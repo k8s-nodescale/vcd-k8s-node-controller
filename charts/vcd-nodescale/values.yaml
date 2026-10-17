@@ -1,7 +1,7 @@
 replicaCount: 1
 
 image:
-  repository: ghcr.io/werton13/vcd-k8s-node-controller
+  repository: docker.io/werton13/vcd-k8s-node-controller
   tag: "" # defaults to .Chart.AppVersion
   pullPolicy: IfNotPresent
 

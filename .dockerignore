@@ -1,0 +1,15 @@
+.git
+.github
+bin
+dist
+charts
+config
+docs
+test
+hack
+*.md
+Makefile
+PROJECT
+LICENSE
+Dockerfile
+.dockerignore

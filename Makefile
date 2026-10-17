@@ -1,8 +1,9 @@
-IMG ?= ghcr.io/werton13/vcd-k8s-node-controller:latest
+IMAGE ?= docker.io/werton13/vcd-k8s-node-controller
+TAG ?= 0.1.0
 GO ?= go
 CONTROLLER_GEN ?= controller-gen
 
-.PHONY: all fmt vet test build run docker-build generate manifests helm-lint clean
+.PHONY: all fmt vet test build run docker-build image image-push image-save generate manifests helm-lint clean
 
 all: fmt vet test build
 
@@ -16,7 +17,13 @@ build: ; CGO_ENABLED=0 $(GO) build -o bin/manager ./cmd/manager
 
 run: ; $(GO) run ./cmd/manager
 
-docker-build: ; docker build -t $(IMG) .
+docker-build: ; docker build -t $(IMAGE):$(TAG) -t $(IMAGE):latest .
+
+image: ; docker build -t $(IMAGE):$(TAG) -t $(IMAGE):latest .
+
+image-push: ; docker push $(IMAGE):$(TAG) && docker push $(IMAGE):latest
+
+image-save: ; mkdir -p dist && docker save -o dist/vcd-k8s-node-controller-$(TAG).tar $(IMAGE):$(TAG)
 
 generate: ; $(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths="./api/..."
 

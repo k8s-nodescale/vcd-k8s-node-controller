@@ -104,6 +104,53 @@ architecture, algorithms and open questions.
 5. Finalizers, retries/backoff, e2e on a dev tenant (2 -> 4 -> 2 via CRD).
 6. Publish image + chart; wire the Terraform `node_controller` variable.
 
+## Container image
+
+Build locally (the Dockerfile uses `golang:1.27.1-alpine` and
+`gcr.io/distroless/static:nonroot`):
+
+```bash
+docker build -t docker.io/<dockerhub-user>/vcd-k8s-node-controller:0.1.0 .
+```
+
+Public module defaults are used inside the build. On a restricted network,
+override them:
+
+```bash
+docker build \
+  --build-arg GOPROXY=https://nexus.example.com/repository/golang/ \
+  --build-arg GOSUMDB=off \
+  -t docker.io/<dockerhub-user>/vcd-k8s-node-controller:0.1.0 .
+```
+
+Push:
+
+```bash
+docker login docker.io
+docker push docker.io/<dockerhub-user>/vcd-k8s-node-controller:0.1.0
+docker push docker.io/<dockerhub-user>/vcd-k8s-node-controller:latest
+```
+
+Or via make:
+
+```bash
+make image IMAGE=docker.io/<dockerhub-user>/vcd-k8s-node-controller TAG=0.1.0
+make image-push IMAGE=docker.io/<dockerhub-user>/vcd-k8s-node-controller TAG=0.1.0
+```
+
+The image is `linux/amd64`, runs as distroless `nonroot` (UID 65532), and is
+about 58 MB uncompressed. For a multi-arch manifest:
+
+```bash
+docker buildx build --platform linux/amd64,linux/arm64 \
+  -t docker.io/<dockerhub-user>/vcd-k8s-node-controller:0.1.0 --push .
+```
+
+A local tarball can be moved between machines with `docker save` / `docker load`
+(see `make image-save`). Tag-based publishing is wired in
+`.github/workflows/docker-publish.yaml` and expects the
+`DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` repository secrets.
+
 ## License
 
 Apache-2.0 (add the full `LICENSE` text before publishing).

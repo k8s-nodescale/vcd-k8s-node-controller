@@ -23,7 +23,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: manager
-          image: ghcr.io/werton13/vcd-k8s-node-controller:latest
+          image: docker.io/werton13/vcd-k8s-node-controller:0.1.0
           imagePullPolicy: IfNotPresent
           args:
             - --leader-elect
