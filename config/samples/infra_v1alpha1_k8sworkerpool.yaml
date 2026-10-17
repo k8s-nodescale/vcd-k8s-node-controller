@@ -1,0 +1,63 @@
+apiVersion: infra.example.com/v1alpha1
+kind: K8sWorkerPool
+metadata:
+  name: default
+  namespace: vcd-nodescale-system
+spec:
+  replicas: 2
+  namePrefix: myorg-cluster-prod
+  bootstrap:
+    osUser: ubuntu
+    osPasswordHash: "$6$REPLACE_WITH_HASH"
+    sshAuthorizedKey: "ssh-ed25519 AAAA... user@example"
+    nicName: ens192
+    dns:
+      - 77.88.8.8
+      - 77.88.8.1
+    k8sVersion: "1.35.9-1.1"
+    k8sMinorRepo: "v1.35"
+  flavor:
+    cpus: 4
+    memoryMB: 8192
+    template: ubuntu24.04-uuid-enabled-v1
+    disks:
+      - sizeGB: 20
+        mount: /data1
+        busType: paravirtual
+        busNumber: 1
+        unitNumber: 0
+      - sizeGB: 60
+        mount: /data2
+        busType: paravirtual
+        busNumber: 1
+        unitNumber: 1
+  vcd:
+    org: myorg
+    vdc: My-VDC-Name
+    vapp: mts-k8s-lab
+    orgNetwork: routed-k8s-net
+    catalog: Templates
+  ipPlan:
+    cidr: 192.168.100.0/24
+    mNodeOffset: 4
+    wNodeOffset: 7
+    dvmOffset: -3
+    kubeapiLB: 2
+    ingressLB: 3
+    masterCount: 3
+    reserved:
+      - 192.168.100.1
+      - 192.168.100.2
+      - 192.168.100.3
+  join:
+    endpoint: 192.168.100.2:6443
+    tokenTTL: 1h
+    labels:
+      node-role.kubernetes.io/worker: ""
+  ingressPool:
+    type: nsxv
+    name: myorg-k8s-cluster-prod-ingress-pool
+    port: 443
+  scaleDown:
+    minReplicas: 2
+    drainTimeout: 10m

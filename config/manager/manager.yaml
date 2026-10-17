@@ -1,0 +1,92 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vcd-nodescale-manager
+  namespace: vcd-nodescale-system
+  labels:
+    app.kubernetes.io/name: vcd-nodescale
+    app.kubernetes.io/component: controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vcd-nodescale
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: vcd-nodescale
+    spec:
+      serviceAccountName: vcd-nodescale-manager
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: manager
+          image: ghcr.io/werton13/vcd-k8s-node-controller:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - --leader-elect
+            - --health-probe-bind-address=:8081
+            - --metrics-bind-address=:8080
+          env:
+            - name: VCD_URL
+              valueFrom:
+                secretKeyRef:
+                  name: vcd-credentials
+                  key: url
+            - name: VCD_USER
+              valueFrom:
+                secretKeyRef:
+                  name: vcd-credentials
+                  key: user
+            - name: VCD_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: vcd-credentials
+                  key: password
+            - name: VCD_ORG
+              valueFrom:
+                secretKeyRef:
+                  name: vcd-credentials
+                  key: org
+            - name: VCD_VDC
+              valueFrom:
+                secretKeyRef:
+                  name: vcd-credentials
+                  key: vdc
+            - name: VCD_INSECURE
+              valueFrom:
+                secretKeyRef:
+                  name: vcd-credentials
+                  key: insecure
+                  optional: true
+          ports:
+            - name: metrics
+              containerPort: 8080
+            - name: health
+              containerPort: 8081
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

@@ -1,0 +1,16 @@
+vcd-nodescale has been installed in namespace {{ include "vcd-nodescale.namespace" . }}.
+
+If the vCD credentials Secret does not exist, create it:
+
+  kubectl -n {{ include "vcd-nodescale.namespace" . }} create secret generic {{ .Values.vcd.existingSecret }} \
+    --from-literal=url=https://vcd.example.com/api \
+    --from-literal=user=svc-node-controller \
+    --from-literal=password='***' \
+    --from-literal=org=myorg \
+    --from-literal=vdc=My-VDC-Name \
+    --from-literal=insecure=false
+
+Then create a K8sWorkerPool (see config/samples/infra_v1alpha1_k8sworkerpool.yaml).
+
+WARNING: once this controller is enabled, do not use Terraform to manage
+worker count or worker LB pool membership; use the CRD instead.

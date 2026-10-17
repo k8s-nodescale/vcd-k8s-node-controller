@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# vCD guest-customization initscript: configure the NIC, seed NoCloud with the
+# embedded user-data, then run cloud-init. Mirrors templates/customization_node.sh.
+set -euo pipefail
+
+NIC="{{ .NICName }}"
+NODE_IP="{{ .NodeIP }}"
+CIDR_PREFIX="{{ .CIDRPrefix }}"
+GATEWAY="{{ .GatewayIP }}"
+DNS_JSON='{{ .DNSServersJSON }}'
+
+cat > /etc/netplan/50-cloud-init.yaml <<EOF
+network:
+  version: 2
+  ethernets:
+    ${NIC}:
+      dhcp4: false
+      addresses: [${NODE_IP}/${CIDR_PREFIX}]
+      routes:
+        - to: default
+          via: ${GATEWAY}
+      nameservers:
+        addresses: ${DNS_JSON}
+EOF
+chmod 600 /etc/netplan/50-cloud-init.yaml
+netplan apply || true
+
+mkdir -p /var/lib/cloud/seed/nocloud
+cat > /var/lib/cloud/seed/nocloud/meta-data <<EOF
+instance-id: {{ .NodeName }}
+local-hostname: {{ .NodeName }}
+EOF
+
+base64 -d <<'CLOUDINIT' | gzip -d > /var/lib/cloud/seed/nocloud/user-data
+{{ .CloudInitBase64Gz }}
+CLOUDINIT
+
+cloud-init init --local || true
+cloud-init init || true
+cloud-init modules --mode=config || true
+cloud-init modules --mode=final || true

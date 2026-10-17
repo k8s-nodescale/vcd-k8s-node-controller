@@ -1,0 +1,357 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.17.0
+  name: k8sworkerpools.infra.example.com
+spec:
+  group: infra.example.com
+  names:
+    kind: K8sWorkerPool
+    listKind: K8sWorkerPoolList
+    plural: k8sworkerpools
+    shortNames:
+    - k8swp
+    singular: k8sworkerpool
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.replicas
+      name: Desired
+      type: integer
+    - jsonPath: .status.observedReplicas
+      name: Observed
+      type: integer
+    - jsonPath: .status.conditions[?(@.type=="Ready")].status
+      name: Ready
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: K8sWorkerPool is the Schema for the k8sworkerpools API.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: K8sWorkerPoolSpec defines the desired worker pool.
+            properties:
+              bootstrap:
+                description: Bootstrap carries OS/cloud-init inputs used to render
+                  new worker user-data.
+                properties:
+                  dns:
+                    items:
+                      type: string
+                    type: array
+                  k8sMinorRepo:
+                    type: string
+                  k8sVersion:
+                    type: string
+                  nicName:
+                    type: string
+                  osPasswordHash:
+                    type: string
+                  osUser:
+                    type: string
+                  sshAuthorizedKey:
+                    type: string
+                type: object
+              flavor:
+                description: Flavor describes the compute and disk shape of a worker.
+                properties:
+                  cpus:
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  disks:
+                    description: Disks are additional data disks (mirrors Terraform
+                      diskw1/diskw2).
+                    items:
+                      description: DiskSpec describes an internal disk attached to
+                        a worker VM.
+                      properties:
+                        busNumber:
+                          format: int32
+                          type: integer
+                        busType:
+                          type: string
+                        mount:
+                          type: string
+                        sizeGB:
+                          format: int32
+                          type: integer
+                        storageProfile:
+                          type: string
+                        unitNumber:
+                          format: int32
+                          type: integer
+                      required:
+                      - sizeGB
+                      type: object
+                    type: array
+                  memoryMB:
+                    format: int32
+                    minimum: 512
+                    type: integer
+                  template:
+                    description: Template is the vCD catalog template name.
+                    type: string
+                required:
+                - cpus
+                - memoryMB
+                type: object
+              ingressPool:
+                description: IngressPool describes the load-balancer pool new workers
+                  join once Ready.
+                properties:
+                  name:
+                    type: string
+                  port:
+                    format: int32
+                    type: integer
+                  type:
+                    enum:
+                    - nsxv
+                    - nsxt
+                    - ""
+                    type: string
+                type: object
+              ipPlan:
+                description: |-
+                  IPPlan mirrors the Terraform ip_plan variable so the controller
+                  never collides with Terraform-managed infrastructure or reserved VIPs.
+                properties:
+                  cidr:
+                    type: string
+                  dvmOffset:
+                    type: integer
+                  ingressLB:
+                    type: integer
+                  kubeapiLB:
+                    type: integer
+                  mNodeOffset:
+                    type: integer
+                  masterCount:
+                    format: int32
+                    type: integer
+                  reserved:
+                    items:
+                      type: string
+                    type: array
+                  wNodeOffset:
+                    type: integer
+                required:
+                - cidr
+                type: object
+              join:
+                description: Join controls how new nodes join the cluster.
+                properties:
+                  endpoint:
+                    description: Endpoint is the control-plane address, e.g. 192.168.100.2:6443.
+                    type: string
+                  labels:
+                    additionalProperties:
+                      type: string
+                    description: Labels applied to the Node after join.
+                    type: object
+                  taints:
+                    description: Taints applied to the Node after join (e.g. "key=value:NoSchedule").
+                    items:
+                      type: string
+                    type: array
+                  tokenTTL:
+                    description: TokenTTL is how long the on-demand bootstrap token
+                      remains valid.
+                    type: string
+                type: object
+              namePrefix:
+                description: NamePrefix is the DNS-safe prefix used to build worker
+                  names (e.g. myorg-cluster-prod).
+                type: string
+              replicas:
+                description: Replicas is the desired number of worker nodes.
+                format: int32
+                minimum: 0
+                type: integer
+              scaleDown:
+                description: ScaleDown controls safe removal of workers.
+                properties:
+                  drainTimeout:
+                    type: string
+                  minReplicas:
+                    format: int32
+                    minimum: 0
+                    type: integer
+                type: object
+              vcd:
+                description: VCD points at the target vCloud Director objects.
+                properties:
+                  catalog:
+                    type: string
+                  catalogOrg:
+                    type: string
+                  org:
+                    type: string
+                  orgNetwork:
+                    type: string
+                  vapp:
+                    type: string
+                  vdc:
+                    type: string
+                required:
+                - org
+                - orgNetwork
+                - vapp
+                - vdc
+                type: object
+            required:
+            - flavor
+            - ipPlan
+            - namePrefix
+            - replicas
+            - vcd
+            type: object
+          status:
+            description: K8sWorkerPoolStatus is the observed state.
+            properties:
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              ledger:
+                description: IPLedger is the persistent IP allocation ledger.
+                properties:
+                  free:
+                    items:
+                      type: string
+                    type: array
+                  nextIndex:
+                    type: integer
+                  used:
+                    items:
+                      type: string
+                    type: array
+                type: object
+              nodes:
+                items:
+                  description: WorkerNodeStatus describes a single managed worker.
+                  properties:
+                    cpu:
+                      format: int32
+                      type: integer
+                    diskGB:
+                      format: int32
+                      type: integer
+                    ip:
+                      type: string
+                    k8sReady:
+                      type: boolean
+                    kubeletVersion:
+                      type: string
+                    memoryMB:
+                      format: int32
+                      type: integer
+                    message:
+                      type: string
+                    name:
+                      type: string
+                    phase:
+                      description: NodePhase describes the lifecycle phase of a managed
+                        worker node.
+                      enum:
+                      - Pending
+                      - Provisioning
+                      - Joining
+                      - Ready
+                      - Draining
+                      - Deleting
+                      - Failed
+                      type: string
+                    vmID:
+                      type: string
+                  required:
+                  - name
+                  type: object
+                type: array
+              observedReplicas:
+                format: int32
+                type: integer
+            required:
+            - observedReplicas
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
