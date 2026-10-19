@@ -3,7 +3,10 @@ package vcd
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/url"
+	"strings"
 
 	"github.com/vmware/go-vcloud-director/v2/govcd"
 
@@ -30,7 +33,11 @@ var _ cloud.Provider = (*Provider)(nil)
 
 // New connects to vCD and authenticates.
 func New(cfg Config) (*Provider, error) {
-	u, err := url.Parse(cfg.URL)
+	endpoint, err := normalizeURL(cfg.URL)
+	if err != nil {
+		return nil, err
+	}
+	u, err := url.Parse(endpoint)
 	if err != nil {
 		return nil, err
 	}
@@ -39,6 +46,53 @@ func New(cfg Config) (*Provider, error) {
 		return nil, err
 	}
 	return &Provider{cfg: cfg, client: client}, nil
+}
+
+// normalizeURL returns the vCD API endpoint expected by govcd: a single
+// http(s) scheme, a non-empty host, and a path ending in /api.
+//
+// It tolerates common misconfigurations such as "iaas.cloud.mts.ru",
+// "https://iaas.cloud.mts.ru" and the doubly-prefixed
+// "https://https://iaas.cloud.mts.ru/api/api".
+func normalizeURL(raw string) (string, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return "", errors.New("VCD_URL is empty")
+	}
+	if !strings.Contains(s, "://") {
+		s = "https://" + s
+	}
+
+	u, err := url.Parse(s)
+	if err != nil {
+		return "", fmt.Errorf("invalid VCD_URL %q: %w", raw, err)
+	}
+
+	// url.Parse("https://https://host/api") yields Host "https:" and
+	// Path "//host/api"; unwrap repeated schemes until the real host remains.
+	for host := u.Hostname(); host == "http" || host == "https"; host = u.Hostname() {
+		rest := strings.TrimPrefix(u.Path, "//")
+		u, err = url.Parse(u.Scheme + "://" + rest)
+		if err != nil {
+			return "", fmt.Errorf("invalid VCD_URL %q: %w", raw, err)
+		}
+	}
+
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", fmt.Errorf("invalid VCD_URL %q: unsupported scheme %q", raw, u.Scheme)
+	}
+	if u.Host == "" {
+		return "", fmt.Errorf("invalid VCD_URL %q: missing host", raw)
+	}
+
+	u.Path = strings.TrimRight(u.Path, "/")
+	for strings.HasSuffix(u.Path, "/api/api") {
+		u.Path = strings.TrimSuffix(u.Path, "/api")
+	}
+	if !strings.HasSuffix(u.Path, "/api") {
+		u.Path += "/api"
+	}
+	return u.String(), nil
 }
 
 // ListWorkerVMs TODO: query the vApp for VMs matching selector metadata.
