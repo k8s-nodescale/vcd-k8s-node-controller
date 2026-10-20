@@ -645,8 +645,8 @@ func buildJoinCommand(endpoint, token, caHash string) (string, error) {
 		return "", fmt.Errorf("bootstrap token and CA hash are required")
 	}
 
-	// kubeadm join has no --node-labels flag; labels are patched onto the Node
-	// by the controller once it is Ready.
+	// Node labels from spec.join.labels are patched onto the Node once it is
+	// Ready (applyNodeAttributes), so the join command stays minimal.
 	return fmt.Sprintf("kubeadm join %s --token %s --discovery-token-ca-cert-hash %s", endpoint, token, caHash), nil
 }
 

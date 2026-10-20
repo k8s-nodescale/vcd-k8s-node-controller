@@ -218,7 +218,10 @@ func (c *Client) SetLabels(ctx context.Context, name string, labels map[string]s
 	}
 	diff := make(map[string]string, len(labels))
 	for k, v := range labels {
-		if node.Labels[k] != v {
+		// A label such as node-role.kubernetes.io/worker carries an empty
+		// value, so a plain map lookup cannot tell "absent" from "present
+		// and empty" and the label would never be added.
+		if cur, ok := node.Labels[k]; !ok || cur != v {
 			diff[k] = v
 		}
 	}
