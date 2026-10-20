@@ -17,8 +17,8 @@ users:
 
 ssh_pwauth: false
 
-{{- if .Disks }}
 bootcmd:
+{{- if .Disks }}
   - |
     /usr/local/sbin/prepare-data-disks.sh
     rc=$?
@@ -26,6 +26,11 @@ bootcmd:
       exit "$rc"
     fi
 {{- end }}
+  - |
+    if [ -f /etc/systemd/system/k8s-node-bootstrap.service ]; then
+      systemctl daemon-reload
+      systemctl enable --now --no-block k8s-node-bootstrap.service
+    fi
 
 write_files:
   - path: /etc/netplan/50-cloud-init.yaml
@@ -73,19 +78,97 @@ write_files:
     permissions: '0700'
     content: |
       #!/bin/bash
+      # Worker OS preparation and cluster join. Idempotent: the marker below
+      # (and kubelet.conf) keeps a node from joining twice.
       set -euo pipefail
-      # ---------------------------------------------------------------------------
-      # TODO(option-A): implement OS preparation + cluster join here.
-      # See conception.md section 5.4 and the Ansible roles:
-      #   - prepare_k8s_nodes     (LVM, /var -> /data1, /var/lib -> /data2, reboot)
-      #   - install_k8s_binaries  (pkgs.k8s.io repo, pinned kubeadm/kubelet/kubectl)
-      # Then run /etc/kubernetes/join-command.sh after the reboot.
-      #
-      # The detailed disk/reboot/idempotency mechanics are intentionally deferred
-      # (conception.md 3.2) and will be implemented before this path is enabled.
-      # ---------------------------------------------------------------------------
-      echo "k8s-node-bootstrap: not implemented yet" >&2
-      exit 1
+
+      LOG=/var/log/k8s-node-bootstrap.log
+      exec >>"$LOG" 2>&1
+      log() { echo "[$(date -Is)] $*"; }
+      log "starting k8s node bootstrap"
+
+      MARKER=/etc/kubernetes/kubeadm-joined
+      if [[ -f "$MARKER" ]]; then
+        log "node already joined; nothing to do"
+        exit 0
+      fi
+
+      K8S_MINOR="{{ .K8sMinorRepo }}"
+      K8S_VERSION="{{ .K8sVersion }}"
+      if [[ -z "$K8S_MINOR" ]]; then
+        log "bootstrap.k8sMinorRepo is empty; cannot configure the Kubernetes apt repository"
+        exit 1
+      fi
+
+      # 1. kubelet requires swap to be disabled.
+      swapoff -a || true
+      sed -ri 's@^([^#].*[[:space:]]swap[[:space:]].*)@#\1@' /etc/fstab
+
+      # 2. Kernel modules and sysctls (config files are written above).
+      modprobe overlay
+      modprobe br_netfilter
+      sysctl --system
+
+      # 3. containerd.
+      if ! command -v containerd >/dev/null 2>&1; then
+        apt-get update -y
+        DEBIAN_FRONTEND=noninteractive apt-get install -y containerd conntrack socat
+      fi
+      mkdir -p /etc/containerd
+      systemctl enable containerd
+      systemctl restart containerd
+
+      # 4. Kubernetes binaries, pinned when a version is configured.
+      if ! command -v kubeadm >/dev/null 2>&1; then
+        apt-get update -y
+        DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl gpg apt-transport-https
+        install -d -m 0755 /etc/apt/keyrings
+        curl -fsSL "https://pkgs.k8s.io/core:/stable:/${K8S_MINOR}/deb/Release.key" \
+          | gpg --batch --yes --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/${K8S_MINOR}/deb/ /" \
+          > /etc/apt/sources.list.d/kubernetes.list
+        apt-get update -y
+        if [[ -n "$K8S_VERSION" ]]; then
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            "kubelet=${K8S_VERSION}" "kubeadm=${K8S_VERSION}" "kubectl=${K8S_VERSION}"
+        else
+          DEBIAN_FRONTEND=noninteractive apt-get install -y kubelet kubeadm kubectl
+        fi
+        apt-mark hold kubelet kubeadm kubectl
+      fi
+      systemctl enable kubelet
+
+      # 5. Join. kubeadm writes /etc/kubernetes/kubelet.conf on success.
+      if [[ ! -f /etc/kubernetes/kubelet.conf ]]; then
+        log "running kubeadm join"
+        bash /etc/kubernetes/join-command.sh
+      fi
+
+      touch "$MARKER"
+      log "k8s node bootstrap finished"
+
+  - path: /etc/systemd/system/k8s-node-bootstrap.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Prepare worker and join the Kubernetes cluster
+      Wants=network-online.target
+      After=network-online.target
+      ConditionPathExists=!/etc/kubernetes/kubeadm-joined
+      StartLimitIntervalSec=0
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/k8s-node-bootstrap.sh
+      RemainAfterExit=yes
+      Restart=on-failure
+      RestartSec=60
+      TimeoutStartSec=45min
+
+      [Install]
+      WantedBy=multi-user.target
 
 runcmd:
-  - /usr/local/sbin/k8s-node-bootstrap.sh
+  - systemctl daemon-reload
+  - systemctl enable k8s-node-bootstrap.service
+  - systemctl start --no-block k8s-node-bootstrap.service

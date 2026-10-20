@@ -174,6 +174,57 @@ func (a *Allocator) Allocate() (string, error) {
 	return "", fmt.Errorf("no free IPs in %s", a.plan.CIDR)
 }
 
+// Ordinal returns the Terraform-style worker ordinal for ip: the offset from
+// the start of the prefix relative to WNodeOffset, starting at 1. The
+// controller derives worker names from this value, so a name is always tied to
+// the IP it was allocated with, even when a freed address is reused.
+func (a *Allocator) Ordinal(ip string) (int, error) {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return 0, fmt.Errorf("parse ip %q: %w", ip, err)
+	}
+	if !a.prefix.Contains(addr) {
+		return 0, fmt.Errorf("ip %s is outside %s", ip, a.prefix)
+	}
+	baseBytes := a.prefix.Masked().Addr().As4()
+	addrBytes := addr.As4()
+	base := binary.BigEndian.Uint32(baseBytes[:])
+	off := int(uint32(binary.BigEndian.Uint32(addrBytes[:]) - base))
+	return off - a.plan.WNodeOffset + 1, nil
+}
+
+// Adopt records ip as allocated without going through Allocate. The reconciler
+// calls it for every VM it finds in vCD, so a lost, partial or stale status can
+// never lead to the same address being handed out twice.
+func (a *Allocator) Adopt(ip string) error {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return fmt.Errorf("parse ip %q: %w", ip, err)
+	}
+	if !a.prefix.Contains(addr) {
+		return fmt.Errorf("ip %s is outside %s", ip, a.prefix)
+	}
+	if _, ok := a.used[addr]; !ok {
+		a.used[addr] = struct{}{}
+		a.ledger.Used = append(a.ledger.Used, addr.String())
+	}
+	a.removeFree(addr)
+	if ord, err := a.Ordinal(ip); err == nil && ord > a.ledger.NextIndex {
+		a.ledger.NextIndex = ord
+	}
+	return nil
+}
+
+func (a *Allocator) removeFree(addr netip.Addr) {
+	kept := a.ledger.Free[:0]
+	for _, s := range a.ledger.Free {
+		if s != addr.String() {
+			kept = append(kept, s)
+		}
+	}
+	a.ledger.Free = kept
+}
+
 // Free releases an allocated IP and makes it eligible for reuse.
 func (a *Allocator) Free(ip string) error {
 	addr, err := netip.ParseAddr(ip)

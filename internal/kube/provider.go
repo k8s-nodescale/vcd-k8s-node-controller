@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"time"
+
+	corev1 "k8s.io/api/core/v1"
 )
 
 // ErrNotImplemented marks methods that still need a real implementation.
@@ -28,4 +30,8 @@ type Provider interface {
 	WaitReady(ctx context.Context, name string, timeout time.Duration) error
 	Drain(ctx context.Context, name string, timeout time.Duration) error
 	DeleteNode(ctx context.Context, name string) error
+
+	// SetTaints replaces the taints on a Node. It is a no-op when they already
+	// match.
+	SetTaints(ctx context.Context, name string, taints []corev1.Taint) error
 }

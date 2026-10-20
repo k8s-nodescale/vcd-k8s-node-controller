@@ -5,7 +5,10 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/netip"
+	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -14,6 +17,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	utilvalidation "k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -28,6 +32,15 @@ import (
 	"github.com/werton13/vcd-k8s-node-controller/internal/kube"
 )
 
+const (
+	// requeueConverged is the level-based resync interval once the pool matches.
+	requeueConverged = 60 * time.Second
+	// requeueProgressing is used while the pool is still converging.
+	requeueProgressing = 15 * time.Second
+	// requeueInvalidSpec avoids a hot loop while the user fixes the CR.
+	requeueInvalidSpec = 10 * time.Minute
+)
+
 // WorkerPoolReconciler reconciles a K8sWorkerPool object.
 type WorkerPoolReconciler struct {
 	client.Client
@@ -36,6 +49,12 @@ type WorkerPoolReconciler struct {
 	Kube     kube.Provider
 	Renderer *cloudinit.Renderer
 	Recorder record.EventRecorder
+
+	// Org and VDC are the vCD org/VDC the cloud provider is authenticated
+	// against (VCD_ORG/VCD_VDC). They are used to reject a CR whose
+	// spec.vcd.org/vdc points somewhere else instead of silently ignoring it.
+	Org string
+	VDC string
 }
 
 // +kubebuilder:rbac:groups=infra.example.com,resources=k8sworkerpools,verbs=get;list;watch;create;update;patch;delete
@@ -50,6 +69,11 @@ type WorkerPoolReconciler struct {
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile drives the worker pool towards spec.replicas.
+//
+// Observed state is rebuilt from vCD on every pass: VMs are adopted into the IP
+// ledger before anything is created, so a lost or partially written status can
+// never cause a duplicate address. Status is written only when it actually
+// changed, which keeps the CR from feeding itself watch events.
 func (r *WorkerPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
@@ -57,72 +81,341 @@ func (r *WorkerPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	if err := r.Get(ctx, req.NamespacedName, &pool); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+	before := pool.DeepCopy()
 
-	actual, err := r.Cloud.ListWorkerVMs(ctx, pool.Spec.VCD.VApp, map[string]string{
-		"managed-by": "vcd-nodescale",
-		"pool":       pool.Name,
-	})
-	if err != nil {
-		r.setNotReady(ctx, &pool, "CloudError", err.Error())
-		return ctrl.Result{}, err
+	if msg := r.validateSpec(&pool); msg != "" {
+		r.setCondition(&pool, metav1.ConditionFalse, "InvalidSpec", msg)
+		if err := r.flush(ctx, before, &pool); err != nil {
+			return ctrl.Result{}, err
+		}
+		logger.Info("worker pool spec is invalid", "reason", msg)
+		return ctrl.Result{RequeueAfter: requeueInvalidSpec}, nil
 	}
 
-	pool.Status.ObservedReplicas = int32(len(actual))
-	desired := pool.Spec.Replicas
+	// List the whole vApp and match by name prefix: VMs adopted from the
+	// Terraform baseline have no controller metadata, and the vApp is shared
+	// with the masters and DVM.
+	all, err := r.Cloud.ListWorkerVMs(ctx, pool.Spec.VCD.VApp, nil)
+	if err != nil {
+		r.setCondition(&pool, metav1.ConditionFalse, "CloudError", err.Error())
+		_ = r.flush(ctx, before, &pool)
+		return ctrl.Result{}, err
+	}
+	actual := ownedWorkerVMs(&pool, all)
 
+	alloc, err := ipam.New(toIPAMPlan(pool.Spec.IPPlan), toIPAMLedger(pool.Status.Ledger))
+	if err != nil {
+		r.setCondition(&pool, metav1.ConditionFalse, "InvalidIPPlan", err.Error())
+		if ferr := r.flush(ctx, before, &pool); ferr != nil {
+			return ctrl.Result{}, ferr
+		}
+		return ctrl.Result{RequeueAfter: requeueInvalidSpec}, nil
+	}
+
+	nodes, err := mergeNodes(&pool, actual, alloc)
+	if err != nil {
+		r.setCondition(&pool, metav1.ConditionFalse, "InvalidIPPlan", err.Error())
+		if ferr := r.flush(ctx, before, &pool); ferr != nil {
+			return ctrl.Result{}, ferr
+		}
+		return ctrl.Result{RequeueAfter: requeueInvalidSpec}, nil
+	}
+
+	pool.Status.Nodes = nodes
+	pool.Status.ObservedReplicas = int32(len(actual))
+	pool.Status.Ledger = toStatusLedger(alloc.Ledger())
+	if err := r.flush(ctx, before, &pool); err != nil {
+		return ctrl.Result{}, err
+	}
+	// The persisted state is the baseline for the writes below.
+	before = pool.DeepCopy()
+
+	desired := pool.Spec.Replicas
 	switch {
 	case desired > pool.Status.ObservedReplicas:
-		if err := r.scaleUp(ctx, &pool, desired-pool.Status.ObservedReplicas); err != nil {
-			logger.Error(err, "scale up failed")
-			r.setNotReady(ctx, &pool, "ScaleUpFailed", err.Error())
+		if err := r.scaleUp(ctx, &pool, alloc, desired-pool.Status.ObservedReplicas); err != nil {
+			logger.Error(err, "scale up failed", "pool", pool.Name)
+			r.setCondition(&pool, metav1.ConditionFalse, "ScaleUpFailed", err.Error())
+			if ferr := r.flush(ctx, before, &pool); ferr != nil {
+				return ctrl.Result{}, ferr
+			}
 			return ctrl.Result{}, err
 		}
 	case desired < pool.Status.ObservedReplicas:
 		if err := r.scaleDown(ctx, &pool, pool.Status.ObservedReplicas-desired); err != nil {
-			logger.Error(err, "scale down failed")
-			r.setNotReady(ctx, &pool, "ScaleDownFailed", err.Error())
+			logger.Error(err, "scale down failed", "pool", pool.Name)
+			r.setCondition(&pool, metav1.ConditionFalse, "ScaleDownFailed", err.Error())
+			if ferr := r.flush(ctx, before, &pool); ferr != nil {
+				return ctrl.Result{}, ferr
+			}
 			return ctrl.Result{}, err
 		}
 	}
+	before = pool.DeepCopy()
 
-	meta.SetStatusCondition(&pool.Status.Conditions, metav1.Condition{
-		Type:               "Ready",
-		Status:             metav1.ConditionTrue,
-		Reason:             "Converged",
-		Message:            fmt.Sprintf("desired=%d observed=%d", desired, pool.Status.ObservedReplicas),
-		ObservedGeneration: pool.Generation,
-	})
-	if err := r.Status().Update(ctx, &pool); err != nil {
+	if err := r.refreshReadiness(ctx, &pool); err != nil {
+		r.setCondition(&pool, metav1.ConditionFalse, "NodeReadinessUnknown", err.Error())
+		if ferr := r.flush(ctx, before, &pool); ferr != nil {
+			return ctrl.Result{}, ferr
+		}
+		return ctrl.Result{RequeueAfter: requeueProgressing}, nil
+	}
+
+	condStatus, reason, msg := evaluatePoolCondition(&pool)
+	r.setCondition(&pool, condStatus, reason, msg)
+	if err := r.flush(ctx, before, &pool); err != nil {
 		return ctrl.Result{}, err
 	}
-	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+
+	if err := r.applyTaints(ctx, &pool); err != nil {
+		r.setCondition(&pool, metav1.ConditionFalse, "TaintFailed", err.Error())
+		if ferr := r.flush(ctx, before, &pool); ferr != nil {
+			return ctrl.Result{}, ferr
+		}
+		return ctrl.Result{}, err
+	}
+
+	requeue := requeueConverged
+	if condStatus != metav1.ConditionTrue {
+		requeue = requeueProgressing
+	}
+	return ctrl.Result{RequeueAfter: requeue}, nil
 }
 
-func (r *WorkerPoolReconciler) setNotReady(ctx context.Context, pool *infrav1.K8sWorkerPool, reason, msg string) {
+// refreshReadiness maps the actual Kubernetes Nodes onto status.nodes.
+func (r *WorkerPoolReconciler) refreshReadiness(ctx context.Context, pool *infrav1.K8sWorkerPool) error {
+	nodes, err := r.Kube.ListNodes(ctx)
+	if err != nil {
+		return err
+	}
+	// kubelet registers Node names in lower case, while VM names keep the
+	// configured prefix case, so match case-insensitively.
+	byName := make(map[string]kube.NodeInfo, len(nodes))
+	for _, n := range nodes {
+		byName[strings.ToLower(n.Name)] = n
+	}
+
+	for i := range pool.Status.Nodes {
+		st := &pool.Status.Nodes[i]
+		info, ok := byName[strings.ToLower(st.Name)]
+		switch {
+		case !ok:
+			st.Phase = infrav1.NodePhaseProvisioning
+			st.K8sReady = false
+			st.Message = "waiting for the node to register"
+		case info.Ready:
+			st.Phase = infrav1.NodePhaseReady
+			st.K8sReady = true
+			st.Message = ""
+			if info.KubeletVersion != "" {
+				st.KubeletVersion = info.KubeletVersion
+			}
+			if info.CPU > 0 {
+				st.CPU = int32((info.CPU + 999) / 1000) // millicores -> cores, rounded up
+			}
+			if info.MemoryBytes > 0 {
+				st.MemoryMB = int32(info.MemoryBytes / (1024 * 1024))
+			}
+		default:
+			st.Phase = infrav1.NodePhaseJoining
+			st.K8sReady = false
+			st.Message = "node registered, waiting for Ready"
+		}
+	}
+	return nil
+}
+
+// evaluatePoolCondition makes Ready mean "the requested workers are Ready",
+// not "the last API calls succeeded".
+func evaluatePoolCondition(pool *infrav1.K8sWorkerPool) (metav1.ConditionStatus, string, string) {
+	desired := pool.Spec.Replicas
+	var ready int32
+	for _, n := range pool.Status.Nodes {
+		if n.Phase == infrav1.NodePhaseReady {
+			ready++
+		}
+	}
+	switch {
+	case pool.Status.ObservedReplicas != desired:
+		return metav1.ConditionFalse, "Scaling",
+			fmt.Sprintf("desired=%d observed=%d ready=%d", desired, pool.Status.ObservedReplicas, ready)
+	case ready != desired:
+		return metav1.ConditionFalse, "Progressing",
+			fmt.Sprintf("%d/%d workers Ready", ready, desired)
+	default:
+		return metav1.ConditionTrue, "Converged",
+			fmt.Sprintf("%d/%d workers Ready", ready, desired)
+	}
+}
+
+// applyTaints applies spec.join.taints to every Ready node.
+func (r *WorkerPoolReconciler) applyTaints(ctx context.Context, pool *infrav1.K8sWorkerPool) error {
+	if len(pool.Spec.Join.Taints) == 0 {
+		return nil
+	}
+	taints, err := parseTaints(pool.Spec.Join.Taints)
+	if err != nil {
+		return err
+	}
+	for _, n := range pool.Status.Nodes {
+		if n.Phase != infrav1.NodePhaseReady {
+			continue
+		}
+		if err := r.Kube.SetTaints(ctx, n.Name, taints); err != nil {
+			return fmt.Errorf("set taints on %s: %w", n.Name, err)
+		}
+	}
+	return nil
+}
+
+// parseTaints accepts the kubectl notation key[=value]:Effect.
+func parseTaints(in []string) ([]corev1.Taint, error) {
+	out := make([]corev1.Taint, 0, len(in))
+	for _, raw := range in {
+		spec := strings.TrimSpace(raw)
+		if spec == "" {
+			continue
+		}
+		i := strings.LastIndex(spec, ":")
+		if i < 0 {
+			return nil, fmt.Errorf("taint %q must end with :Effect", raw)
+		}
+		effect := corev1.TaintEffect(spec[i+1:])
+		spec = spec[:i]
+		switch effect {
+		case corev1.TaintEffectNoSchedule, corev1.TaintEffectPreferNoSchedule, corev1.TaintEffectNoExecute:
+		default:
+			return nil, fmt.Errorf("taint %q has invalid effect %q", raw, effect)
+		}
+
+		key, value := spec, ""
+		if j := strings.Index(spec, "="); j >= 0 {
+			key, value = spec[:j], spec[j+1:]
+		}
+		if errs := utilvalidation.IsQualifiedName(key); len(errs) > 0 {
+			return nil, fmt.Errorf("taint %q has an invalid key: %s", raw, strings.Join(errs, "; "))
+		}
+		if value != "" {
+			if errs := utilvalidation.IsValidLabelValue(value); len(errs) > 0 {
+				return nil, fmt.Errorf("taint %q has an invalid value: %s", raw, strings.Join(errs, "; "))
+			}
+		}
+		out = append(out, corev1.Taint{Key: key, Value: value, Effect: effect})
+	}
+	return out, nil
+}
+
+// flush writes status only when it changed. Writing an identical status would
+// bump resourceVersion and re-trigger the reconcile loop.
+func (r *WorkerPoolReconciler) flush(ctx context.Context, before, pool *infrav1.K8sWorkerPool) error {
+	if reflect.DeepEqual(before.Status, pool.Status) {
+		return nil
+	}
+	return r.Status().Update(ctx, pool)
+}
+
+func (r *WorkerPoolReconciler) setCondition(pool *infrav1.K8sWorkerPool, status metav1.ConditionStatus, reason, msg string) {
 	meta.SetStatusCondition(&pool.Status.Conditions, metav1.Condition{
 		Type:               "Ready",
-		Status:             metav1.ConditionFalse,
+		Status:             status,
 		Reason:             reason,
 		Message:            msg,
 		ObservedGeneration: pool.Generation,
 	})
-	_ = r.Status().Update(ctx, pool)
 }
 
-// scaleUp provisions n workers. LB membership is added later, only after the
-// node reports Ready (see reconcileNodeReadiness TODO).
-func (r *WorkerPoolReconciler) scaleUp(ctx context.Context, pool *infrav1.K8sWorkerPool, n int32) error {
-	alloc, err := ipam.New(toIPAMPlan(pool.Spec.IPPlan), toIPAMLedger(pool.Status.Ledger))
-	if err != nil {
-		return err
+// validateSpec rejects values the controller would otherwise silently ignore
+// (org/vdc come from the process environment) or that cannot produce a working
+// worker (no template, no join endpoint).
+func (r *WorkerPoolReconciler) validateSpec(pool *infrav1.K8sWorkerPool) string {
+	switch {
+	case strings.TrimSpace(pool.Spec.NamePrefix) == "":
+		return "spec.namePrefix is required"
+	case strings.TrimSpace(pool.Spec.Bootstrap.OSUser) == "":
+		return "spec.bootstrap.osUser is required"
+	case strings.TrimSpace(pool.Spec.Bootstrap.K8sMinorRepo) == "":
+		return "spec.bootstrap.k8sMinorRepo is required"
+	case strings.TrimSpace(pool.Spec.VCD.VApp) == "":
+		return "spec.vcd.vapp is required"
+	case strings.TrimSpace(pool.Spec.VCD.OrgNetwork) == "":
+		return "spec.vcd.orgNetwork is required"
+	case strings.TrimSpace(pool.Spec.Flavor.Template) == "":
+		return "spec.flavor.template is required"
+	case strings.TrimSpace(pool.Spec.Join.Endpoint) == "":
+		return "spec.join.endpoint is required"
 	}
+	if r.Org != "" && pool.Spec.VCD.Org != "" && !strings.EqualFold(r.Org, pool.Spec.VCD.Org) {
+		return fmt.Sprintf("spec.vcd.org %q does not match the controller org %q (VCD_ORG)", pool.Spec.VCD.Org, r.Org)
+	}
+	if r.VDC != "" && pool.Spec.VCD.VDC != "" && !strings.EqualFold(r.VDC, pool.Spec.VCD.VDC) {
+		return fmt.Sprintf("spec.vcd.vdc %q does not match the controller VDC %q (VCD_VDC)", pool.Spec.VCD.VDC, r.VDC)
+	}
+	if _, err := parseTaints(pool.Spec.Join.Taints); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
+// mergeNodes rebuilds status.nodes from the VMs that actually exist and adopts
+// their addresses into the ledger. Per-node phase and Kubernetes readiness are
+// carried over by name.
+func mergeNodes(pool *infrav1.K8sWorkerPool, vms []cloud.VM, alloc *ipam.Allocator) ([]infrav1.WorkerNodeStatus, error) {
+	previous := make(map[string]infrav1.WorkerNodeStatus, len(pool.Status.Nodes))
+	for _, n := range pool.Status.Nodes {
+		previous[n.Name] = n
+	}
+
+	out := make([]infrav1.WorkerNodeStatus, 0, len(vms))
+	for _, vm := range vms {
+		node := previous[vm.Name]
+		node.Name = vm.Name
+		if vm.IP != "" {
+			if err := alloc.Adopt(vm.IP); err != nil {
+				return nil, fmt.Errorf("VM %q: %w", vm.Name, err)
+			}
+			node.IP = vm.IP
+		}
+		node.VMID = vm.ID
+		if node.Phase == "" {
+			node.Phase = infrav1.NodePhaseProvisioning
+		}
+		if vm.CPU > 0 {
+			node.CPU = vm.CPU
+		}
+		if vm.MemoryMB > 0 {
+			node.MemoryMB = vm.MemoryMB
+		}
+		if vm.DiskGB > 0 {
+			node.DiskGB = vm.DiskGB
+		}
+		out = append(out, node)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+// scaleUp provisions n workers. Each successful create is persisted
+// immediately. If a create fails, the address is kept reserved only when the
+// VM still exists in vCD; otherwise it is released for reuse.
+func (r *WorkerPoolReconciler) scaleUp(ctx context.Context, pool *infrav1.K8sWorkerPool, alloc *ipam.Allocator, n int32) error {
+	logger := log.FromContext(ctx)
+
 	ttl := pool.Spec.Join.TokenTTL.Duration
-	if ttl == 0 {
+	if ttl <= 0 {
 		ttl = time.Hour
 	}
 	dnsJSON, err := json.Marshal(pool.Spec.Bootstrap.DNS)
 	if err != nil {
+		return fmt.Errorf("encode DNS servers: %w", err)
+	}
+	cloudInitDisks, err := toCloudInitDisks(pool.Spec.Flavor.Disks)
+	if err != nil {
 		return err
+	}
+
+	persist := func() error {
+		pool.Status.Ledger = toStatusLedger(alloc.Ledger())
+		return r.Status().Update(ctx, pool)
 	}
 
 	for i := int32(0); i < n; i++ {
@@ -130,22 +423,32 @@ func (r *WorkerPoolReconciler) scaleUp(ctx context.Context, pool *infrav1.K8sWor
 		if err != nil {
 			return err
 		}
+		ordinal, err := alloc.Ordinal(ip)
+		if err != nil {
+			_ = alloc.Free(ip)
+			return err
+		}
+		name := workerName(pool.Spec.NamePrefix, ordinal)
+
+		// release frees the address when nothing was created yet.
+		release := func(cause error) error {
+			_ = alloc.Free(ip)
+			if perr := persist(); perr != nil {
+				return fmt.Errorf("%w (persist ledger: %v)", cause, perr)
+			}
+			return cause
+		}
 		token, err := r.Kube.CreateBootstrapToken(ctx, ttl)
 		if err != nil {
-			return err
+			return release(fmt.Errorf("create bootstrap token for %s: %w", name, err))
 		}
 		caHash, err := r.Kube.CAHash(ctx)
 		if err != nil {
-			return err
+			return release(fmt.Errorf("compute CA hash for %s: %w", name, err))
 		}
-
-		name := fmt.Sprintf("%s-wrk-%02d", pool.Spec.NamePrefix, alloc.Ledger().NextIndex)
-		join := fmt.Sprintf("kubeadm join %s --token %s --discovery-token-ca-cert-hash %s",
-			pool.Spec.Join.Endpoint, token, caHash)
-
-		cloudInitDisks, err := toCloudInitDisks(pool.Spec.Flavor.Disks)
+		join, err := buildJoinCommand(pool.Spec.Join.Endpoint, token, caHash, pool.Spec.Join.Labels)
 		if err != nil {
-			return err
+			return release(fmt.Errorf("build join command for %s: %w", name, err))
 		}
 
 		userData, initscript, err := r.Renderer.Render(cloudinit.Params{
@@ -164,7 +467,7 @@ func (r *WorkerPoolReconciler) scaleUp(ctx context.Context, pool *infrav1.K8sWor
 			Disks:            cloudInitDisks,
 		})
 		if err != nil {
-			return err
+			return release(fmt.Errorf("render bootstrap for %s: %w", name, err))
 		}
 
 		vm, err := r.Cloud.CreateVM(ctx, cloud.CreateVMSpec{
@@ -188,21 +491,70 @@ func (r *WorkerPoolReconciler) scaleUp(ctx context.Context, pool *infrav1.K8sWor
 			EnableUUID: true,
 		})
 		if err != nil {
-			return err
+			return r.reserveUnlessGone(ctx, pool, alloc, ip, name,
+				fmt.Errorf("create worker %s: %w", name, err), persist)
 		}
 
+		cpu, memMB, diskGB := vm.CPU, vm.MemoryMB, vm.DiskGB
+		if cpu == 0 {
+			cpu = pool.Spec.Flavor.CPUs
+		}
+		if memMB == 0 {
+			memMB = pool.Spec.Flavor.MemoryMB
+		}
 		pool.Status.Nodes = append(pool.Status.Nodes, infrav1.WorkerNodeStatus{
 			Name:     name,
 			IP:       ip,
 			VMID:     vm.ID,
 			Phase:    infrav1.NodePhaseProvisioning,
-			CPU:      pool.Spec.Flavor.CPUs,
-			MemoryMB: pool.Spec.Flavor.MemoryMB,
+			CPU:      cpu,
+			MemoryMB: memMB,
+			DiskGB:   diskGB,
 		})
+		pool.Status.ObservedReplicas = int32(len(pool.Status.Nodes))
+		if err := persist(); err != nil {
+			return err
+		}
+		logger.Info("created worker", "node", name, "ip", ip, "vmID", vm.ID)
 	}
-
-	pool.Status.Ledger = toStatusLedger(alloc.Ledger())
 	return nil
+}
+
+// ownedWorkerVMs keeps the VMs that belong to the pool. Ownership is decided by
+// the name prefix, not by metadata: workers that already existed before the
+// controller was installed carry no labels, and adopting them is what prevents
+// duplicate names and addresses.
+func ownedWorkerVMs(pool *infrav1.K8sWorkerPool, vms []cloud.VM) []cloud.VM {
+	prefix := pool.Spec.NamePrefix + "-wrk-"
+	out := make([]cloud.VM, 0, len(vms))
+	for _, vm := range vms {
+		if strings.HasPrefix(vm.Name, prefix) {
+			out = append(out, vm)
+		}
+	}
+	return out
+}
+
+// reserveUnlessGone keeps the address when a VM survived a failed create and
+// frees it otherwise, so repeated failures cannot leak the worker range.
+func (r *WorkerPoolReconciler) reserveUnlessGone(ctx context.Context, pool *infrav1.K8sWorkerPool, alloc *ipam.Allocator, ip, name string, cause error, persist func() error) error {
+	exists := true // assume the worst when the lookup fails
+	if vms, err := r.Cloud.ListWorkerVMs(ctx, pool.Spec.VCD.VApp, nil); err == nil {
+		exists = false
+		for _, vm := range vms {
+			if vm.Name == name {
+				exists = true
+				break
+			}
+		}
+	}
+	if !exists {
+		_ = alloc.Free(ip)
+	}
+	if perr := persist(); perr != nil {
+		return fmt.Errorf("%w (persist ledger: %v)", cause, perr)
+	}
+	return cause
 }
 
 // scaleDown removes n workers. TODO: cordon -> drain (PDB-aware) -> remove from
@@ -220,16 +572,75 @@ func (r *WorkerPoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
+// mapNodeToPools enqueues only the pools whose name prefix owns the node.
+// Enqueueing every pool for every Node event caused a reconcile storm.
 func (r *WorkerPoolReconciler) mapNodeToPools(ctx context.Context, obj client.Object) []reconcile.Request {
+	node, ok := obj.(*corev1.Node)
+	if !ok {
+		return nil
+	}
 	var pools infrav1.K8sWorkerPoolList
 	if err := r.List(ctx, &pools); err != nil {
 		return nil
 	}
-	out := make([]reconcile.Request, 0, len(pools.Items))
+	out := make([]reconcile.Request, 0, 2)
 	for i := range pools.Items {
+		prefix := strings.ToLower(strings.TrimSpace(pools.Items[i].Spec.NamePrefix))
+		if prefix == "" || !strings.HasPrefix(strings.ToLower(node.Name), prefix+"-wrk-") {
+			continue
+		}
 		out = append(out, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&pools.Items[i])})
 	}
 	return out
+}
+
+// workerName ties the node name to the IP ordinal, so a reused address keeps
+// the name it was originally created with instead of shifting indices.
+func workerName(prefix string, ordinal int) string {
+	return fmt.Sprintf("%s-wrk-%02d", prefix, ordinal)
+}
+
+// buildJoinCommand renders a shell-safe kubeadm join command with validated
+// node labels.
+func buildJoinCommand(endpoint, token, caHash string, labels map[string]string) (string, error) {
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
+		return "", fmt.Errorf("join.endpoint is empty")
+	}
+	host, port, err := net.SplitHostPort(endpoint)
+	if err != nil || strings.TrimSpace(host) == "" {
+		return "", fmt.Errorf("join.endpoint %q must be host:port", endpoint)
+	}
+	if _, err := strconv.Atoi(port); err != nil {
+		return "", fmt.Errorf("join.endpoint %q has a non-numeric port", endpoint)
+	}
+	if token == "" || caHash == "" {
+		return "", fmt.Errorf("bootstrap token and CA hash are required")
+	}
+
+	cmd := fmt.Sprintf("kubeadm join %s --token %s --discovery-token-ca-cert-hash %s", endpoint, token, caHash)
+	if len(labels) == 0 {
+		return cmd, nil
+	}
+
+	keys := make([]string, 0, len(labels))
+	for k := range labels {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	pairs := make([]string, 0, len(keys))
+	for _, k := range keys {
+		v := labels[k]
+		if errs := utilvalidation.IsQualifiedName(k); len(errs) > 0 {
+			return "", fmt.Errorf("join.labels key %q is invalid: %s", k, strings.Join(errs, "; "))
+		}
+		if errs := utilvalidation.IsValidLabelValue(v); len(errs) > 0 {
+			return "", fmt.Errorf("join.labels value %q for %q is invalid: %s", v, k, strings.Join(errs, "; "))
+		}
+		pairs = append(pairs, k+"="+v)
+	}
+	return cmd + " --node-labels '" + strings.Join(pairs, ",") + "'", nil
 }
 
 func toIPAMPlan(p infrav1.IPPlan) ipam.Plan {
@@ -250,7 +661,11 @@ func toIPAMLedger(l infrav1.IPLedger) ipam.Ledger {
 }
 
 func toStatusLedger(l ipam.Ledger) infrav1.IPLedger {
-	return infrav1.IPLedger{NextIndex: l.NextIndex, Used: l.Used, Free: l.Free}
+	return infrav1.IPLedger{
+		NextIndex: l.NextIndex,
+		Used:      append([]string(nil), l.Used...),
+		Free:      append([]string(nil), l.Free...),
+	}
 }
 
 func toCloudInitDisks(in []infrav1.DiskSpec) ([]cloudinit.DiskParam, error) {

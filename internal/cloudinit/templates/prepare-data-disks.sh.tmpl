@@ -20,7 +20,7 @@ if [[ -f "$MARKER" ]]; then
   exit 0
 fi
 
-for tool in pvcreate vgcreate lvcreate mkfs blkid rsync blockdev mountpoint findmnt; do
+for tool in pvcreate vgcreate lvcreate pvs vgs lvs mkfs blkid rsync blockdev mountpoint; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     log "missing required tool: $tool"
     exit 1
@@ -153,7 +153,10 @@ write_fstab {{ printf "%q" .Mount }} {{ printf "%q" .TempMount }} {{ printf "%q"
 touch "$MARKER"
 sync
 log "rebooting to activate final /var and /var/lib mounts"
-reboot
+if ! reboot; then
+  log "reboot command failed"
+  exit 1
+fi
 # 42 tells the vCD initscript that a reboot was requested, so it must not
 # continue with cloud-init in the same boot.
 exit 42

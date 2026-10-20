@@ -6,12 +6,14 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 )
 
@@ -144,6 +146,43 @@ func (c *Client) WaitReady(ctx context.Context, name string, timeout time.Durati
 // Drain TODO: cordon + eviction-API drain (respect PDBs, skip DaemonSets/mirror pods).
 func (c *Client) Drain(ctx context.Context, name string, timeout time.Duration) error {
 	return ErrNotImplemented
+}
+
+// SetTaints replaces the node's taints. A merge patch is used so the controller
+// only needs the patch verb on nodes.
+func (c *Client) SetTaints(ctx context.Context, name string, taints []corev1.Taint) error {
+	node, err := c.cs.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	if taintsEqual(node.Spec.Taints, taints) {
+		return nil
+	}
+	body, err := json.Marshal(map[string]interface{}{
+		"spec": map[string]interface{}{"taints": taints},
+	})
+	if err != nil {
+		return err
+	}
+	_, err = c.cs.CoreV1().Nodes().Patch(ctx, name, types.MergePatchType, body, metav1.PatchOptions{})
+	return err
+}
+
+func taintsEqual(a, b []corev1.Taint) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	seen := make(map[corev1.Taint]int, len(a))
+	for _, t := range a {
+		seen[t]++
+	}
+	for _, t := range b {
+		if seen[t] == 0 {
+			return false
+		}
+		seen[t]--
+	}
+	return true
 }
 
 // DeleteNode removes the Node object from the cluster.

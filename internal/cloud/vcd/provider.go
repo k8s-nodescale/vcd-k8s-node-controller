@@ -301,17 +301,27 @@ func (p *Provider) findTemplate(vdc *govcd.Vdc, spec cloud.CreateVMSpec) (*govcd
 		return tpl, nil
 	}
 
-	orgName := strings.TrimSpace(spec.CatalogOrg)
-	if orgName == "" {
-		orgName = p.cfg.Org
-	}
-	org, err := p.client.GetOrgByName(orgName)
+	// A catalog shared into this org is visible here, and an org admin often
+	// cannot read the publishing org at all, so try the controller org first and
+	// only then the org named in spec.vcd.catalogOrg.
+	org, err := p.client.GetOrgByName(p.cfg.Org)
 	if err != nil {
-		return nil, fmt.Errorf("get catalog org %q: %w", orgName, err)
+		return nil, fmt.Errorf("get org %q: %w", p.cfg.Org, err)
 	}
 	catalog, err := org.GetCatalogByName(spec.Catalog, true)
 	if err != nil {
-		return nil, fmt.Errorf("get catalog %q in org %q: %w", spec.Catalog, orgName, err)
+		orgName := strings.TrimSpace(spec.CatalogOrg)
+		if orgName == "" || strings.EqualFold(orgName, p.cfg.Org) {
+			return nil, fmt.Errorf("get catalog %q in org %q: %w", spec.Catalog, p.cfg.Org, err)
+		}
+		other, oerr := p.client.GetOrgByName(orgName)
+		if oerr != nil {
+			return nil, fmt.Errorf("get catalog org %q: %w", orgName, oerr)
+		}
+		catalog, err = other.GetCatalogByName(spec.Catalog, true)
+		if err != nil {
+			return nil, fmt.Errorf("get catalog %q in org %q: %w", spec.Catalog, orgName, err)
+		}
 	}
 	tpl, err := catalog.GetVAppTemplateByName(spec.Template)
 	if err != nil {

@@ -94,3 +94,87 @@ func TestLedgerPersistence(t *testing.T) {
 		t.Fatalf("expected 192.168.100.9 after restoring ledger, got %s", got)
 	}
 }
+
+func TestOrdinalMatchesAllocationOrder(t *testing.T) {
+	a, err := New(basePlan(), Ledger{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		want int
+		ip   string
+	}{{1, "192.168.100.7"}, {2, "192.168.100.8"}, {3, "192.168.100.9"}}
+	for _, tc := range cases {
+		want, ip := tc.want, tc.ip
+		gotIP, err := a.Allocate()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if gotIP != ip {
+			t.Fatalf("allocated %s, want %s", gotIP, ip)
+		}
+		got, err := a.Ordinal(gotIP)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("Ordinal(%s) = %d, want %d", gotIP, got, want)
+		}
+	}
+}
+
+func TestAdoptPreventsDuplicateAllocation(t *testing.T) {
+	a, err := New(basePlan(), Ledger{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A VM created in a previous reconcile exists in vCD but is missing from
+	// the ledger: it must be adopted rather than handed out again.
+	if err := a.Adopt("192.168.100.8"); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"192.168.100.7", "192.168.100.9"} {
+		got, err := a.Allocate()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("allocated %s, want %s", got, want)
+		}
+	}
+	ledger := a.Ledger()
+	if ledger.NextIndex != 3 {
+		t.Fatalf("NextIndex = %d, want 3", ledger.NextIndex)
+	}
+}
+
+func TestAdoptRemovesAddressFromFreeList(t *testing.T) {
+	a, err := New(basePlan(), Ledger{Used: []string{"192.168.100.7", "192.168.100.8"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Free("192.168.100.8"); err != nil {
+		t.Fatal(err)
+	}
+	// The VM for .8 is still alive, so the reconciler adopts it again.
+	if err := a.Adopt("192.168.100.8"); err != nil {
+		t.Fatal(err)
+	}
+	ip, err := a.Allocate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ip == "192.168.100.8" {
+		t.Fatal("adopted address was handed out again")
+	}
+}
+
+func TestAdoptRejectsAddressOutsidePlan(t *testing.T) {
+	a, err := New(basePlan(), Ledger{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Adopt("10.0.0.5"); err == nil {
+		t.Fatal("expected an error for an address outside the plan CIDR")
+	}
+}

@@ -57,12 +57,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	vcdOrg := os.Getenv("VCD_ORG")
+	vcdVDC := os.Getenv("VCD_VDC")
 	cloudProvider, err := vcd.New(vcd.Config{
 		URL:      os.Getenv("VCD_URL"),
 		User:     os.Getenv("VCD_USER"),
 		Password: os.Getenv("VCD_PASSWORD"),
-		Org:      os.Getenv("VCD_ORG"),
-		VDC:      os.Getenv("VCD_VDC"),
+		Org:      vcdOrg,
+		VDC:      vcdVDC,
 		Insecure: os.Getenv("VCD_INSECURE") == "true",
 	})
 	if err != nil {
@@ -89,6 +91,8 @@ func main() {
 		Kube:     kube.NewClient(cs),
 		Renderer: renderer,
 		Recorder: mgr.GetEventRecorderFor("k8sworkerpool-controller"),
+		Org:      vcdOrg,
+		VDC:      vcdVDC,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller")
 		os.Exit(1)
