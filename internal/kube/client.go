@@ -85,7 +85,10 @@ func (c *Client) CAHash(ctx context.Context) (string, error) {
 	return "sha256:" + hex.EncodeToString(sum[:]), nil
 }
 
-// CreateBootstrapToken creates a short-lived kubeadm bootstrap token via the API.
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;update,namespace=kube-public
+
+// CreateBootstrapToken creates a short-lived kubeadm bootstrap token via the API
+// and publishes the JWS signature kubeadm needs for token-based discovery.
 // The returned value is suitable for `kubeadm join --token`.
 func (c *Client) CreateBootstrapToken(ctx context.Context, ttl time.Duration) (string, error) {
 	if ttl <= 0 {
@@ -101,8 +104,11 @@ func (c *Client) CreateBootstrapToken(ctx context.Context, ttl time.Duration) (s
 	}
 	obj := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: "bootstrap-token-",
-			Namespace:    "kube-system",
+			// kubeadm names the secret after the token id; keeping the same
+			// convention makes the secret, the JWS entry and the join command
+			// trivially traceable to each other.
+			Name:      "bootstrap-token-" + id,
+			Namespace: "kube-system",
 		},
 		Type: corev1.SecretType("bootstrap.kubernetes.io/token"),
 		StringData: map[string]string{
@@ -117,7 +123,39 @@ func (c *Client) CreateBootstrapToken(ctx context.Context, ttl time.Duration) (s
 	if _, err := c.cs.CoreV1().Secrets("kube-system").Create(ctx, obj, metav1.CreateOptions{}); err != nil {
 		return "", err
 	}
+	// The secret alone is not enough: kubeadm validates the API server identity
+	// through the JWS entry in cluster-info and refuses to join without it.
+	if err := c.publishClusterInfoJWS(ctx, id); err != nil {
+		_ = c.cs.CoreV1().Secrets("kube-system").Delete(ctx, obj.Name, metav1.DeleteOptions{})
+		return "", err
+	}
 	return id + "." + secret, nil
+}
+
+// publishClusterInfoJWS adds the jws-kubeconfig-<tokenID> entry kubeadm looks
+// up during token-based discovery. The signature covers the exact kubeconfig
+// bytes stored in the ConfigMap.
+func (c *Client) publishClusterInfoJWS(ctx context.Context, tokenID string) error {
+	cm, err := c.cs.CoreV1().ConfigMaps(clusterInfoNamespace).Get(ctx, clusterInfoName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("read %s/%s for bootstrap token %s: %w", clusterInfoNamespace, clusterInfoName, tokenID, err)
+	}
+	kubeconfig, ok := cm.Data[clusterInfoKubeconfigKey]
+	if !ok || kubeconfig == "" {
+		return fmt.Errorf("%s/%s has no %q data key", clusterInfoNamespace, clusterInfoName, clusterInfoKubeconfigKey)
+	}
+	jws, err := computeDetachedJWS([]byte(kubeconfig))
+	if err != nil {
+		return err
+	}
+	if cm.Data == nil {
+		cm.Data = map[string]string{}
+	}
+	cm.Data[jwsSignatureKeyPrefix+tokenID] = jws
+	if _, err := c.cs.CoreV1().ConfigMaps(clusterInfoNamespace).Update(ctx, cm, metav1.UpdateOptions{}); err != nil {
+		return fmt.Errorf("publish JWS for bootstrap token %s: %w", tokenID, err)
+	}
+	return nil
 }
 
 // WaitReady polls until the named Node reports Ready.

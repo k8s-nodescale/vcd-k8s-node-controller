@@ -48,3 +48,30 @@ subjects:
     name: {{ include "vcd-nodescale.serviceAccountName" . }}
     namespace: {{ include "vcd-nodescale.namespace" . }}
 {{- end }}
+---
+# kubeadm validates the API server identity through the JWS entries in the
+# kube-public/cluster-info ConfigMap, so a bootstrap token created through the
+# API is useless until its jws-kubeconfig-<id> entry is published there.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "vcd-nodescale.fullname" . }}-clusterinfo
+  namespace: kube-public
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "vcd-nodescale.fullname" . }}-clusterinfo
+  namespace: kube-public
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "vcd-nodescale.fullname" . }}-clusterinfo
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "vcd-nodescale.serviceAccountName" . }}
+    namespace: {{ include "vcd-nodescale.namespace" . }}
