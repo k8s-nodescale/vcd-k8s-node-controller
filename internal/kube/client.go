@@ -15,6 +15,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/util/retry"
 )
 
 // Client is a client-go-backed kube.Provider.
@@ -61,6 +62,12 @@ func (c *Client) ListNodes(ctx context.Context) ([]NodeInfo, error) {
 }
 
 // CAHash computes the kubeadm --discovery-token-ca-cert-hash from the cluster CA.
+//
+// kubeadm pins the SubjectPublicKeyInfo of the CA, not the certificate: its
+// util/pubkeypin hashes x509.MarshalPKIXPublicKey(cert.PublicKey). Hashing
+// cert.Raw instead yields a plausible looking sha256:... that kubeadm always
+// rejects with `cluster CA found in cluster-info ConfigMap is invalid: none of
+// the public keys ... are pinned`.
 func (c *Client) CAHash(ctx context.Context) (string, error) {
 	var pemBytes []byte
 	for _, ns := range []string{"kube-public", "kube-system"} {
@@ -81,7 +88,11 @@ func (c *Client) CAHash(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	sum := sha256.Sum256(cert.Raw)
+	spki, err := x509.MarshalPKIXPublicKey(cert.PublicKey)
+	if err != nil {
+		return "", fmt.Errorf("encode CA public key: %w", err)
+	}
+	sum := sha256.Sum256(spki)
 	return "sha256:" + hex.EncodeToString(sum[:]), nil
 }
 
@@ -136,23 +147,32 @@ func (c *Client) CreateBootstrapToken(ctx context.Context, ttl time.Duration) (s
 // up during token-based discovery. The signature covers the exact kubeconfig
 // bytes stored in the ConfigMap.
 func (c *Client) publishClusterInfoJWS(ctx context.Context, tokenID string) error {
-	cm, err := c.cs.CoreV1().ConfigMaps(clusterInfoNamespace).Get(ctx, clusterInfoName, metav1.GetOptions{})
-	if err != nil {
-		return fmt.Errorf("read %s/%s for bootstrap token %s: %w", clusterInfoNamespace, clusterInfoName, tokenID, err)
-	}
-	kubeconfig, ok := cm.Data[clusterInfoKubeconfigKey]
-	if !ok || kubeconfig == "" {
-		return fmt.Errorf("%s/%s has no %q data key", clusterInfoNamespace, clusterInfoName, clusterInfoKubeconfigKey)
-	}
-	jws, err := computeDetachedJWS([]byte(kubeconfig))
-	if err != nil {
+	var jws string
+	// cluster-info is shared with anything else that creates tokens, so a
+	// concurrent write is expected and must not fail the whole scale-up.
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		cm, err := c.cs.CoreV1().ConfigMaps(clusterInfoNamespace).Get(ctx, clusterInfoName, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("read %s/%s for bootstrap token %s: %w", clusterInfoNamespace, clusterInfoName, tokenID, err)
+		}
+		kubeconfig, ok := cm.Data[clusterInfoKubeconfigKey]
+		if !ok || kubeconfig == "" {
+			return fmt.Errorf("%s/%s has no %q data key", clusterInfoNamespace, clusterInfoName, clusterInfoKubeconfigKey)
+		}
+		if jws == "" {
+			jws, err = computeDetachedJWS([]byte(kubeconfig))
+			if err != nil {
+				return err
+			}
+		}
+		if cm.Data == nil {
+			cm.Data = map[string]string{}
+		}
+		cm.Data[jwsSignatureKeyPrefix+tokenID] = jws
+		_, err = c.cs.CoreV1().ConfigMaps(clusterInfoNamespace).Update(ctx, cm, metav1.UpdateOptions{})
 		return err
-	}
-	if cm.Data == nil {
-		cm.Data = map[string]string{}
-	}
-	cm.Data[jwsSignatureKeyPrefix+tokenID] = jws
-	if _, err := c.cs.CoreV1().ConfigMaps(clusterInfoNamespace).Update(ctx, cm, metav1.UpdateOptions{}); err != nil {
+	})
+	if err != nil {
 		return fmt.Errorf("publish JWS for bootstrap token %s: %w", tokenID, err)
 	}
 	return nil
