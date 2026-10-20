@@ -34,4 +34,7 @@ type Provider interface {
 	// SetTaints replaces the taints on a Node. It is a no-op when they already
 	// match.
 	SetTaints(ctx context.Context, name string, taints []corev1.Taint) error
+
+	// SetLabels adds or updates labels on a Node. Other labels are left alone.
+	SetLabels(ctx context.Context, name string, labels map[string]string) error
 }

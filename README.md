@@ -10,28 +10,40 @@ design doc).
 
 ## Status
 
-Early skeleton — the structure, API, IP allocator, token/CA logic, cloud-init
-renderer and packaging are in place. Several provider methods are deliberate
-stubs (see Roadmap).
+Working end to end on the dev tenant (`KION-WEB-DEV`, NSX-V, vApp `K8s_cluster`):
+adding replicas to a `K8sWorkerPool` creates a VM, lays out its data disks,
+boots the guest, joins it to the cluster and reports it Ready.
 
 Implemented:
 
 - `K8sWorkerPool` CRD (`infra.example.com/v1alpha1`) + generated deepcopy/CRD.
 - `ipam` allocator aware of Terraform's `ip_plan` (gateway, VIPs, masters, DVM,
-  explicit reservations) with unit tests.
-- `kube` provider: bootstrap-token creation, CA hash from `kube-root-ca.crt`,
-  node listing/readiness, node deletion (client-go).
-- `cloudinit` renderer: vCD initscript + worker user-data templates.
-- Reconciler skeleton with a working scale-up flow and a guarded scale-down TODO.
-- Helm chart, kustomize manifests, RBAC, sample CR, CI workflow.
+  explicit reservations). Worker names are derived from the address ordinal and
+  existing VMs are adopted into the ledger on every pass, so a lost status can
+  never produce a duplicate name or IP.
+- `cloud/vcd` provider on `govcd`: create VM from a catalog template, paravirtual
+  SCSI data disks, IP-assigned NIC on the org network, guest customization with
+  the rendered cloud-init payload. `DeleteVM` is still a stub.
+- Guest bootstrap (`internal/cloudinit`): swap off, kernel modules/sysctl,
+  containerd, pinned `pkgs.k8s.io` packages, `kubeadm join`, run by a systemd
+  unit that retries and is re-armed on later boots. One deliberate reboot to
+  relocate `/var` and `/var/lib` onto the data disks.
+- Readiness: `Provisioning` -> `Joining` -> `Ready` from the real Node objects;
+  allocatable CPU/memory, kubelet version, and `Ready=True/Converged` once every
+  requested worker is Ready.
+- `join.labels` applied to the Node after it is Ready (kubeadm 1.35 has no
+  `--node-labels`), `join.taints` merge-patched onto Ready nodes.
+- Exactly one status write per pass, with conflicts treated as "retry next
+  pass". Two writes per pass used to make the controller fight its own
+  resourceVersion and never converge.
 
 Not implemented yet:
 
-- `govcd` VM create/delete, internal disks, guest customization, LB pool members.
-- Scale-down (cordon/drain/reset/delete) and PDB-aware eviction.
-- Option A disk + `/var` relocation details (deferred by design).
-- LB pool membership added only after the Node reports `Ready`.
-- Finalizers and full reconciliation of `status.nodes`.
+- `govcd` VM delete and scale-down (cordon, PDB-aware drain, disk cleanup).
+- Ingress LB pool membership (add only after the Node is Ready).
+- Finalizers and a failed-provisioning watchdog: a VM that boots but never joins
+  is counted in `observedReplicas` and is not replaced automatically.
+- Token renewal for joins that outlive `join.tokenTTL`.
 
 ## Layout
 
@@ -40,7 +52,7 @@ api/v1alpha1/            CRD Go types, group registration, generated deepcopy
 cmd/manager/             controller-runtime entrypoint
 internal/controller/     WorkerPool reconciler (+ Node watch)
 internal/cloud/          cloud.Provider interface
-internal/cloud/vcd/      govcd-backed implementation (stubs)
+internal/cloud/vcd/      govcd-backed implementation
 internal/kube/           kube.Provider interface + client-go implementation
 internal/ipam/           ip_plan-aware IP ledger/allocator (+ tests)
 internal/cloudinit/      renderer + embedded templates
@@ -70,7 +82,16 @@ make manifests
 
 1. Create the vCD credentials secret in the target namespace (keys: `url`,
    `user`, `password`, `org`, `vdc`, optional `insecure`).
-2. Install the chart:
+2. Install the chart from the published repository:
+
+```
+helm repo add vcd-nodescale https://werton13.github.io/vcd-k8s-node-controller
+helm repo update
+helm install vcd-nodescale vcd-nodescale/vcd-nodescale \
+  --namespace vcd-nodescale-system --create-namespace
+```
+
+Or from a checkout:
 
 ```
 helm install vcd-nodescale charts/vcd-nodescale \
@@ -97,60 +118,46 @@ architecture, algorithms and open questions.
 
 ## Roadmap
 
-1. Implement `govcd` `CreateVM` / `DeleteVM` and verify against a dev tenant.
-2. Finish scale-down: cordon, drain, LB removal, delete, ledger free.
-3. Implement Option A cloud-init (disks, `/var` relocation, reboot guard).
-4. Add LB pool membership after `Node Ready`; remove on scale-in.
-5. Finalizers, retries/backoff, e2e on a dev tenant (2 -> 4 -> 2 via CRD).
-6. Publish image + chart; wire the Terraform `node_controller` variable.
+1. Implement `govcd` `DeleteVM` and finish scale-down: cordon, drain, LB
+   removal, delete, ledger free, node delete.
+2. Failed-provisioning watchdog (VM up but Node absent for N minutes).
+3. Token renewal / re-issued join for slow installs.
+4. LB pool membership after `Node Ready`; remove on scale-in.
+5. Finalizers, e2e on a dev tenant (2 -> 4 -> 2 via the CRD).
+6. Wire the Terraform `node_controller` variable.
 
 ## Container image
+
+The image is published to Docker Hub on a `v*` tag:
+`docker.io/werton13/vcd-k8s-node-controller` (`.github/workflows/docker-publish.yaml`).
 
 Build locally (the Dockerfile uses `golang:1.27.1-alpine` and
 `gcr.io/distroless/static:nonroot`):
 
-```bash
-docker build -t docker.io/<dockerhub-user>/vcd-k8s-node-controller:0.1.0 .
+```
+docker build -t docker.io/werton13/vcd-k8s-node-controller:0.1.2 .
 ```
 
 Public module defaults are used inside the build. On a restricted network,
 override them:
 
-```bash
+```
 docker build \
   --build-arg GOPROXY=https://nexus.example.com/repository/golang/ \
   --build-arg GOSUMDB=off \
-  -t docker.io/<dockerhub-user>/vcd-k8s-node-controller:0.1.0 .
+  -t docker.io/werton13/vcd-k8s-node-controller:0.1.2 .
 ```
 
-Push:
+Push (or use `make image-push`):
 
-```bash
+```
 docker login docker.io
-docker push docker.io/<dockerhub-user>/vcd-k8s-node-controller:0.1.0
-docker push docker.io/<dockerhub-user>/vcd-k8s-node-controller:latest
+docker push docker.io/werton13/vcd-k8s-node-controller:0.1.2
+docker push docker.io/werton13/vcd-k8s-node-controller:latest
 ```
 
-Or via make:
-
-```bash
-make image IMAGE=docker.io/<dockerhub-user>/vcd-k8s-node-controller TAG=0.1.0
-make image-push IMAGE=docker.io/<dockerhub-user>/vcd-k8s-node-controller TAG=0.1.0
-```
-
-The image is `linux/amd64`, runs as distroless `nonroot` (UID 65532), and is
-about 58 MB uncompressed. For a multi-arch manifest:
-
-```bash
-docker buildx build --platform linux/amd64,linux/arm64 \
-  -t docker.io/<dockerhub-user>/vcd-k8s-node-controller:0.1.0 --push .
-```
-
-A local tarball can be moved between machines with `docker save` / `docker load`
-(see `make image-save`). Tag-based publishing is wired in
-`.github/workflows/docker-publish.yaml` and expects the
-`DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` repository secrets.
+The image is `linux/amd64` and runs as distroless `nonroot` (UID 65532).
 
 ## License
 
-Apache-2.0 (add the full `LICENSE` text before publishing).
+Apache-2.0, see [`LICENSE`](LICENSE).

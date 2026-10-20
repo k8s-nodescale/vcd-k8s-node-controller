@@ -148,6 +148,35 @@ func (c *Client) Drain(ctx context.Context, name string, timeout time.Duration) 
 	return ErrNotImplemented
 }
 
+// SetLabels adds or updates the given labels. A merge patch keeps unrelated
+// labels (kubelet, cloud provider) intact.
+func (c *Client) SetLabels(ctx context.Context, name string, labels map[string]string) error {
+	if len(labels) == 0 {
+		return nil
+	}
+	node, err := c.cs.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	diff := make(map[string]string, len(labels))
+	for k, v := range labels {
+		if node.Labels[k] != v {
+			diff[k] = v
+		}
+	}
+	if len(diff) == 0 {
+		return nil
+	}
+	body, err := json.Marshal(map[string]interface{}{
+		"metadata": map[string]interface{}{"labels": diff},
+	})
+	if err != nil {
+		return err
+	}
+	_, err = c.cs.CoreV1().Nodes().Patch(ctx, name, types.MergePatchType, body, metav1.PatchOptions{})
+	return err
+}
+
 // SetTaints replaces the node's taints. A merge patch is used so the controller
 // only needs the patch verb on nodes.
 func (c *Client) SetTaints(ctx context.Context, name string, taints []corev1.Taint) error {

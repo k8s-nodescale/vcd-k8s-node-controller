@@ -187,7 +187,7 @@ func (p *Provider) CreateVM(ctx context.Context, spec cloud.CreateVMSpec) (cloud
 			IsConnected:             true,
 			NeedsCustomization:      true,
 			IPAddressAllocationMode: types.IPAllocationModeManual,
-			IpType:                  "IPv4",
+			IpType:                  "IPV4",
 		}},
 	}
 

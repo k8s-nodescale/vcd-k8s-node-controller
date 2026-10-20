@@ -67,6 +67,7 @@ func (f *fakeCloud) RemovePoolMember(ctx context.Context, pool cloud.PoolRef, ip
 type fakeKube struct {
 	nodes  []kube.NodeInfo
 	taints map[string][]corev1.Taint
+	labels map[string]map[string]string
 }
 
 func (f *fakeKube) CreateBootstrapToken(ctx context.Context, ttl time.Duration) (string, error) {
@@ -86,6 +87,14 @@ func (f *fakeKube) SetTaints(ctx context.Context, name string, taints []corev1.T
 		f.taints = map[string][]corev1.Taint{}
 	}
 	f.taints[name] = taints
+	return nil
+}
+
+func (f *fakeKube) SetLabels(ctx context.Context, name string, labels map[string]string) error {
+	if f.labels == nil {
+		f.labels = map[string]map[string]string{}
+	}
+	f.labels[name] = labels
 	return nil
 }
 
@@ -207,8 +216,11 @@ func TestReconcileScalesUpAndIsIdempotent(t *testing.T) {
 	if got := fc.created[0].IP; got != "192.168.100.7" {
 		t.Fatalf("first IP = %q, want 192.168.100.7", got)
 	}
-	if !strings.Contains(fc.created[0].UserData, "--node-labels") {
-		t.Error("user-data is missing the node labels flag")
+	if strings.Contains(fc.created[0].UserData, "--node-labels") {
+		t.Error("user-data must not pass --node-labels to kubeadm join")
+	}
+	if !strings.Contains(fc.created[0].UserData, "kubeadm join") {
+		t.Error("user-data is missing the join command")
 	}
 
 	got := getPool(t, r, pool)
@@ -332,7 +344,7 @@ func TestReconcileRejectsMismatchedOrg(t *testing.T) {
 }
 
 func TestBuildJoinCommand(t *testing.T) {
-	cmd, err := buildJoinCommand("192.168.100.2:6443", "tok", "sha256:aa", nil)
+	cmd, err := buildJoinCommand("192.168.100.2:6443", "tok", "sha256:aa")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -340,16 +352,9 @@ func TestBuildJoinCommand(t *testing.T) {
 	if cmd != want {
 		t.Fatalf("got %q, want %q", cmd, want)
 	}
-
-	cmd, err = buildJoinCommand("192.168.100.2:6443", "tok", "sha256:aa", map[string]string{
-		"b": "2",
-		"a": "1",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.HasSuffix(cmd, " --node-labels 'a=1,b=2'") {
-		t.Fatalf("labels not sorted or quoted: %q", cmd)
+	// kubeadm join has no --node-labels flag in 1.35; labels are patched later.
+	if strings.Contains(cmd, "--node-labels") {
+		t.Fatalf("join command must not use --node-labels: %q", cmd)
 	}
 
 	for _, tc := range []struct{ name, endpoint string }{
@@ -357,15 +362,9 @@ func TestBuildJoinCommand(t *testing.T) {
 		{"non-numeric port", "192.168.100.2:kube"},
 		{"empty", ""},
 	} {
-		if _, err := buildJoinCommand(tc.endpoint, "tok", "sha256:aa", nil); err == nil {
+		if _, err := buildJoinCommand(tc.endpoint, "tok", "sha256:aa"); err == nil {
 			t.Errorf("%s: expected an error", tc.name)
 		}
-	}
-	if _, err := buildJoinCommand("192.168.100.2:6443", "tok", "sha256:aa", map[string]string{"bad key": "v"}); err == nil {
-		t.Error("expected an error for an invalid label key")
-	}
-	if _, err := buildJoinCommand("192.168.100.2:6443", "tok", "sha256:aa", map[string]string{"a": "x'y"}); err == nil {
-		t.Error("expected an error for an invalid label value")
 	}
 }
 
@@ -486,6 +485,19 @@ func TestReconcileAppliesTaintsOnlyToReadyNodes(t *testing.T) {
 	}
 }
 
+func TestValidateSpecRejectsInvalidLabels(t *testing.T) {
+	pool := testPool(1)
+	pool.Spec.Join.Labels = map[string]string{"bad key": "v"}
+	r := &WorkerPoolReconciler{}
+	if msg := r.validateSpec(pool); msg == "" {
+		t.Fatal("expected an error for an invalid label key")
+	}
+	pool.Spec.Join.Labels = map[string]string{"ok": "x'y"}
+	if msg := r.validateSpec(pool); msg == "" {
+		t.Fatal("expected an error for an invalid label value")
+	}
+}
+
 func TestParseTaints(t *testing.T) {
 	got, err := parseTaints([]string{"dedicated=workers:NoSchedule", "node-role.kubernetes.io/worker:NoExecute", ""})
 	if err != nil {
@@ -543,6 +555,7 @@ func TestReconcileMatchesNodeNamesCaseInsensitively(t *testing.T) {
 	ctx := context.Background()
 	pool := testPool(1)
 	pool.Spec.NamePrefix = "KION-WEB-DEV"
+	pool.Spec.Join.Labels = map[string]string{"node-role.kubernetes.io/worker": ""}
 	fc := &fakeCloud{vms: []cloud.VM{
 		{ID: "vm-1", Name: "KION-WEB-DEV-wrk-01", IP: "192.168.100.7"},
 	}}
@@ -559,5 +572,8 @@ func TestReconcileMatchesNodeNamesCaseInsensitively(t *testing.T) {
 	}
 	if cond := metaReady(got); cond == nil || cond.Status != metav1.ConditionTrue {
 		t.Fatalf("unexpected condition: %#v", cond)
+	}
+	if _, ok := fk.labels["kion-web-dev-wrk-01"]; !ok {
+		t.Fatalf("labels were not applied to the lower-case node name: %#v", fk.labels)
 	}
 }
