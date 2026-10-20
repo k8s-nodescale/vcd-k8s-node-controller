@@ -12,6 +12,7 @@ var ErrNotImplemented = errors.New("cloud provider method not implemented")
 // DiskSpec describes an internal disk to attach to a worker VM.
 type DiskSpec struct {
 	SizeGB         int32
+	Mount          string
 	BusType        string
 	BusNumber      int32
 	UnitNumber     int32

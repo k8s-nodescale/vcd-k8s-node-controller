@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# Option A data-disk preparation, mirroring the Ansible prepare_k8s_nodes role:
+#   LVM on the data disks -> temporary mounts -> move /var and /var/lib ->
+#   rewrite fstab by UUID -> reboot once.
+#
+# The script is idempotent: a marker on the root filesystem prevents a reboot
+# loop, and LVM/filesystem creation steps are skipped when they already exist.
+set -euo pipefail
+
+MARKER=/etc/vcd-data-disks.done
+LOG=/var/log/vcd-data-disks.log
+exec >>"$LOG" 2>&1
+
+log() {
+  echo "[$(date -Is)] $*"
+}
+
+if [[ -f "$MARKER" ]]; then
+  log "data disks already prepared; nothing to do"
+  exit 0
+fi
+
+for tool in pvcreate vgcreate lvcreate mkfs blkid rsync blockdev mountpoint findmnt; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    log "missing required tool: $tool"
+    exit 1
+  fi
+done
+
+wait_for_device() {
+  local dev="$1" size_gb="$2" i bytes expected
+  expected=$((size_gb * 1024 * 1024 * 1024))
+  for i in $(seq 1 60); do
+    if [[ -b "$dev" ]]; then
+      bytes=$(blockdev --getsize64 "$dev")
+      # Allow 1 GiB tolerance for controller/geometry rounding.
+      if (( bytes >= expected - 1073741824 && bytes <= expected + 1073741824 )); then
+        return 0
+      fi
+      log "device $dev has unexpected size $bytes (expected about $expected)"
+      return 1
+    fi
+    sleep 2
+  done
+  log "timed out waiting for $dev"
+  return 1
+}
+
+prepare_disk() {
+  local dev="$1" vg="$2" lv="$3" temp="$4" fs="$5" size_gb="$6"
+  local lvdev existing_fs
+
+  wait_for_device "$dev" "$size_gb"
+
+  if pvs --noheadings -o pv_name "$dev" 2>/dev/null | grep -qw "$dev"; then
+    log "$dev is already an LVM physical volume"
+  else
+    # Never overwrite a disk that already carries a filesystem or partition
+    # table. A blank data disk has no signature.
+    if blkid -p "$dev" >/dev/null 2>&1; then
+      log "$dev already has a filesystem/partition signature; refusing to overwrite"
+      return 1
+    fi
+    log "creating physical volume on $dev"
+    pvcreate -ff -y "$dev"
+  fi
+
+  if ! vgs "$vg" >/dev/null 2>&1; then
+    log "creating volume group $vg"
+    vgcreate "$vg" "$dev"
+  fi
+
+  if ! lvs "$vg/$lv" >/dev/null 2>&1; then
+    log "creating logical volume $vg/$lv"
+    lvcreate -l 100%FREE -n "$lv" "$vg"
+  fi
+
+  lvdev=$(readlink -f "/dev/${vg}/${lv}")
+  existing_fs=$(blkid -p -s TYPE -o value "$lvdev" 2>/dev/null || true)
+  if [[ -n "$existing_fs" && "$existing_fs" != "$fs" ]]; then
+    log "$lvdev already contains filesystem $existing_fs, expected $fs; refusing to format"
+    return 1
+  fi
+  if [[ -z "$existing_fs" ]]; then
+    log "formatting $lvdev as $fs"
+    mkfs -t "$fs" "$lvdev"
+  fi
+
+  mkdir -p "$temp"
+  if ! mountpoint -q "$temp"; then
+    log "mounting $lvdev at $temp"
+    mount "$lvdev" "$temp"
+  fi
+}
+
+sync_data() {
+  local src="$1" dst="$2"
+  shift 2
+  local excludes=() e
+
+  if mountpoint -q "$src"; then
+    log "$src is already a mountpoint; skipping data copy"
+    return 0
+  fi
+  if [[ ! -d "$src" ]]; then
+    log "source $src does not exist; skipping copy"
+    return 0
+  fi
+  if [[ -z "$(ls -A "$src" 2>/dev/null)" ]]; then
+    log "source $src is empty; skipping copy"
+    return 0
+  fi
+
+  for e in "$@"; do
+    excludes+=("--exclude=$e")
+  done
+  log "copying $src -> $dst (excludes: ${*:-none})"
+  rsync -aHAX --one-file-system "${excludes[@]}" "$src"/ "$dst"/
+
+  # Keep excluded child mount points present under the parent so the later
+  # nested mount (e.g. /var/lib on data2) has a directory to mount over.
+  for e in "$@"; do
+    mkdir -p "$dst$e"
+  done
+}
+
+write_fstab() {
+  local final="$1" temp="$2" vg="$3" lv="$4" fs="$5"
+  local lvdev uuid
+
+  lvdev=$(readlink -f "/dev/${vg}/${lv}")
+  uuid=$(blkid -s UUID -o value "$lvdev")
+  if [[ -z "$uuid" ]]; then
+    log "no UUID found on $lvdev"
+    return 1
+  fi
+
+  # Remove stale entries for the temporary and final mount points, but keep
+  # comments. The trailing whitespace in the pattern prevents /var from
+  # matching /var/lib.
+  sed -i "\#^[^#].*[[:space:]]${temp}[[:space:]]#d" /etc/fstab
+  sed -i "\#^[^#].*[[:space:]]${final}[[:space:]]#d" /etc/fstab
+  echo "UUID=$uuid $final $fs defaults 0 2" >>/etc/fstab
+  log "fstab entry: UUID=$uuid $final $fs"
+}
+
+{{- range .Disks }}
+prepare_disk {{ printf "%q" .Device }} {{ printf "%q" .VG }} {{ printf "%q" .LV }} {{ printf "%q" .TempMount }} {{ printf "%q" .FSType }} {{ .SizeGB }}
+sync_data {{ printf "%q" .Mount }} {{ printf "%q" .TempMount }}{{ range .RsyncExcludes }} {{ printf "%q" . }}{{ end }}
+write_fstab {{ printf "%q" .Mount }} {{ printf "%q" .TempMount }} {{ printf "%q" .VG }} {{ printf "%q" .LV }} {{ printf "%q" .FSType }}
+{{- end }}
+
+touch "$MARKER"
+sync
+log "rebooting to activate final /var and /var/lib mounts"
+reboot
+# 42 tells the vCD initscript that a reboot was requested, so it must not
+# continue with cloud-init in the same boot.
+exit 42

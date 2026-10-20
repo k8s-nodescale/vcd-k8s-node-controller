@@ -14,12 +14,20 @@ import (
 var templatesFS embed.FS
 
 // DiskParam describes one additional data disk for the Option A layout.
+//
+// Device is the guest device name (e.g. /dev/sdb). TempMount is the temporary
+// mount used while copying the old contents; Mount is the final fstab mount
+// point (e.g. /var or /var/lib). RsyncExcludes are relative to Mount and keep
+// nested final mounts out of the parent copy (e.g. /lib for /var).
 type DiskParam struct {
-	Device string
-	VG     string
-	LV     string
-	Mount  string
-	FSType string
+	Device        string
+	VG            string
+	LV            string
+	TempMount     string
+	Mount         string
+	FSType        string
+	SizeGB        int32
+	RsyncExcludes []string
 }
 
 // Params is the full input for rendering a worker bootstrap.
@@ -43,6 +51,7 @@ type Params struct {
 type Renderer struct {
 	userDataTpl   *template.Template
 	initscriptTpl *template.Template
+	diskSetupTpl  *template.Template
 }
 
 // New parses the embedded templates.
@@ -55,7 +64,11 @@ func New() (*Renderer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse initscript template: %w", err)
 	}
-	return &Renderer{userDataTpl: ud, initscriptTpl: is}, nil
+	diskSetup, err := template.ParseFS(templatesFS, "templates/prepare-data-disks.sh.tmpl")
+	if err != nil {
+		return nil, fmt.Errorf("parse disk setup template: %w", err)
+	}
+	return &Renderer{userDataTpl: ud, initscriptTpl: is, diskSetupTpl: diskSetup}, nil
 }
 
 // Render returns the cloud-init user-data and the vCD customization initscript.
@@ -68,11 +81,16 @@ func (r *Renderer) Render(p Params) (userData string, initscript string, err err
 	if err != nil {
 		return "", "", err
 	}
+	var ds bytes.Buffer
+	if err := r.diskSetupTpl.Execute(&ds, p); err != nil {
+		return "", "", fmt.Errorf("render disk setup: %w", err)
+	}
 	var is bytes.Buffer
 	if err := r.initscriptTpl.Execute(&is, struct {
 		Params
 		CloudInitBase64Gz string
-	}{Params: p, CloudInitBase64Gz: gz}); err != nil {
+		DiskSetupScript   string
+	}{Params: p, CloudInitBase64Gz: gz, DiskSetupScript: ds.String()}); err != nil {
 		return "", "", fmt.Errorf("render initscript: %w", err)
 	}
 	return ud.String(), is.String(), nil

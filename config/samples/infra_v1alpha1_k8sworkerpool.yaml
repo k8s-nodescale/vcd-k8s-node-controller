@@ -21,13 +21,13 @@ spec:
     memoryMB: 8192
     template: ubuntu24.04-uuid-enabled-v1
     disks:
-      - sizeGB: 20
-        mount: /data1
+      - sizeGB: 10
+        mount: /var
         busType: paravirtual
         busNumber: 1
         unitNumber: 0
-      - sizeGB: 60
-        mount: /data2
+      - sizeGB: 30
+        mount: /var/lib
         busType: paravirtual
         busNumber: 1
         unitNumber: 1

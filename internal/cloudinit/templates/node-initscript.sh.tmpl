@@ -35,6 +35,25 @@ base64 -d <<'CLOUDINIT' | gzip -d > /var/lib/cloud/seed/nocloud/user-data
 {{ .CloudInitBase64Gz }}
 CLOUDINIT
 
+{{- if .Disks }}
+# Prepare the extra data disks before cloud-init starts. The script is also
+# listed in cloud-init bootcmd, so it still runs after the one-time reboot if
+# this customization script is not executed again.
+cat > /usr/local/sbin/prepare-data-disks.sh <<'DISKSETUP'
+{{ .DiskSetupScript }}
+DISKSETUP
+chmod 0700 /usr/local/sbin/prepare-data-disks.sh
+rc=0
+/usr/local/sbin/prepare-data-disks.sh || rc=$?
+if [[ "$rc" -eq 42 ]]; then
+  # The disk script requested a reboot; cloud-init will run on the next boot.
+  exit 0
+fi
+if [[ "$rc" -ne 0 ]]; then
+  exit "$rc"
+fi
+{{- end }}
+
 cloud-init init --local || true
 cloud-init init || true
 cloud-init modules --mode=config || true

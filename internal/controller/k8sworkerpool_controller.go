@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/netip"
 	"strconv"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -142,6 +143,11 @@ func (r *WorkerPoolReconciler) scaleUp(ctx context.Context, pool *infrav1.K8sWor
 		join := fmt.Sprintf("kubeadm join %s --token %s --discovery-token-ca-cert-hash %s",
 			pool.Spec.Join.Endpoint, token, caHash)
 
+		cloudInitDisks, err := toCloudInitDisks(pool.Spec.Flavor.Disks)
+		if err != nil {
+			return err
+		}
+
 		userData, initscript, err := r.Renderer.Render(cloudinit.Params{
 			NodeName:         name,
 			NodeIP:           ip,
@@ -155,7 +161,7 @@ func (r *WorkerPoolReconciler) scaleUp(ctx context.Context, pool *infrav1.K8sWor
 			K8sVersion:       pool.Spec.Bootstrap.K8sVersion,
 			K8sMinorRepo:     pool.Spec.Bootstrap.K8sMinorRepo,
 			JoinCommand:      join,
-			Disks:            toCloudInitDisks(pool.Spec.Flavor.Disks),
+			Disks:            cloudInitDisks,
 		})
 		if err != nil {
 			return err
@@ -247,18 +253,58 @@ func toStatusLedger(l ipam.Ledger) infrav1.IPLedger {
 	return infrav1.IPLedger{NextIndex: l.NextIndex, Used: l.Used, Free: l.Free}
 }
 
-func toCloudInitDisks(in []infrav1.DiskSpec) []cloudinit.DiskParam {
-	out := make([]cloudinit.DiskParam, 0, len(in))
-	for i, d := range in {
+func toCloudInitDisks(in []infrav1.DiskSpec) ([]cloudinit.DiskParam, error) {
+	if len(in) == 0 {
+		return nil, nil
+	}
+
+	// Use the same placement algorithm as the vCD provider so the guest device
+	// order (sdb, sdc, ...) matches the order in which AddInternalDisk attaches
+	// the disks. The template OS disk occupies bus 0/unit 0.
+	placements, err := cloud.PlanDiskPlacements(toCloudDisks(in), []cloud.DiskPlacement{
+		{Index: -1, BusNumber: 0, UnitNumber: 0},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]cloudinit.DiskParam, 0, len(placements))
+	for i, placement := range placements {
+		tempMount := fmt.Sprintf("/data%d", i+1)
+		mount := placement.Spec.Mount
+		if mount == "" {
+			mount = tempMount
+		}
+		if !strings.HasPrefix(mount, "/") {
+			return nil, fmt.Errorf("disk %d: mount %q must be an absolute path", placement.Index, mount)
+		}
+
+		var excludes []string
+		for j, other := range placements {
+			if j == i {
+				continue
+			}
+			otherMount := other.Spec.Mount
+			if otherMount == "" {
+				otherMount = fmt.Sprintf("/data%d", j+1)
+			}
+			if strings.HasPrefix(otherMount, mount+"/") {
+				excludes = append(excludes, strings.TrimPrefix(otherMount, mount))
+			}
+		}
+
 		out = append(out, cloudinit.DiskParam{
-			Device: fmt.Sprintf("/dev/sd%c", 'b'+i),
-			VG:     fmt.Sprintf("data%d_vg", i+1),
-			LV:     fmt.Sprintf("data%d_lv", i+1),
-			Mount:  d.Mount,
-			FSType: "xfs",
+			Device:        fmt.Sprintf("/dev/sd%c", 'b'+i),
+			VG:            fmt.Sprintf("data%d_vg", i+1),
+			LV:            fmt.Sprintf("data%d_lv", i+1),
+			TempMount:     tempMount,
+			Mount:         mount,
+			FSType:        "ext4",
+			SizeGB:        placement.Spec.SizeGB,
+			RsyncExcludes: excludes,
 		})
 	}
-	return out
+	return out, nil
 }
 
 func toCloudDisks(in []infrav1.DiskSpec) []cloud.DiskSpec {
@@ -266,6 +312,7 @@ func toCloudDisks(in []infrav1.DiskSpec) []cloud.DiskSpec {
 	for _, d := range in {
 		out = append(out, cloud.DiskSpec{
 			SizeGB:         d.SizeGB,
+			Mount:          d.Mount,
 			BusType:        d.BusType,
 			BusNumber:      d.BusNumber,
 			UnitNumber:     d.UnitNumber,
