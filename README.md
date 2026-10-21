@@ -371,6 +371,35 @@ docker push docker.io/werton13/vcd-k8s-node-controller:latest
 
 The image is `linux/amd64` and runs as distroless `nonroot` (UID 65532).
 
+## Releasing a new version
+
+Every version of the controller ships to four places. Missing one is how the
+chart, the image and the Terraform pin drift apart (`0.1.1` in tfvars while
+`0.1.5` ran), so do all of them in one pass:
+
+1. **Version bump in this repo** - `Makefile` (`TAG`), `charts/vcd-nodescale/Chart.yaml`
+   (`version` + `appVersion`), `internal/cloudinit`'s `RenderVersion` when the guest
+   scripts change, and the image examples in this README.
+2. **Image** - `make image` then `make image-push` (pushes `:<tag>` and `:latest`).
+   Built locally: the `docker-publish` workflow needs `DOCKERHUB_USERNAME` /
+   `DOCKERHUB_TOKEN` and fails without them.
+3. **Chart on GitHub Pages** - `helm package charts/vcd-nodescale`, copy the
+   `.tgz` into a `gh-pages` checkout, `helm repo index . --url
+   https://werton13.github.io/vcd-k8s-node-controller/`, commit and push. The
+   Pages deploy job can sit `queued` for 10+ minutes; verify
+   `https://werton13.github.io/vcd-k8s-node-controller/vcd-nodescale-<tag>.tgz`
+   returns 200 before calling it done.
+4. **Pins in the consumers** - the same version in all three:
+   - `tf-vcloud-k8s` `variables.tf` (`node_controller.chart_version` /
+     `image_tag` defaults) - commit and push branch `dev`;
+   - test/production `terraform.tfvars` files (`node_controller` block) - the
+     authoritative pin, it is what Ansible installs;
+   - `k8s-kubeadm-r2` `roles/k8s_addons_node_controller/defaults/main.yml`
+     (both vars) and the role README table - commit and push branch `dev`.
+
+Finally tag `v<version>` and push: `ci` must be green, and `docker-publish`
+runs even though it cannot log in.
+
 ## License
 
 Apache-2.0, see [`LICENSE`](LICENSE).
