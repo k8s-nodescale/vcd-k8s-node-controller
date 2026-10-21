@@ -463,13 +463,23 @@ func (r *WorkerPoolReconciler) scaleUp(ctx context.Context, pool *infrav1.K8sWor
 		}
 		name := workerName(pool.Spec.NamePrefix, ordinal)
 
-		// release frees the address when nothing was created yet.
+		// token is set once a bootstrap token exists for this attempt, so release
+		// can revoke it: a token that outlives a failed create is a live
+		// credential for a node that will never exist (customization-phases.md
+		// §5.4 - observed: 21 leaked tokens in one afternoon).
+		var token string
+		// release frees the address and revokes the token when nothing was created.
 		release := func(cause error) error {
 			_ = alloc.Free(ip)
+			if token != "" {
+				if err := r.Kube.RevokeBootstrapToken(ctx, token); err != nil {
+					logger.Error(err, "revoke bootstrap token", "node", name, "token", tokenID(token))
+				}
+			}
 			syncLedger()
 			return cause
 		}
-		token, err := r.Kube.CreateBootstrapToken(ctx, ttl)
+		token, err = r.Kube.CreateBootstrapToken(ctx, ttl)
 		if err != nil {
 			return release(fmt.Errorf("create bootstrap token for %s: %w", name, err))
 		}
@@ -494,6 +504,7 @@ func (r *WorkerPoolReconciler) scaleUp(ctx context.Context, pool *infrav1.K8sWor
 			SSHAuthorizedKey: pool.Spec.Bootstrap.SSHAuthorizedKey,
 			K8sVersion:       pool.Spec.Bootstrap.K8sVersion,
 			K8sMinorRepo:     pool.Spec.Bootstrap.K8sMinorRepo,
+			JoinEndpoint:     pool.Spec.Join.Endpoint,
 			JoinCommand:      join,
 			Disks:            cloudInitDisks,
 		})
@@ -518,6 +529,11 @@ func (r *WorkerPoolReconciler) scaleUp(ctx context.Context, pool *infrav1.K8sWor
 				"managed-by": "vcd-nodescale",
 				"pool":       pool.Name,
 				"node-name":  name,
+				// Which build baked this VM, and which bootstrap token it holds:
+				// without these a stuck guest cannot be traced or cleaned up
+				// (customization-phases.md §5.1, §5.4).
+				"render":   r.Renderer.Stamp(),
+				"token-id": tokenID(token),
 			},
 			EnableUUID: true,
 		})
@@ -623,6 +639,13 @@ func (r *WorkerPoolReconciler) mapNodeToPools(ctx context.Context, obj client.Ob
 
 // workerName ties the node name to the IP ordinal, so a reused address keeps
 // the name it was originally created with instead of shifting indices.
+// tokenID returns the id half of a bootstrap token ("<id>.<secret>"), which is
+// also the suffix of the Secret and of the kube-public JWS entry.
+func tokenID(token string) string {
+	id, _, _ := strings.Cut(strings.TrimSpace(token), ".")
+	return id
+}
+
 func workerName(prefix string, ordinal int) string {
 	return fmt.Sprintf("%s-wrk-%02d", prefix, ordinal)
 }

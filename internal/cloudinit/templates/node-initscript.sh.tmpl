@@ -1,79 +1,159 @@
 #!/usr/bin/env bash
-# vCD guest-customization initscript: configure the NIC, seed NoCloud with the
-# embedded user-data, then run cloud-init. Mirrors templates/customization_node.sh.
-set -euo pipefail
+# vCD guest-customization initscript: staged dispatcher.
+# {{ .RenderStamp }}
+#
+# vCD runs this twice with the phase in $1: preCustomization (before vCD sets
+# hostname/network/credentials) and postCustomization (just before vCD's
+# reboot). Contract, see customization-phases.md R1-R4: never reboot, never
+# exit non-zero (a failing phase is terminal for the VM: "Customization.pm
+# line 637" / GC_FAILED), every stage idempotent and recorded in
+# /etc/vcd-stage/state, and only work that makes the next boot possible.
+set -uo pipefail   # deliberately no -e: a failing stage must not abort the phase
 
+PHASE="${1:-postCustomization}"
 LOG=/var/log/vcd-cloudinit.log
+# On the root filesystem, not /var/lib: the disk stage moves /var between the
+# pre and post phases, and state kept there would be copied away mid-run.
+STAGE_DIR=/etc/vcd-stage
+mkdir -p "$STAGE_DIR"
 exec >>"$LOG" 2>&1
+
 log() { echo "[$(date -Is)] $*"; }
-log "starting vCD guest customization initscript"
+log "initscript phase=$PHASE {{ .RenderStamp }}"
 
 NIC="{{ .NICName }}"
+NODE_NAME="{{ .NodeName }}"
 NODE_IP="{{ .NodeIP }}"
 CIDR_PREFIX="{{ .CIDRPrefix }}"
 GATEWAY="{{ .GatewayIP }}"
 DNS_JSON='{{ .DNSServersJSON }}'
+SPEC_HASH="{{ .SpecHash8 }}"
 
-cat > /etc/netplan/50-cloud-init.yaml <<EOF
-network:
-  version: 2
-  ethernets:
-    ${NIC}:
-      dhcp4: false
-      addresses: [${NODE_IP}/${CIDR_PREFIX}]
-      routes:
-        - to: default
-          via: ${GATEWAY}
-      nameservers:
-        addresses: ${DNS_JSON}
-EOF
-chmod 600 /etc/netplan/50-cloud-init.yaml
-if ! netplan apply; then
-  log "netplan apply failed"
-fi
+record() { # stage rc
+  printf '%s stage=%s rc=%s phase=%s %s\n' \
+    "$(date -Is)" "$1" "$2" "$PHASE" "{{ .RenderStamp }}" >>"$STAGE_DIR/state"
+}
 
-mkdir -p /var/lib/cloud/seed/nocloud
-cat > /var/lib/cloud/seed/nocloud/meta-data <<EOF
-instance-id: {{ .NodeName }}
-local-hostname: {{ .NodeName }}
-EOF
-
-base64 -d <<'CLOUDINIT' | gzip -d > /var/lib/cloud/seed/nocloud/user-data
-{{ .CloudInitBase64Gz }}
-CLOUDINIT
-
-{{- if .Disks }}
-# Prepare the extra data disks before cloud-init starts. The script is also
-# listed in cloud-init bootcmd, so it still runs after the one-time reboot if
-# this customization script is not executed again.
-cat > /usr/local/sbin/prepare-data-disks.sh <<'DISKSETUP'
-{{ .DiskSetupScript }}
-DISKSETUP
-chmod 0700 /usr/local/sbin/prepare-data-disks.sh
-rc=0
-/usr/local/sbin/prepare-data-disks.sh || rc=$?
-if [[ "$rc" -eq 42 ]]; then
-  # The disk script requested a reboot; cloud-init will run on the next boot.
-  exit 0
-fi
-if [[ "$rc" -ne 0 ]]; then
-  exit "$rc"
-fi
-{{- end }}
-
-run() {
-  local desc="$1"
-  shift
-  local rc=0
-  "$@" || rc=$?
-  if [[ "$rc" -ne 0 ]]; then
-    log "$desc failed with exit code $rc"
+# run_stage NAME FUNCTION
+# Skips a stage whose marker exists, runs it otherwise, records the result and
+# always returns 0 so the phase keeps going (R2).
+run_stage() {
+  local name="$1" fn="$2" rc=0
+  if [[ -f "$STAGE_DIR/$name.done" ]]; then
+    log "stage $name: already done"
+    record "$name" skipped
+    return 0
   fi
+  log "stage $name: start"
+  "$fn" || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    touch "$STAGE_DIR/$name.done"
+    log "stage $name: ok"
+  else
+    log "stage $name: FAILED rc=$rc; the phase continues, the next boot retries"
+  fi
+  record "$name" "$rc"
   return 0
 }
 
-run "cloud-init init --local" cloud-init init --local
-run "cloud-init init" cloud-init init
-run "cloud-init modules --mode=config" cloud-init modules --mode=config
-run "cloud-init modules --mode=final" cloud-init modules --mode=final
-log "vCD guest customization initscript finished"
+stage_net() {
+  cat > /etc/netplan/01-netplan.yaml <<EOF
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    $NIC:
+      dhcp4: false
+      dhcp6: false
+      addresses:
+        - $NODE_IP/$CIDR_PREFIX
+      routes:
+        - to: default
+          via: $GATEWAY
+      nameservers:
+        addresses: $DNS_JSON
+EOF
+  chmod 0600 /etc/netplan/01-netplan.yaml
+  rm -f /etc/netplan/50-cloud-init.yaml || true
+  netplan apply || log "netplan apply returned non-zero"
+
+  # vCD applies its own network settings right after this phase and stalls when
+  # the guest has no working network (observed: GC_PENDING for 20+ minutes).
+  # Wait for the address and the default route, but never reboot here: a reboot
+  # in this phase is what produced "Customization.pm line 637".
+  local i
+  for i in $(seq 1 20); do
+    if ip -4 addr show dev "$NIC" 2>/dev/null | grep -q "inet $NODE_IP/" \
+       && ip route 2>/dev/null | grep -q '^default'; then
+      log "network up: $NODE_IP/$CIDR_PREFIX via $GATEWAY"
+      return 0
+    fi
+    sleep 1
+  done
+  log "network did not come up within 20 s on $NIC"
+  return 1
+}
+
+stage_seed() {
+  mkdir -p /var/lib/cloud/seed/nocloud
+  cat > /var/lib/cloud/seed/nocloud/meta-data <<EOF
+instance-id: $NODE_NAME-$SPEC_HASH
+local-hostname: $NODE_NAME
+EOF
+  base64 -d <<'CLOUDINIT' | gzip -d > /var/lib/cloud/seed/nocloud/user-data
+{{ .CloudInitBase64Gz }}
+CLOUDINIT
+  sync
+  log "NoCloud seed written: instance-id $NODE_NAME-$SPEC_HASH"
+}
+
+stage_disks() {
+{{- if .Disks }}
+  cat > /usr/local/sbin/prepare-data-disks.sh <<'DISKSETUP'
+{{ .DiskSetupScript }}
+DISKSETUP
+  chmod 0700 /usr/local/sbin/prepare-data-disks.sh
+  log "preparing data disks"
+  /usr/local/sbin/prepare-data-disks.sh
+{{- else }}
+  log "no data disks configured"
+  return 0
+{{- end }}
+}
+
+stage_epoch() {
+  # Belt and braces: the instance-id already differs from whatever the OVF
+  # datasource recorded at first boot (it carries the spec hash), so cloud-init
+  # runs the seed on the next boot even without this. Keeping the wipe means a
+  # VM re-created from the same spec also converges.
+  if cloud-init clean; then
+    log "cloud-init state reset"
+  else
+    log "cloud-init clean failed (the instance-id still differs)"
+  fi
+}
+
+log "stage plan for phase $PHASE"
+case "$PHASE" in
+  preCustomization|precustomization)
+    # Only the network and the seed. Both need no egress and cannot block.
+    run_stage net  stage_net
+    run_stage seed stage_seed
+    ;;
+  postCustomization|postcustomization)
+    # The seed is re-checked here so a VM whose pre phase was skipped still
+    # converges; epoch runs last, immediately before vCD's reboot.
+    run_stage seed  stage_seed
+    run_stage disks stage_disks
+    run_stage epoch stage_epoch
+    ;;
+  *)
+    log "unknown phase '$PHASE': running the post-customization stages"
+    run_stage seed  stage_seed
+    run_stage disks stage_disks
+    run_stage epoch stage_epoch
+    ;;
+esac
+
+log "initscript finished phase=$PHASE; vCD owns the reboot"
+exit 0

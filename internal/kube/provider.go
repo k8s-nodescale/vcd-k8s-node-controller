@@ -25,6 +25,10 @@ type NodeInfo struct {
 // Provider abstracts cluster operations required for worker scaling.
 type Provider interface {
 	CreateBootstrapToken(ctx context.Context, ttl time.Duration) (string, error)
+	// RevokeBootstrapToken deletes a token and its cluster-info JWS entry. It is
+	// called when a create fails after the token was minted, so a failed attempt
+	// does not leave a usable credential behind.
+	RevokeBootstrapToken(ctx context.Context, token string) error
 	CAHash(ctx context.Context) (string, error)
 	ListNodes(ctx context.Context) ([]NodeInfo, error)
 	WaitReady(ctx context.Context, name string, timeout time.Duration) error

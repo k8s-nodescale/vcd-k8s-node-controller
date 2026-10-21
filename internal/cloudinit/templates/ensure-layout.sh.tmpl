@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Boot-time repair (customization-phases.md, R7/R8).
+#
+# fstab is written by the customization phase, i.e. after the boot that reads
+# fstab, so the *next* boot is the one that must mount the data disks. When it
+# does not - observed on the first live run: data2_lv stayed mounted on /data2
+# while /var/lib came up empty, leaving apt without a database and cloud-init
+# without its seed - this unit mounts the configured device itself, before
+# anything that depends on it.
+#
+# Idempotent: on a healthy boot every check passes and nothing is mounted.
+set -uo pipefail
+
+LOG=/var/log/vcd-layout.log
+exec >>"$LOG" 2>&1
+log() { echo "[$(date -Is)] $*"; }
+log "ensure-layout starting"
+
+rc=0
+
+ensure() { # mountpoint expected_device
+  local mnt="$1" want="$2" src
+  src=$(findmnt -n -o SOURCE --target "$mnt" 2>/dev/null || true)
+  if [[ -n "$src" && "$(readlink -f "$src")" == "$(readlink -f "$want")" ]]; then
+    log "ok $mnt on $src"
+    return 0
+  fi
+  if [[ -z "$src" ]]; then
+    log "$mnt is not a mount point; mounting $want"
+  else
+    log "$mnt is on $src, expected $want; mounting $want over it"
+  fi
+  mkdir -p "$mnt" || { log "mkdir $mnt failed"; rc=1; return 1; }
+  if mount "$want" "$mnt"; then
+    log "mounted $want at $mnt"
+  else
+    log "FAILED to mount $want at $mnt"
+    rc=1
+  fi
+}
+
+{{- if .Disks }}
+{{- range .Disks }}
+ensure {{ printf "%q" .Mount }} {{ printf "%q" (printf "/dev/%s/%s" .VG .LV) }}
+{{- end }}
+{{- else }}
+log "no data disks configured"
+{{- end }}
+
+if (( rc != 0 )); then
+  log "ensure-layout finished with errors"
+  exit 1
+fi
+log "ensure-layout done"
+exit 0

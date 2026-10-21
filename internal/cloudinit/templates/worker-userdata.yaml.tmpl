@@ -1,4 +1,5 @@
 #cloud-config
+# {{ .RenderStamp }}
 preserve_hostname: false
 hostname: {{ .NodeName }}
 fqdn: {{ .NodeName }}
@@ -7,6 +8,10 @@ users:
   - name: {{ .OSUser }}
     groups: [sudo]
     shell: /bin/bash
+    # cloud-init locks the account when a passwd hash is set unless this is
+    # false; a locked account cannot authenticate for sudo, which the operator
+    # needs on a guest that failed a stage.
+    lock_passwd: false
     {{- if .OSPasswordHash }}
     passwd: {{ .OSPasswordHash }}
     {{- end }}
@@ -17,22 +22,21 @@ users:
 
 ssh_pwauth: false
 
+# Declarative only: two boot steps, everything else is a file or a unit. See
+# customization-phases.md §4.2 - work that can fail slowly or needs a retry
+# belongs in a systemd unit, not here.
 bootcmd:
-{{- if .Disks }}
   - |
-    /usr/local/sbin/prepare-data-disks.sh
-    rc=$?
-    if [ "$rc" -ne 0 ] && [ "$rc" -ne 42 ]; then
-      exit "$rc"
+    if [ -x /usr/local/sbin/prepare-data-disks.sh ]; then
+      /usr/local/sbin/prepare-data-disks.sh || echo "prepare-data-disks.sh failed, continuing"
     fi
-{{- end }}
   - |
-    if [ -f /etc/systemd/system/k8s-node-bootstrap.service ]; then
-      systemctl daemon-reload
-      systemctl enable --now --no-block k8s-node-bootstrap.service
-    fi
+    systemctl daemon-reload || true
+    systemctl enable --now --no-block k8s-node-prereqs.service || true
 
 write_files:
+  # Fallback network config for the case where the vCD customization phase did
+  # not run; the initscript writes 01-netplan.yaml and removes this file.
   - path: /etc/netplan/50-cloud-init.yaml
     permissions: '0600'
     content: |
@@ -74,22 +78,32 @@ write_files:
       set -euo pipefail
       {{ .JoinCommand }}
 
-  - path: /usr/local/sbin/k8s-node-bootstrap.sh
+  - path: /usr/local/sbin/vcd-verify-layout.sh
+    permissions: '0700'
+    content: |
+{{ .LayoutScript }}
+
+  - path: /usr/local/sbin/vcd-ensure-layout.sh
+    permissions: '0700'
+    content: |
+{{ .EnsureScript }}
+
+  - path: /usr/local/sbin/k8s-node-prereqs.sh
     permissions: '0700'
     content: |
       #!/bin/bash
-      # Worker OS preparation and cluster join. Idempotent: the marker below
-      # (and kubelet.conf) keeps a node from joining twice.
+      # Stage: OS prerequisites. Slow, network-dependent, retried by systemd.
+      # Marker keeps it idempotent; it never touches the cluster.
       set -euo pipefail
 
-      LOG=/var/log/k8s-node-bootstrap.log
+      LOG=/var/log/k8s-node-prereqs.log
       exec >>"$LOG" 2>&1
       log() { echo "[$(date -Is)] $*"; }
-      log "starting k8s node bootstrap"
+      log "starting prerequisites {{ .RenderStamp }}"
 
-      MARKER=/etc/kubernetes/kubeadm-joined
+      MARKER=/etc/kubernetes/prereqs.done
       if [[ -f "$MARKER" ]]; then
-        log "node already joined; nothing to do"
+        log "prerequisites already done"
         exit 0
       fi
 
@@ -138,28 +152,133 @@ write_files:
       fi
       systemctl enable kubelet
 
-      # 5. Join. kubeadm writes /etc/kubernetes/kubelet.conf on success.
-      if [[ ! -f /etc/kubernetes/kubelet.conf ]]; then
-        log "running kubeadm join"
-        bash /etc/kubernetes/join-command.sh
+      touch "$MARKER"
+      log "prerequisites done"
+
+  - path: /usr/local/sbin/k8s-node-join.sh
+    permissions: '0700'
+    content: |
+      #!/bin/bash
+      # Stage: join the cluster. The only step that changes cluster state, so it
+      # waits for the prerequisites and for the API instead of failing fast.
+      set -euo pipefail
+
+      LOG=/var/log/k8s-node-join.log
+      exec >>"$LOG" 2>&1
+      log() { echo "[$(date -Is)] $*"; }
+      log "starting join {{ .RenderStamp }}"
+
+      MARKER=/etc/kubernetes/kubeadm-joined
+      if [[ -f "$MARKER" ]]; then
+        log "already joined"
+        exit 0
+      fi
+      # kubeadm writes kubelet.conf on success; the marker is the authority.
+      if [[ -f /etc/kubernetes/kubelet.conf ]]; then
+        log "kubelet.conf exists; recording the marker"
+        touch "$MARKER"
+        exit 0
       fi
 
-      touch "$MARKER"
-      log "k8s node bootstrap finished"
+      ENDPOINT="{{ .JoinEndpoint }}"
 
-  - path: /etc/systemd/system/k8s-node-bootstrap.service
+      # Wait for the prerequisites (they retry independently in their own unit).
+      for _ in $(seq 1 30); do
+        [[ -f /etc/kubernetes/prereqs.done ]] && break
+        sleep 10
+      done
+      if [[ ! -f /etc/kubernetes/prereqs.done ]]; then
+        log "prerequisites are not finished yet"
+        exit 1
+      fi
+
+      # Wait for the API server instead of burning an attempt on a cold route.
+      if [[ -n "$ENDPOINT" ]]; then
+        api=0
+        for _ in $(seq 1 24); do
+          if curl -skf --max-time 5 "https://$ENDPOINT/healthz" >/dev/null 2>&1; then
+            api=1
+            break
+          fi
+          sleep 5
+        done
+        if [[ "$api" -ne 1 ]]; then
+          log "API $ENDPOINT is not reachable"
+          exit 1
+        fi
+        log "API $ENDPOINT reachable"
+      fi
+
+      # kubeadm has no timeout of its own: when discovery cannot be verified
+      # (observed: a token whose cluster-info JWS entry was missing) it prints
+      # "...pre-flight checks" and waits forever. Bound it so the unit fails,
+      # retries and reports instead of sitting in "activating" for hours.
+      log "running kubeadm join (15m timeout)"
+      if ! timeout 900 bash /etc/kubernetes/join-command.sh; then
+        log "kubeadm join failed or timed out"
+        exit 1
+      fi
+      touch "$MARKER"
+      log "join finished"
+
+  - path: /etc/systemd/system/vcd-ensure-layout.service
     permissions: '0644'
     content: |
       [Unit]
-      Description=Prepare worker and join the Kubernetes cluster
-      Wants=network-online.target
-      After=network-online.target
+      Description=Mount the data disks where the spec says
+      After=local-fs.target
+      Before=k8s-node-prereqs.service k8s-node-join.service
+      ConditionPathExists=/etc/vcd-data-disks.done
+      StartLimitIntervalSec=0
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/vcd-ensure-layout.sh
+      RemainAfterExit=yes
+      Restart=on-failure
+      RestartSec=15
+
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /etc/systemd/system/k8s-node-prereqs.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Prepare the worker OS (packages, containerd, sysctl)
+      Wants=network-online.target vcd-ensure-layout.service
+      After=network-online.target vcd-ensure-layout.service
+      ConditionPathExists=!/etc/kubernetes/prereqs.done
+      StartLimitIntervalSec=0
+
+      [Service]
+      Type=oneshot
+      # apt and dpkg live on /var/lib: refuse to run on an empty layout instead
+      # of failing with "Could not open lock file /var/lib/dpkg/lock-frontend".
+      ExecStartPre=/usr/local/sbin/vcd-verify-layout.sh
+      ExecStart=/usr/local/sbin/k8s-node-prereqs.sh
+      RemainAfterExit=yes
+      Restart=on-failure
+      RestartSec=60
+      TimeoutStartSec=30min
+
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /etc/systemd/system/k8s-node-join.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Join the Kubernetes cluster as a worker
+      Wants=network-online.target k8s-node-prereqs.service vcd-ensure-layout.service
+      After=network-online.target k8s-node-prereqs.service vcd-ensure-layout.service
       ConditionPathExists=!/etc/kubernetes/kubeadm-joined
       StartLimitIntervalSec=0
 
       [Service]
       Type=oneshot
-      ExecStart=/usr/local/sbin/k8s-node-bootstrap.sh
+      ExecStartPre=/usr/local/sbin/vcd-verify-layout.sh
+      ExecStart=/usr/local/sbin/k8s-node-join.sh
       RemainAfterExit=yes
       Restart=on-failure
       RestartSec=60
@@ -170,5 +289,9 @@ write_files:
 
 runcmd:
   - systemctl daemon-reload
-  - systemctl enable k8s-node-bootstrap.service
-  - systemctl start --no-block k8s-node-bootstrap.service
+  - systemctl enable vcd-ensure-layout.service
+  - systemctl start --no-block vcd-ensure-layout.service
+  - systemctl enable --now --no-block k8s-node-prereqs.service
+  # --now, not just enable: on the first boot of a worker the prerequisites
+  # have just finished and the node should join in this boot, not the next one.
+  - systemctl enable --now --no-block k8s-node-join.service

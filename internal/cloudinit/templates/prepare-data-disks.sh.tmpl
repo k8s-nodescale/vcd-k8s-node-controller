@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Option A data-disk preparation, mirroring the Ansible prepare_k8s_nodes role:
 #   LVM on the data disks -> temporary mounts -> move /var and /var/lib ->
-#   rewrite fstab by UUID -> reboot once.
+#   rewrite fstab by UUID -> the guest is rebooted by vCD afterwards.
 #
-# The script is idempotent: a marker on the root filesystem prevents a reboot
-# loop, and LVM/filesystem creation steps are skipped when they already exist.
+# The script never reboots: it runs during the vCD post-customization phase and
+# vCD power-cycles the guest once the phase returns. A marker on the root
+# filesystem keeps it idempotent, and LVM/filesystem creation is skipped when
+# it already exists.
 set -euo pipefail
 
 MARKER=/etc/vcd-data-disks.done
@@ -152,11 +154,5 @@ write_fstab {{ printf "%q" .Mount }} {{ printf "%q" .TempMount }} {{ printf "%q"
 
 touch "$MARKER"
 sync
-log "rebooting to activate final /var and /var/lib mounts"
-if ! reboot; then
-  log "reboot command failed"
-  exit 1
-fi
-# 42 tells the vCD initscript that a reboot was requested, so it must not
-# continue with cloud-init in the same boot.
-exit 42
+log "data disks prepared; vCD reboots the guest after post-customization so the new mounts take effect"
+exit 0

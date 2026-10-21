@@ -24,10 +24,20 @@ Implemented:
 - `cloud/vcd` provider on `govcd`: create VM from a catalog template, paravirtual
   SCSI data disks, IP-assigned NIC on the org network, guest customization with
   the rendered cloud-init payload. `DeleteVM` is still a stub.
-- Guest bootstrap (`internal/cloudinit`): swap off, kernel modules/sysctl,
-  containerd, pinned `pkgs.k8s.io` packages, `kubeadm join`, run by a systemd
-  unit that retries and is re-armed on later boots. One deliberate reboot to
-  relocate `/var` and `/var/lib` onto the data disks.
+- Guest bootstrap (`internal/cloudinit`) in two stages, because vCD runs the
+  customisation script in a phase it can fail the VM in:
+  - **preCustomization** writes only what vCD's own network step needs (netplan,
+    NoCloud seed) and keeps the interface up, so the phase cannot stall;
+  - **postCustomization** prepares the data disks (`/var`, `/var/lib`) and bumps
+    the cloud-init instance epoch; vCD's reboot then pays for the move.
+  Neither phase reboots or exits non-zero - a failing phase is terminal for the
+  VM - and each stage records its result in `/etc/vcd-stage/state`.
+- Boot work is done by two marker-guarded systemd units: `k8s-node-prereqs`
+  (swap, modules, sysctl, containerd, pinned `pkgs.k8s.io` packages) and
+  `k8s-node-join` (layout gate, wait for the API, bounded `kubeadm join`), both
+  `Restart=on-failure`. A `vcd-ensure-layout` unit mounts the data disks where
+  the spec says before either runs, and `vcd-verify-layout` refuses to run apt
+  or `kubeadm join` on a guest whose `/var` move did not take effect.
 - Every join prerequisite, so a created VM needs no manual cluster surgery: a
   bootstrap token (`bootstrap-token-<id>`), the matching `jws-kubeconfig-<id>`
   signature in `kube-public/cluster-info` (kubeadm 1.35 refuses token discovery
@@ -52,7 +62,10 @@ Not implemented yet:
 - Finalizers and a failed-provisioning watchdog: a VM that boots but never joins
   is counted in `observedReplicas` and is not replaced automatically.
 - Token renewal for joins that outlive `join.tokenTTL`; the token of a finished
-  join is left to expire on its own, and its JWS entry with it.
+  join is left to expire on its own, and its JWS entry with it. A failed create
+  now revokes its token (the earlier leak left one usable credential per failed
+  attempt), and every published JWS entry is read back before the join command
+  is handed to the guest.
 
 ## The K8sWorkerPool resource
 
@@ -303,7 +316,7 @@ removal is a manual procedure (undeploy and delete the VM, free its address in
 ## Terraform integration contract
 
 - The Terraform module installs this chart behind a `node_controller.enabled`
-  toggle and pins `chart_version` / `image_tag` (currently `0.1.5`).
+  toggle and pins `chart_version` / `image_tag` (currently `0.2.0`).
 - **Once the controller is enabled, do not use Terraform to manage worker count
   or worker LB pool membership.** Use the CRD instead. The Terraform module's
   README must state this explicitly.
@@ -321,7 +334,7 @@ architecture, algorithms and open questions.
    removal, delete, ledger free, node delete.
 2. Failed-provisioning watchdog (VM up but Node absent for N minutes).
 3. Token renewal / re-issued join for slow installs; delete the token and its
-   JWS entry once the node is Ready.
+   JWS entry once the node is Ready (a failed create already revokes its token).
 4. LB pool membership after `Node Ready`; remove on scale-in.
 5. Finalizers, e2e on a dev tenant (2 -> 4 -> 2 via the CRD).
 6. Wire the Terraform `node_controller` variable.
@@ -335,7 +348,7 @@ Build locally (the Dockerfile uses `golang:1.27.1-alpine` and
 `gcr.io/distroless/static:nonroot`):
 
 ```
-docker build -t docker.io/werton13/vcd-k8s-node-controller:0.1.5 .
+docker build -t docker.io/werton13/vcd-k8s-node-controller:0.2.0 .
 ```
 
 Public module defaults are used inside the build. On a restricted network,
@@ -345,14 +358,14 @@ override them:
 docker build \
   --build-arg GOPROXY=https://nexus.example.com/repository/golang/ \
   --build-arg GOSUMDB=off \
-  -t docker.io/werton13/vcd-k8s-node-controller:0.1.5 .
+  -t docker.io/werton13/vcd-k8s-node-controller:0.2.0 .
 ```
 
 Push (or use `make image-push`):
 
 ```
 docker login docker.io
-docker push docker.io/werton13/vcd-k8s-node-controller:0.1.5
+docker push docker.io/werton13/vcd-k8s-node-controller:0.2.0
 docker push docker.io/werton13/vcd-k8s-node-controller:latest
 ```
 

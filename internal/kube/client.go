@@ -8,10 +8,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
@@ -96,7 +99,8 @@ func (c *Client) CAHash(ctx context.Context) (string, error) {
 	return "sha256:" + hex.EncodeToString(sum[:]), nil
 }
 
-// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;update,namespace=kube-public
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;update;delete,namespace=kube-public
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;delete,namespace=kube-system
 
 // CreateBootstrapToken creates a short-lived kubeadm bootstrap token via the API
 // and publishes the JWS signature kubeadm needs for token-based discovery.
@@ -175,7 +179,66 @@ func (c *Client) publishClusterInfoJWS(ctx context.Context, tokenID string) erro
 	if err != nil {
 		return fmt.Errorf("publish JWS for bootstrap token %s: %w", tokenID, err)
 	}
-	return nil
+	// Read the entry back. cluster-info is written by more than one actor, and a
+	// lost update leaves a token that makes every joining node hang in
+	// "[discovery] Waiting for the cluster-info ConfigMap to receive a JWS
+	// signature" - which looks exactly like a slow join, not like an error.
+	// Observed live: a token with a Secret and no JWS entry.
+	for attempt := 0; attempt < 3; attempt++ {
+		cm, err := c.cs.CoreV1().ConfigMaps(clusterInfoNamespace).Get(ctx, clusterInfoName, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("verify JWS for bootstrap token %s: %w", tokenID, err)
+		}
+		if cm.Data[jwsSignatureKeyPrefix+tokenID] != "" {
+			return nil
+		}
+		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			gcm, err := c.cs.CoreV1().ConfigMaps(clusterInfoNamespace).Get(ctx, clusterInfoName, metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
+			if gcm.Data == nil {
+				gcm.Data = map[string]string{}
+			}
+			gcm.Data[jwsSignatureKeyPrefix+tokenID] = jws
+			_, err = c.cs.CoreV1().ConfigMaps(clusterInfoNamespace).Update(ctx, gcm, metav1.UpdateOptions{})
+			return err
+		}); err != nil {
+			return fmt.Errorf("republish JWS for bootstrap token %s: %w", tokenID, err)
+		}
+	}
+	return fmt.Errorf("JWS entry for bootstrap token %s did not survive in %s/%s",
+		tokenID, clusterInfoNamespace, clusterInfoName)
+}
+
+// RevokeBootstrapToken removes a bootstrap token and its cluster-info JWS entry.
+// It exists so a failed VM create does not leave a usable credential behind:
+// the create path leaks one token per failed attempt otherwise.
+func (c *Client) RevokeBootstrapToken(ctx context.Context, token string) error {
+	id, _, ok := strings.Cut(strings.TrimSpace(token), ".")
+	if !ok || id == "" {
+		return nil
+	}
+	var errs []error
+	if err := c.cs.CoreV1().Secrets("kube-system").Delete(ctx, "bootstrap-token-"+id, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		errs = append(errs, err)
+	}
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		cm, err := c.cs.CoreV1().ConfigMaps(clusterInfoNamespace).Get(ctx, clusterInfoName, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		if _, ok := cm.Data[jwsSignatureKeyPrefix+id]; !ok {
+			return nil
+		}
+		delete(cm.Data, jwsSignatureKeyPrefix+id)
+		_, err = c.cs.CoreV1().ConfigMaps(clusterInfoNamespace).Update(ctx, cm, metav1.UpdateOptions{})
+		return err
+	})
+	if err != nil && !apierrors.IsNotFound(err) {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 // WaitReady polls until the named Node reports Ready.

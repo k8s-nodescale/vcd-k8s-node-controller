@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Pre-join gate (customization-phases.md, R7).
+#
+# Refuse to join when a data disk did not end up where the spec asked for. A
+# guest whose /var move failed half-way must fail here, with a readable message,
+# instead of joining and writing containerd/kubelet data to the root disk (the
+# wrk-03 class of failure).
+#
+# Called by k8s-node-join.service as ExecStartPre. Exit 0 = layout is correct.
+set -uo pipefail
+
+LOG=/var/log/vcd-layout.log
+exec >>"$LOG" 2>&1
+log() { echo "[$(date -Is)] $*"; }
+
+fail=0
+
+check() { # mountpoint expected_device size_gb
+  local mnt="$1" want="$2" want_gb="$3" src have_gb
+  if ! src=$(findmnt -n -o SOURCE --target "$mnt" 2>/dev/null) || [[ -z "$src" ]]; then
+    log "FAIL $mnt is not a mount point"
+    fail=1
+    return
+  fi
+  if [[ "$(readlink -f "$src")" != "$(readlink -f "$want")" ]]; then
+    log "FAIL $mnt is on $src, expected $want"
+    fail=1
+    return
+  fi
+  have_gb=$(df -BG --output=size "$mnt" 2>/dev/null | tail -1 | tr -dc '0-9')
+  if [[ -z "$have_gb" ]]; then
+    log "WARN could not read the size of $mnt"
+  elif (( have_gb + 1 < want_gb )); then
+    log "FAIL $mnt is ${have_gb}G, expected about ${want_gb}G"
+    fail=1
+    return
+  fi
+  log "ok $mnt on $src (${have_gb}G)"
+}
+
+{{- if .Disks }}
+{{- range .Disks }}
+check {{ printf "%q" .Mount }} {{ printf "%q" (printf "/dev/%s/%s" .VG .LV) }} {{ .SizeGB }}
+{{- end }}
+{{- else }}
+log "no data disks configured; nothing to verify"
+{{- end }}
+
+if (( fail != 0 )); then
+  log "layout check failed; refusing to join"
+  exit 1
+fi
+log "layout ok"
+exit 0

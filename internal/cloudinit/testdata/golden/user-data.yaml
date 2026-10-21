@@ -1,0 +1,385 @@
+#cloud-config
+# render=0.2.0 hash=c9a32a99f590
+preserve_hostname: false
+hostname: pool-wrk-01
+fqdn: pool-wrk-01
+
+users:
+  - name: ubuntu
+    groups: [sudo]
+    shell: /bin/bash
+    # cloud-init locks the account when a passwd hash is set unless this is
+    # false; a locked account cannot authenticate for sudo, which the operator
+    # needs on a guest that failed a stage.
+    lock_passwd: false
+
+ssh_pwauth: false
+
+# Declarative only: two boot steps, everything else is a file or a unit. See
+# customization-phases.md §4.2 - work that can fail slowly or needs a retry
+# belongs in a systemd unit, not here.
+bootcmd:
+  - |
+    if [ -x /usr/local/sbin/prepare-data-disks.sh ]; then
+      /usr/local/sbin/prepare-data-disks.sh || echo "prepare-data-disks.sh failed, continuing"
+    fi
+  - |
+    systemctl daemon-reload || true
+    systemctl enable --now --no-block k8s-node-prereqs.service || true
+
+write_files:
+  # Fallback network config for the case where the vCD customization phase did
+  # not run; the initscript writes 01-netplan.yaml and removes this file.
+  - path: /etc/netplan/50-cloud-init.yaml
+    permissions: '0600'
+    content: |
+      network:
+        version: 2
+        ethernets:
+          ens192:
+            dhcp4: false
+            addresses: [192.0.2.10/24]
+            routes:
+              - to: default
+                via: 192.0.2.1
+            nameservers:
+              addresses: ["192.0.2.53"]
+
+  - path: /etc/modules-load.d/k8s.conf
+    content: |
+      overlay
+      br_netfilter
+
+  - path: /etc/sysctl.d/k8s.conf
+    content: |
+      net.bridge.bridge-nf-call-iptables  = 1
+      net.bridge.bridge-nf-call-ip6tables = 1
+      net.ipv4.ip_forward                 = 1
+
+  - path: /etc/containerd/config.toml
+    content: |
+      version = 2
+      root = "/var/lib/containerd"
+      state = "/run/containerd"
+      [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+        SystemdCgroup = true
+
+  - path: /etc/kubernetes/join-command.sh
+    permissions: '0700'
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      kubeadm join 192.0.2.2:6443 --token x --discovery-token-ca-cert-hash sha256:y
+
+  - path: /usr/local/sbin/vcd-verify-layout.sh
+    permissions: '0700'
+    content: |
+      #!/usr/bin/env bash
+      # Pre-join gate (customization-phases.md, R7).
+      #
+      # Refuse to join when a data disk did not end up where the spec asked for. A
+      # guest whose /var move failed half-way must fail here, with a readable message,
+      # instead of joining and writing containerd/kubelet data to the root disk (the
+      # wrk-03 class of failure).
+      #
+      # Called by k8s-node-join.service as ExecStartPre. Exit 0 = layout is correct.
+      set -uo pipefail
+
+      LOG=/var/log/vcd-layout.log
+      exec >>"$LOG" 2>&1
+      log() { echo "[$(date -Is)] $*"; }
+
+      fail=0
+
+      check() { # mountpoint expected_device size_gb
+        local mnt="$1" want="$2" want_gb="$3" src have_gb
+        if ! src=$(findmnt -n -o SOURCE --target "$mnt" 2>/dev/null) || [[ -z "$src" ]]; then
+          log "FAIL $mnt is not a mount point"
+          fail=1
+          return
+        fi
+        if [[ "$(readlink -f "$src")" != "$(readlink -f "$want")" ]]; then
+          log "FAIL $mnt is on $src, expected $want"
+          fail=1
+          return
+        fi
+        have_gb=$(df -BG --output=size "$mnt" 2>/dev/null | tail -1 | tr -dc '0-9')
+        if [[ -z "$have_gb" ]]; then
+          log "WARN could not read the size of $mnt"
+        elif (( have_gb + 1 < want_gb )); then
+          log "FAIL $mnt is ${have_gb}G, expected about ${want_gb}G"
+          fail=1
+          return
+        fi
+        log "ok $mnt on $src (${have_gb}G)"
+      }
+      check "/var" "/dev/data1_vg/data1_lv" 10
+      check "/var/lib" "/dev/data2_vg/data2_lv" 30
+
+      if (( fail != 0 )); then
+        log "layout check failed; refusing to join"
+        exit 1
+      fi
+      log "layout ok"
+      exit 0
+
+  - path: /usr/local/sbin/vcd-ensure-layout.sh
+    permissions: '0700'
+    content: |
+      #!/usr/bin/env bash
+      # Boot-time repair (customization-phases.md, R7/R8).
+      #
+      # fstab is written by the customization phase, i.e. after the boot that reads
+      # fstab, so the *next* boot is the one that must mount the data disks. When it
+      # does not - observed on the first live run: data2_lv stayed mounted on /data2
+      # while /var/lib came up empty, leaving apt without a database and cloud-init
+      # without its seed - this unit mounts the configured device itself, before
+      # anything that depends on it.
+      #
+      # Idempotent: on a healthy boot every check passes and nothing is mounted.
+      set -uo pipefail
+
+      LOG=/var/log/vcd-layout.log
+      exec >>"$LOG" 2>&1
+      log() { echo "[$(date -Is)] $*"; }
+      log "ensure-layout starting"
+
+      rc=0
+
+      ensure() { # mountpoint expected_device
+        local mnt="$1" want="$2" src
+        src=$(findmnt -n -o SOURCE --target "$mnt" 2>/dev/null || true)
+        if [[ -n "$src" && "$(readlink -f "$src")" == "$(readlink -f "$want")" ]]; then
+          log "ok $mnt on $src"
+          return 0
+        fi
+        if [[ -z "$src" ]]; then
+          log "$mnt is not a mount point; mounting $want"
+        else
+          log "$mnt is on $src, expected $want; mounting $want over it"
+        fi
+        mkdir -p "$mnt" || { log "mkdir $mnt failed"; rc=1; return 1; }
+        if mount "$want" "$mnt"; then
+          log "mounted $want at $mnt"
+        else
+          log "FAILED to mount $want at $mnt"
+          rc=1
+        fi
+      }
+      ensure "/var" "/dev/data1_vg/data1_lv"
+      ensure "/var/lib" "/dev/data2_vg/data2_lv"
+
+      if (( rc != 0 )); then
+        log "ensure-layout finished with errors"
+        exit 1
+      fi
+      log "ensure-layout done"
+      exit 0
+
+  - path: /usr/local/sbin/k8s-node-prereqs.sh
+    permissions: '0700'
+    content: |
+      #!/bin/bash
+      # Stage: OS prerequisites. Slow, network-dependent, retried by systemd.
+      # Marker keeps it idempotent; it never touches the cluster.
+      set -euo pipefail
+
+      LOG=/var/log/k8s-node-prereqs.log
+      exec >>"$LOG" 2>&1
+      log() { echo "[$(date -Is)] $*"; }
+      log "starting prerequisites render=0.2.0 hash=c9a32a99f590"
+
+      MARKER=/etc/kubernetes/prereqs.done
+      if [[ -f "$MARKER" ]]; then
+        log "prerequisites already done"
+        exit 0
+      fi
+
+      K8S_MINOR="v1.35"
+      K8S_VERSION="1.35.9-1.1"
+      if [[ -z "$K8S_MINOR" ]]; then
+        log "bootstrap.k8sMinorRepo is empty; cannot configure the Kubernetes apt repository"
+        exit 1
+      fi
+
+      # 1. kubelet requires swap to be disabled.
+      swapoff -a || true
+      sed -ri 's@^([^#].*[[:space:]]swap[[:space:]].*)@#\1@' /etc/fstab
+
+      # 2. Kernel modules and sysctls (config files are written above).
+      modprobe overlay
+      modprobe br_netfilter
+      sysctl --system
+
+      # 3. containerd.
+      if ! command -v containerd >/dev/null 2>&1; then
+        apt-get update -y
+        DEBIAN_FRONTEND=noninteractive apt-get install -y containerd conntrack socat
+      fi
+      mkdir -p /etc/containerd
+      systemctl enable containerd
+      systemctl restart containerd
+
+      # 4. Kubernetes binaries, pinned when a version is configured.
+      if ! command -v kubeadm >/dev/null 2>&1; then
+        apt-get update -y
+        DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl gpg apt-transport-https
+        install -d -m 0755 /etc/apt/keyrings
+        curl -fsSL "https://pkgs.k8s.io/core:/stable:/${K8S_MINOR}/deb/Release.key" \
+          | gpg --batch --yes --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/${K8S_MINOR}/deb/ /" \
+          > /etc/apt/sources.list.d/kubernetes.list
+        apt-get update -y
+        if [[ -n "$K8S_VERSION" ]]; then
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            "kubelet=${K8S_VERSION}" "kubeadm=${K8S_VERSION}" "kubectl=${K8S_VERSION}"
+        else
+          DEBIAN_FRONTEND=noninteractive apt-get install -y kubelet kubeadm kubectl
+        fi
+        apt-mark hold kubelet kubeadm kubectl
+      fi
+      systemctl enable kubelet
+
+      touch "$MARKER"
+      log "prerequisites done"
+
+  - path: /usr/local/sbin/k8s-node-join.sh
+    permissions: '0700'
+    content: |
+      #!/bin/bash
+      # Stage: join the cluster. The only step that changes cluster state, so it
+      # waits for the prerequisites and for the API instead of failing fast.
+      set -euo pipefail
+
+      LOG=/var/log/k8s-node-join.log
+      exec >>"$LOG" 2>&1
+      log() { echo "[$(date -Is)] $*"; }
+      log "starting join render=0.2.0 hash=c9a32a99f590"
+
+      MARKER=/etc/kubernetes/kubeadm-joined
+      if [[ -f "$MARKER" ]]; then
+        log "already joined"
+        exit 0
+      fi
+      # kubeadm writes kubelet.conf on success; the marker is the authority.
+      if [[ -f /etc/kubernetes/kubelet.conf ]]; then
+        log "kubelet.conf exists; recording the marker"
+        touch "$MARKER"
+        exit 0
+      fi
+
+      ENDPOINT="192.0.2.2:6443"
+
+      # Wait for the prerequisites (they retry independently in their own unit).
+      for _ in $(seq 1 30); do
+        [[ -f /etc/kubernetes/prereqs.done ]] && break
+        sleep 10
+      done
+      if [[ ! -f /etc/kubernetes/prereqs.done ]]; then
+        log "prerequisites are not finished yet"
+        exit 1
+      fi
+
+      # Wait for the API server instead of burning an attempt on a cold route.
+      if [[ -n "$ENDPOINT" ]]; then
+        api=0
+        for _ in $(seq 1 24); do
+          if curl -skf --max-time 5 "https://$ENDPOINT/healthz" >/dev/null 2>&1; then
+            api=1
+            break
+          fi
+          sleep 5
+        done
+        if [[ "$api" -ne 1 ]]; then
+          log "API $ENDPOINT is not reachable"
+          exit 1
+        fi
+        log "API $ENDPOINT reachable"
+      fi
+
+      # kubeadm has no timeout of its own: when discovery cannot be verified
+      # (observed: a token whose cluster-info JWS entry was missing) it prints
+      # "...pre-flight checks" and waits forever. Bound it so the unit fails,
+      # retries and reports instead of sitting in "activating" for hours.
+      log "running kubeadm join (15m timeout)"
+      if ! timeout 900 bash /etc/kubernetes/join-command.sh; then
+        log "kubeadm join failed or timed out"
+        exit 1
+      fi
+      touch "$MARKER"
+      log "join finished"
+
+  - path: /etc/systemd/system/vcd-ensure-layout.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Mount the data disks where the spec says
+      After=local-fs.target
+      Before=k8s-node-prereqs.service k8s-node-join.service
+      ConditionPathExists=/etc/vcd-data-disks.done
+      StartLimitIntervalSec=0
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/vcd-ensure-layout.sh
+      RemainAfterExit=yes
+      Restart=on-failure
+      RestartSec=15
+
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /etc/systemd/system/k8s-node-prereqs.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Prepare the worker OS (packages, containerd, sysctl)
+      Wants=network-online.target vcd-ensure-layout.service
+      After=network-online.target vcd-ensure-layout.service
+      ConditionPathExists=!/etc/kubernetes/prereqs.done
+      StartLimitIntervalSec=0
+
+      [Service]
+      Type=oneshot
+      # apt and dpkg live on /var/lib: refuse to run on an empty layout instead
+      # of failing with "Could not open lock file /var/lib/dpkg/lock-frontend".
+      ExecStartPre=/usr/local/sbin/vcd-verify-layout.sh
+      ExecStart=/usr/local/sbin/k8s-node-prereqs.sh
+      RemainAfterExit=yes
+      Restart=on-failure
+      RestartSec=60
+      TimeoutStartSec=30min
+
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /etc/systemd/system/k8s-node-join.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Join the Kubernetes cluster as a worker
+      Wants=network-online.target k8s-node-prereqs.service vcd-ensure-layout.service
+      After=network-online.target k8s-node-prereqs.service vcd-ensure-layout.service
+      ConditionPathExists=!/etc/kubernetes/kubeadm-joined
+      StartLimitIntervalSec=0
+
+      [Service]
+      Type=oneshot
+      ExecStartPre=/usr/local/sbin/vcd-verify-layout.sh
+      ExecStart=/usr/local/sbin/k8s-node-join.sh
+      RemainAfterExit=yes
+      Restart=on-failure
+      RestartSec=60
+      TimeoutStartSec=45min
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  - systemctl daemon-reload
+  - systemctl enable vcd-ensure-layout.service
+  - systemctl start --no-block vcd-ensure-layout.service
+  - systemctl enable --now --no-block k8s-node-prereqs.service
+  # --now, not just enable: on the first boot of a worker the prerequisites
+  # have just finished and the node should join in this boot, not the next one.
+  - systemctl enable --now --no-block k8s-node-join.service

@@ -65,13 +65,18 @@ func (f *fakeCloud) RemovePoolMember(ctx context.Context, pool cloud.PoolRef, ip
 }
 
 type fakeKube struct {
-	nodes  []kube.NodeInfo
-	taints map[string][]corev1.Taint
-	labels map[string]map[string]string
+	nodes         []kube.NodeInfo
+	taints        map[string][]corev1.Taint
+	labels        map[string]map[string]string
+	revokedTokens []string
 }
 
 func (f *fakeKube) CreateBootstrapToken(ctx context.Context, ttl time.Duration) (string, error) {
 	return "abcdef.0123456789abcdef", nil
+}
+func (f *fakeKube) RevokeBootstrapToken(ctx context.Context, token string) error {
+	f.revokedTokens = append(f.revokedTokens, token)
+	return nil
 }
 func (f *fakeKube) CAHash(ctx context.Context) (string, error) { return "sha256:0011", nil }
 func (f *fakeKube) ListNodes(ctx context.Context) ([]kube.NodeInfo, error) {
