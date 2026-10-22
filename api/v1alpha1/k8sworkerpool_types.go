@@ -69,6 +69,14 @@ type NodeFlavor struct {
 	// +kubebuilder:validation:Minimum=512
 	MemoryMB int32 `json:"memoryMB"`
 
+	// OSDiskGB overrides the system disk (bus 0/unit 0) of the cloned
+	// template. Zero keeps the template size. Terraform-created workers use
+	// disks_config.osdisk.sizegb; without this field a cloned worker inherits
+	// the catalog template disk (10 GB on Ubuntu-24.04-ENG-Server).
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	OSDiskGB int32 `json:"osDiskGB,omitempty"`
+
 	// Template is the vCD catalog template name.
 	Template string `json:"template,omitempty"`
 
@@ -128,7 +136,13 @@ type IngressPool struct {
 	// +kubebuilder:validation:Enum=nsxv;nsxt;""
 	Type string `json:"type,omitempty"`
 	Name string `json:"name,omitempty"`
-	Port int32  `json:"port,omitempty"`
+	// Port is the node port the pool forwards to (not the virtual-server
+	// port): NSX-V pool members point at the NodePort of the ingress
+	// controller.
+	Port int32 `json:"port,omitempty"`
+	// Edge is the NSX-V edge gateway that owns the pool. NSX-V pools belong to
+	// an edge gateway, so member removal needs it.
+	Edge string `json:"edge,omitempty"`
 }
 
 // ScaleDownPolicy controls safe removal of workers.
@@ -136,6 +150,22 @@ type ScaleDownPolicy struct {
 	// +kubebuilder:validation:Minimum=0
 	MinReplicas  int32           `json:"minReplicas,omitempty"`
 	DrainTimeout metav1.Duration `json:"drainTimeout,omitempty"`
+
+	// DeleteWorkers names specific workers to remove, in order, regardless of
+	// their position in the pool. An entry is processed like a scale-down:
+	// cordon, ingress-pool removal, PDB-aware drain, volume-detach check, then
+	// node and VM deletion. When the worker is gone the entry is removed from
+	// this list and spec.replicas is decremented, so the worker is not
+	// recreated. Unknown names are dropped with a warning event.
+	// +optional
+	DeleteWorkers []string `json:"deleteWorkers,omitempty"`
+
+	// Force skips the data-loss guard for node-local volumes (hostPath/local
+	// PVs that would become unreadable). It never skips PDBs or the detach
+	// check. The same can be requested per node with the annotation
+	// infra.example.com/force-delete=true.
+	// +optional
+	Force bool `json:"force,omitempty"`
 }
 
 // K8sWorkerPoolStatus is the observed state.
@@ -165,6 +195,11 @@ type WorkerNodeStatus struct {
 	K8sReady       bool      `json:"k8sReady,omitempty"`
 	KubeletVersion string    `json:"kubeletVersion,omitempty"`
 	Message        string    `json:"message,omitempty"`
+
+	// DeleteStartedAt anchors the scaleDown.drainTimeout budget for a worker
+	// that is being removed. It is cleared when the worker leaves status.
+	// +optional
+	DeleteStartedAt *metav1.Time `json:"deleteStartedAt,omitempty"`
 }
 
 // +kubebuilder:object:root=true

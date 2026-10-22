@@ -43,6 +43,12 @@ func (c *Client) ListNodes(ctx context.Context) ([]NodeInfo, error) {
 	for i := range list.Items {
 		n := &list.Items[i]
 		info := NodeInfo{Name: n.Name, KubeletVersion: n.Status.NodeInfo.KubeletVersion}
+		if len(n.Annotations) > 0 {
+			info.Annotations = make(map[string]string, len(n.Annotations))
+			for k, v := range n.Annotations {
+				info.Annotations[k] = v
+			}
+		}
 		for _, cond := range n.Status.Conditions {
 			if cond.Type == corev1.NodeReady {
 				info.Ready = cond.Status == corev1.ConditionTrue
@@ -265,9 +271,6 @@ func (c *Client) WaitReady(ctx context.Context, name string, timeout time.Durati
 }
 
 // Drain TODO: cordon + eviction-API drain (respect PDBs, skip DaemonSets/mirror pods).
-func (c *Client) Drain(ctx context.Context, name string, timeout time.Duration) error {
-	return ErrNotImplemented
-}
 
 // SetLabels adds or updates the given labels. A merge patch keeps unrelated
 // labels (kubelet, cloud provider) intact.
@@ -340,7 +343,11 @@ func taintsEqual(a, b []corev1.Taint) bool {
 
 // DeleteNode removes the Node object from the cluster.
 func (c *Client) DeleteNode(ctx context.Context, name string) error {
-	return c.cs.CoreV1().Nodes().Delete(ctx, name, metav1.DeleteOptions{})
+	err := c.cs.CoreV1().Nodes().Delete(ctx, name, metav1.DeleteOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	return err
 }
 
 func randomString(n int) (string, error) {

@@ -62,8 +62,12 @@ type WorkerPoolReconciler struct {
 // +kubebuilder:rbac:groups=infra.example.com,resources=k8sworkerpools/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=infra.example.com,resources=k8sworkerpools/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch;patch;delete
-// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;delete
 // +kubebuilder:rbac:groups="",resources=pods/eviction,verbs=create
+// +kubebuilder:rbac:groups="",resources=persistentvolumes,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch
+// +kubebuilder:rbac:groups=storage.k8s.io,resources=volumeattachments,verbs=get;list;watch
+// +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
@@ -145,6 +149,18 @@ func (r *WorkerPoolReconciler) reconcile(ctx context.Context, pool *infrav1.K8sW
 	pool.Status.ObservedReplicas = int32(len(actual))
 	pool.Status.Ledger = toStatusLedger(alloc.Ledger())
 
+	// Named deletions (spec.scaleDown.deleteWorkers and the per-node
+	// annotation) run before the replica arithmetic: deleting a specific
+	// worker must not be read as a scale-up.
+	if handled, res, err := r.reconcileDeletions(ctx, pool, alloc); handled {
+		if err != nil {
+			logger.Error(err, "worker deletion failed", "pool", pool.Name)
+			r.setCondition(pool, metav1.ConditionFalse, "ScaleDownFailed", err.Error())
+			return res, err
+		}
+		return res, nil
+	}
+
 	desired := pool.Spec.Replicas
 	switch {
 	case desired > pool.Status.ObservedReplicas:
@@ -154,10 +170,14 @@ func (r *WorkerPoolReconciler) reconcile(ctx context.Context, pool *infrav1.K8sW
 			return ctrl.Result{}, err
 		}
 	case desired < pool.Status.ObservedReplicas:
-		if err := r.scaleDown(ctx, pool, pool.Status.ObservedReplicas-desired); err != nil {
+		handled, res, err := r.scaleDown(ctx, pool, alloc, pool.Status.ObservedReplicas-desired)
+		if err != nil {
 			logger.Error(err, "scale down failed", "pool", pool.Name)
 			r.setCondition(pool, metav1.ConditionFalse, "ScaleDownFailed", err.Error())
-			return ctrl.Result{}, err
+			return res, err
+		}
+		if handled {
+			return res, nil
 		}
 	}
 
@@ -196,6 +216,11 @@ func (r *WorkerPoolReconciler) refreshReadiness(ctx context.Context, pool *infra
 
 	for i := range pool.Status.Nodes {
 		st := &pool.Status.Nodes[i]
+		// A worker that is being deleted keeps its phase: overwriting it with
+		// Ready would restart the drain on every pass.
+		if st.DeleteStartedAt != nil {
+			continue
+		}
 		info, ok := byName[strings.ToLower(st.Name)]
 		switch {
 		case !ok:
@@ -326,10 +351,27 @@ func parseTaints(in []string) ([]corev1.Taint, error) {
 // flush writes status only when it changed. Writing an identical status would
 // bump resourceVersion and re-trigger the reconcile loop.
 func (r *WorkerPoolReconciler) flush(ctx context.Context, before, pool *infrav1.K8sWorkerPool) error {
-	if reflect.DeepEqual(before.Status, pool.Status) {
+	if reflect.DeepEqual(before.Spec, pool.Spec) {
+		if reflect.DeepEqual(before.Status, pool.Status) {
+			return nil
+		}
+		return r.Status().Update(ctx, pool)
+	}
+
+	// A completed named deletion prunes spec.scaleDown.deleteWorkers and
+	// decrements spec.replicas. Merge patches carry no resourceVersion for an
+	// unchanged object, so the spec write cannot conflict with the status
+	// write that follows it.
+	computed := pool.DeepCopy()
+	spec := pool.DeepCopy()
+	if err := r.Patch(ctx, spec, client.MergeFrom(before.DeepCopy())); err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+	computed.ResourceVersion = spec.ResourceVersion
+	if reflect.DeepEqual(before.Status, computed.Status) {
 		return nil
 	}
-	return r.Status().Update(ctx, pool)
+	return r.Status().Update(ctx, computed)
 }
 
 func (r *WorkerPoolReconciler) setCondition(pool *infrav1.K8sWorkerPool, status metav1.ConditionStatus, reason, msg string) {
@@ -522,6 +564,7 @@ func (r *WorkerPoolReconciler) scaleUp(ctx context.Context, pool *infrav1.K8sWor
 			Template:   pool.Spec.Flavor.Template,
 			CPUs:       pool.Spec.Flavor.CPUs,
 			MemoryMB:   pool.Spec.Flavor.MemoryMB,
+			OSDiskGB:   pool.Spec.Flavor.OSDiskGB,
 			Disks:      toCloudDisks(pool.Spec.Flavor.Disks),
 			Initscript: initscript,
 			UserData:   userData,
@@ -602,11 +645,6 @@ func (r *WorkerPoolReconciler) reserveUnlessGone(ctx context.Context, pool *infr
 
 // scaleDown removes n workers. TODO: cordon -> drain (PDB-aware) -> remove from
 // ingress LB pool -> kubeadm reset -> delete VM + disks -> free IP -> delete Node.
-func (r *WorkerPoolReconciler) scaleDown(ctx context.Context, pool *infrav1.K8sWorkerPool, n int32) error {
-	// Intentionally a no-op until kube.Provider.Drain is implemented.
-	return nil
-}
-
 // SetupWithManager registers the controller and watches Nodes to trigger reconciliation.
 func (r *WorkerPoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).

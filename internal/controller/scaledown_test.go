@@ -1,0 +1,270 @@
+package controller
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"testing"
+	"time"
+
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	infrav1 "github.com/werton13/vcd-k8s-node-controller/api/v1alpha1"
+	"github.com/werton13/vcd-k8s-node-controller/internal/cloud"
+	"github.com/werton13/vcd-k8s-node-controller/internal/kube"
+)
+
+func workerVM(ordinal int, ip string) cloud.VM {
+	name := fmt.Sprintf("pool-wrk-%02d", ordinal)
+	return cloud.VM{
+		ID:       "vm-" + name,
+		Name:     name,
+		IP:       ip,
+		CPU:      2,
+		MemoryMB: 4096,
+		DiskGB:   60,
+	}
+}
+
+func threeWorkers() []cloud.VM {
+	return []cloud.VM{
+		workerVM(1, "192.168.100.7"),
+		workerVM(2, "192.168.100.8"),
+		workerVM(3, "192.168.100.9"),
+	}
+}
+
+func nodeNames(pool *infrav1.K8sWorkerPool) []string {
+	out := make([]string, 0, len(pool.Status.Nodes))
+	for _, node := range pool.Status.Nodes {
+		out = append(out, node.Name)
+	}
+	return out
+}
+
+func reconcilePasses(t *testing.T, r *WorkerPoolReconciler, pool *infrav1.K8sWorkerPool, passes int) {
+	t.Helper()
+	for i := 0; i < passes; i++ {
+		if _, err := r.Reconcile(context.Background(), requestFor(pool)); err != nil {
+			t.Fatalf("pass %d: %v", i, err)
+		}
+	}
+}
+
+func TestReconcileDeletesNamedWorkerAndDecrementsReplicas(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(3)
+	pool.Spec.ScaleDown = infrav1.ScaleDownPolicy{
+		MinReplicas:   1,
+		DrainTimeout:  metav1.Duration{Duration: time.Minute},
+		DeleteWorkers: []string{"pool-wrk-02"},
+	}
+	fc := &fakeCloud{vms: threeWorkers()}
+	fk := &fakeKube{nodes: readyNodes("pool-wrk-01", "pool-wrk-02", "pool-wrk-03")}
+	r := newTestReconciler(t, fc, fk, pool)
+
+	reconcilePasses(t, r, pool, 6)
+
+	got := getPool(t, r, pool)
+	names := nodeNames(got)
+	if len(names) != 2 || names[0] != "pool-wrk-01" || names[1] != "pool-wrk-03" {
+		t.Fatalf("remaining workers = %v, want pool-wrk-01 and pool-wrk-03", names)
+	}
+	if got.Spec.Replicas != 2 {
+		t.Fatalf("spec.replicas = %d, want 2 after a named deletion", got.Spec.Replicas)
+	}
+	if len(got.Spec.ScaleDown.DeleteWorkers) != 0 {
+		t.Fatalf("deleteWorkers not pruned: %v", got.Spec.ScaleDown.DeleteWorkers)
+	}
+	if len(fc.deleted) != 1 || fc.deleted[0] != "vm-pool-wrk-02" {
+		t.Fatalf("deleted VMs = %v, want [vm-pool-wrk-02]", fc.deleted)
+	}
+	if len(fk.drained) != 1 || fk.drained[0] != "pool-wrk-02" {
+		t.Fatalf("drained = %v, want [pool-wrk-02]", fk.drained)
+	}
+	if len(fk.deletedNodes) != 1 || fk.deletedNodes[0] != "pool-wrk-02" {
+		t.Fatalf("deleted Node objects = %v, want [pool-wrk-02]", fk.deletedNodes)
+	}
+	if got.Status.ObservedReplicas != 2 {
+		t.Fatalf("observedReplicas = %d, want 2", got.Status.ObservedReplicas)
+	}
+	if got.Status.Ledger.Used != nil {
+		for _, ip := range got.Status.Ledger.Used {
+			if ip == "192.168.100.8" {
+				t.Fatalf("address of the deleted worker is still in use: %v", got.Status.Ledger.Used)
+			}
+		}
+	}
+	_ = ctx
+}
+
+func TestReconcileScaleDownRemovesHighestOrdinal(t *testing.T) {
+	pool := testPool(2)
+	fc := &fakeCloud{vms: threeWorkers()}
+	fk := &fakeKube{nodes: readyNodes("pool-wrk-01", "pool-wrk-02", "pool-wrk-03")}
+	r := newTestReconciler(t, fc, fk, pool)
+
+	reconcilePasses(t, r, pool, 6)
+
+	got := getPool(t, r, pool)
+	names := nodeNames(got)
+	if len(names) != 2 || names[0] != "pool-wrk-01" || names[1] != "pool-wrk-02" {
+		t.Fatalf("remaining workers = %v, want the two lowest ordinals", names)
+	}
+	if len(fc.deleted) != 1 || fc.deleted[0] != "vm-pool-wrk-03" {
+		t.Fatalf("deleted VMs = %v, want [vm-pool-wrk-03]", fc.deleted)
+	}
+	if got.Spec.Replicas != 2 {
+		t.Fatalf("spec.replicas = %d, want 2 (scale-down must not touch it)", got.Spec.Replicas)
+	}
+}
+
+func TestReconcileScaleDownStopsAtMinReplicas(t *testing.T) {
+	pool := testPool(1)
+	pool.Spec.ScaleDown = infrav1.ScaleDownPolicy{MinReplicas: 2}
+	fc := &fakeCloud{vms: threeWorkers()[:2]}
+	fk := &fakeKube{nodes: readyNodes("pool-wrk-01", "pool-wrk-02")}
+	r := newTestReconciler(t, fc, fk, pool)
+
+	reconcilePasses(t, r, pool, 2)
+
+	got := getPool(t, r, pool)
+	if len(got.Status.Nodes) != 2 {
+		t.Fatalf("workers = %d, want 2 (minReplicas must stop the scale-down)", len(got.Status.Nodes))
+	}
+	if len(fc.deleted) != 0 {
+		t.Fatalf("deleted VMs = %v, want none", fc.deleted)
+	}
+	cond := meta.FindStatusCondition(got.Status.Conditions, "Ready")
+	if cond == nil || cond.Reason != "MinReplicasProtected" {
+		t.Fatalf("condition = %#v, want MinReplicasProtected", cond)
+	}
+}
+
+func TestReconcileRefusesToDeleteNodeLocalVolumes(t *testing.T) {
+	pool := testPool(3)
+	pool.Spec.ScaleDown = infrav1.ScaleDownPolicy{MinReplicas: 1, DeleteWorkers: []string{"pool-wrk-03"}}
+	fc := &fakeCloud{vms: threeWorkers()}
+	fk := &fakeKube{
+		nodes:        readyNodes("pool-wrk-01", "pool-wrk-02", "pool-wrk-03"),
+		localVolumes: map[string][]string{"pool-wrk-03": {"pv-local-data"}},
+	}
+	r := newTestReconciler(t, fc, fk, pool)
+
+	reconcilePasses(t, r, pool, 2)
+
+	got := getPool(t, r, pool)
+	if len(got.Status.Nodes) != 3 || len(fc.deleted) != 0 {
+		t.Fatalf("worker was deleted despite node-local data (deleted=%v)", fc.deleted)
+	}
+	cond := meta.FindStatusCondition(got.Status.Conditions, "Ready")
+	if cond == nil || cond.Reason != "VolumeDataAtRisk" {
+		t.Fatalf("condition = %#v, want VolumeDataAtRisk", cond)
+	}
+	if len(fk.cordoned) != 0 {
+		t.Fatalf("node was cordoned before the data-loss guard: %v", fk.cordoned)
+	}
+}
+
+func TestReconcileForceDeletesNodeWithLocalVolumes(t *testing.T) {
+	pool := testPool(3)
+	pool.Spec.ScaleDown = infrav1.ScaleDownPolicy{
+		MinReplicas:   1,
+		Force:         true,
+		DeleteWorkers: []string{"pool-wrk-03"},
+	}
+	fc := &fakeCloud{vms: threeWorkers()}
+	fk := &fakeKube{
+		nodes:        readyNodes("pool-wrk-01", "pool-wrk-02", "pool-wrk-03"),
+		localVolumes: map[string][]string{"pool-wrk-03": {"pv-local-data"}},
+	}
+	r := newTestReconciler(t, fc, fk, pool)
+
+	reconcilePasses(t, r, pool, 6)
+
+	if len(fc.deleted) != 1 || fc.deleted[0] != "vm-pool-wrk-03" {
+		t.Fatalf("deleted VMs = %v, want [vm-pool-wrk-03]", fc.deleted)
+	}
+}
+
+func TestReconcileDrainTimeoutFailsWithoutDeletingVM(t *testing.T) {
+	pool := testPool(3)
+	pool.Spec.ScaleDown = infrav1.ScaleDownPolicy{
+		MinReplicas:   1,
+		DrainTimeout:  metav1.Duration{Duration: time.Millisecond},
+		DeleteWorkers: []string{"pool-wrk-03"},
+	}
+	fc := &fakeCloud{vms: threeWorkers()}
+	fk := &fakeKube{
+		nodes:    readyNodes("pool-wrk-01", "pool-wrk-02", "pool-wrk-03"),
+		drainErr: fmt.Errorf("%w: 1 pod(s) still on pool-wrk-03; blocked by PodDisruptionBudget(s): web-pdb", kube.ErrDrainIncomplete),
+	}
+	r := newTestReconciler(t, fc, fk, pool)
+
+	reconcilePasses(t, r, pool, 3)
+
+	got := getPool(t, r, pool)
+	if len(fc.deleted) != 0 {
+		t.Fatalf("VM deleted after a failed drain: %v", fc.deleted)
+	}
+	var phase infrav1.NodePhase
+	for _, node := range got.Status.Nodes {
+		if node.Name == "pool-wrk-03" {
+			phase = node.Phase
+			if node.Message == "" {
+				t.Fatal("failed worker has no message explaining the drain timeout")
+			}
+		}
+	}
+	if phase != infrav1.NodePhaseFailed {
+		t.Fatalf("phase = %q, want Failed", phase)
+	}
+}
+
+func TestReconcileDeletesWorkerByNodeAnnotation(t *testing.T) {
+	pool := testPool(3)
+	pool.Spec.ScaleDown = infrav1.ScaleDownPolicy{MinReplicas: 1}
+	fc := &fakeCloud{vms: threeWorkers()}
+	nodes := readyNodes("pool-wrk-01", "pool-wrk-02", "pool-wrk-03")
+	nodes[2].Annotations = map[string]string{DeleteWorkerAnnotation: "true"}
+	fk := &fakeKube{nodes: nodes}
+	r := newTestReconciler(t, fc, fk, pool)
+
+	reconcilePasses(t, r, pool, 6)
+
+	got := getPool(t, r, pool)
+	if len(fc.deleted) != 1 || fc.deleted[0] != "vm-pool-wrk-03" {
+		t.Fatalf("deleted VMs = %v, want [vm-pool-wrk-03]", fc.deleted)
+	}
+	// The annotation is a rolling replacement: replicas stays at 3, so the
+	// pool is expected to create a new worker afterwards.
+	if got.Spec.Replicas != 3 {
+		t.Fatalf("spec.replicas = %d, want 3", got.Spec.Replicas)
+	}
+}
+
+func TestWorkerOrdinal(t *testing.T) {
+	cases := map[string]int{
+		"pool-wrk-01": 1,
+		"pool-wrk-12": 12,
+		"pool-wrk":    -1,
+		"pool":        -1,
+	}
+	for name, want := range cases {
+		if got := workerOrdinal(name); got != want {
+			t.Errorf("workerOrdinal(%q) = %d, want %d", name, got, want)
+		}
+	}
+}
+
+func TestToPoolRefCarriesEdge(t *testing.T) {
+	pool := testPool(1)
+	pool.Spec.IngressPool = infrav1.IngressPool{Type: "nsxv", Name: "p", Port: 30080, Edge: "edge-1"}
+	ref := toPoolRef(pool)
+	if ref.Edge != "edge-1" || ref.Port != 30080 {
+		t.Fatalf("unexpected pool ref: %#v", ref)
+	}
+}
+
+var _ = errors.Is

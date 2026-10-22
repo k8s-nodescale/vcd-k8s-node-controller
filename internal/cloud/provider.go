@@ -9,6 +9,12 @@ import (
 // ErrNotImplemented marks provider methods that still need a real implementation.
 var ErrNotImplemented = errors.New("cloud provider method not implemented")
 
+// ErrPoolNotConfigured means the worker pool has an ingress load balancer
+// configured that this provider cannot address (missing edge gateway name, or
+// NSX-T, which is not implemented yet). Callers treat it as a warning: the node
+// is drained and deleted, but its pool member must be removed by hand.
+var ErrPoolNotConfigured = errors.New("ingress pool not addressable by this provider")
+
 // DiskSpec describes an internal disk to attach to a worker VM.
 type DiskSpec struct {
 	SizeGB         int32
@@ -42,7 +48,12 @@ type CreateVMSpec struct {
 	Template   string
 	CPUs       int32
 	MemoryMB   int32
-	Disks      []DiskSpec
+
+	// OSDiskGB grows the cloned template's system disk (bus 0/unit 0) before
+	// the first power-on. Zero keeps the template size.
+	OSDiskGB int32
+
+	Disks []DiskSpec
 
 	// Initscript seeds cloud-init (writes netplan + NoCloud seed).
 	Initscript string
@@ -60,13 +71,16 @@ type PoolRef struct {
 	Type string // nsxv | nsxt
 	Name string
 	Port int32
+	// Edge is the NSX-V edge gateway that owns the pool. Required for nsxv;
+	// NSX-V load balancer pools are scoped to an edge, not to the VDC.
+	Edge string
 }
 
 // Provider abstracts all vCD operations required for worker scaling.
 type Provider interface {
 	ListWorkerVMs(ctx context.Context, vapp string, selector map[string]string) ([]VM, error)
 	CreateVM(ctx context.Context, spec CreateVMSpec) (VM, error)
-	DeleteVM(ctx context.Context, id string) error
+	DeleteVM(ctx context.Context, vappName, id string) error
 	AddPoolMember(ctx context.Context, pool PoolRef, ip string) error
 	RemovePoolMember(ctx context.Context, pool PoolRef, ip string) error
 }

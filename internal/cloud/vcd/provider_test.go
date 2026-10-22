@@ -1,6 +1,12 @@
 package vcd
 
-import "testing"
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"github.com/werton13/vcd-k8s-node-controller/internal/cloud"
+)
 
 func TestNormalizeURL(t *testing.T) {
 	tests := []struct {
@@ -75,6 +81,26 @@ func TestNormalizeURL(t *testing.T) {
 			}
 			if got != tc.want {
 				t.Fatalf("normalizeURL(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestUpdatePoolMemberRejectsUnaddressablePools(t *testing.T) {
+	p := &Provider{}
+	cases := []struct {
+		name string
+		pool cloud.PoolRef
+	}{
+		{name: "nsxt is not implemented", pool: cloud.PoolRef{Type: "nsxt", Name: "p", Edge: "e"}},
+		{name: "missing edge", pool: cloud.PoolRef{Type: "nsxv", Name: "p"}},
+		{name: "missing name", pool: cloud.PoolRef{Type: "nsxv", Edge: "e"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := p.AddPoolMember(context.Background(), tc.pool, "192.0.2.10")
+			if !errors.Is(err, cloud.ErrPoolNotConfigured) {
+				t.Fatalf("err = %v, want ErrPoolNotConfigured", err)
 			}
 		})
 	}

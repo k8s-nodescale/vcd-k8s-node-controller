@@ -2,6 +2,6 @@ apiVersion: v2
 name: vcd-nodescale
 description: Kubernetes worker-node scaling controller for VMware Cloud Director
 type: application
-version: 0.2.0
-appVersion: "0.2.0"
+version: 0.3.0
+appVersion: "0.3.0"
 kubeVersion: ">=1.28.0-0"

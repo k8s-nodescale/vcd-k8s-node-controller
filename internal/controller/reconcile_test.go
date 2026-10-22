@@ -24,6 +24,8 @@ import (
 type fakeCloud struct {
 	vms             []cloud.VM
 	created         []cloud.CreateVMSpec
+	deleted         []string
+	poolRemovals    []string
 	calls           int
 	failAt          int
 	failAfterCreate bool
@@ -56,11 +58,22 @@ func (f *fakeCloud) CreateVM(ctx context.Context, spec cloud.CreateVMSpec) (clou
 	return vm, nil
 }
 
-func (f *fakeCloud) DeleteVM(ctx context.Context, id string) error { return nil }
+func (f *fakeCloud) DeleteVM(ctx context.Context, vappName, id string) error {
+	f.deleted = append(f.deleted, id)
+	kept := f.vms[:0]
+	for _, vm := range f.vms {
+		if vm.ID != id {
+			kept = append(kept, vm)
+		}
+	}
+	f.vms = kept
+	return nil
+}
 func (f *fakeCloud) AddPoolMember(ctx context.Context, pool cloud.PoolRef, ip string) error {
 	return nil
 }
 func (f *fakeCloud) RemovePoolMember(ctx context.Context, pool cloud.PoolRef, ip string) error {
+	f.poolRemovals = append(f.poolRemovals, ip)
 	return nil
 }
 
@@ -69,6 +82,11 @@ type fakeKube struct {
 	taints        map[string][]corev1.Taint
 	labels        map[string]map[string]string
 	revokedTokens []string
+	cordoned      []string
+	drained       []string
+	deletedNodes  []string
+	localVolumes  map[string][]string
+	drainErr      error
 }
 
 func (f *fakeKube) CreateBootstrapToken(ctx context.Context, ttl time.Duration) (string, error) {
@@ -85,8 +103,27 @@ func (f *fakeKube) ListNodes(ctx context.Context) ([]kube.NodeInfo, error) {
 func (f *fakeKube) WaitReady(ctx context.Context, name string, timeout time.Duration) error {
 	return nil
 }
-func (f *fakeKube) Drain(ctx context.Context, name string, timeout time.Duration) error { return nil }
-func (f *fakeKube) DeleteNode(ctx context.Context, name string) error                   { return nil }
+func (f *fakeKube) Cordon(ctx context.Context, name string) error {
+	f.cordoned = append(f.cordoned, name)
+	return nil
+}
+func (f *fakeKube) Drain(ctx context.Context, name string, timeout time.Duration) error {
+	if f.drainErr != nil {
+		return f.drainErr
+	}
+	f.drained = append(f.drained, name)
+	return nil
+}
+func (f *fakeKube) WaitVolumesDetached(ctx context.Context, name string, timeout time.Duration) error {
+	return nil
+}
+func (f *fakeKube) NodeLocalVolumes(ctx context.Context, name string) ([]string, error) {
+	return f.localVolumes[name], nil
+}
+func (f *fakeKube) DeleteNode(ctx context.Context, name string) error {
+	f.deletedNodes = append(f.deletedNodes, name)
+	return nil
+}
 func (f *fakeKube) SetTaints(ctx context.Context, name string, taints []corev1.Taint) error {
 	if f.taints == nil {
 		f.taints = map[string][]corev1.Taint{}

@@ -21,9 +21,20 @@ Implemented:
   explicit reservations). Worker names are derived from the address ordinal and
   existing VMs are adopted into the ledger on every pass, so a lost status can
   never produce a duplicate name or IP.
-- `cloud/vcd` provider on `govcd`: create VM from a catalog template, paravirtual
-  SCSI data disks, IP-assigned NIC on the org network, guest customization with
-  the rendered cloud-init payload. `DeleteVM` is still a stub.
+- `cloud/vcd` provider on `govcd`: create VM from a catalog template, grow the
+  system disk when `flavor.osDiskGB` asks for it, paravirtual SCSI data disks,
+  IP-assigned NIC on the org network, guest customization with the rendered
+  cloud-init payload. `DeleteVM` powers the VM off and removes it together with
+  its disks; it is idempotent.
+- Scale-in: lowering `spec.replicas` removes the highest-ordinal worker, while
+  `spec.scaleDown.deleteWorkers` and the `infra.example.com/delete-worker`
+  annotation remove a worker **by name**. Every removal is cordon -> ingress-pool
+  removal -> PDB-aware drain (eviction API) -> volume-detach wait -> Node delete
+  -> VM delete -> address release, bounded by `scaleDown.drainTimeout` and
+  guarded by `minReplicas` and a node-local volume check. See
+  [Scale in](#scale-in--removing-a-worker).
+- Ingress pool membership: workers are added to the NSX-V edge pool once Ready
+  and removed before the drain starts (`ingressPool.type/name/port/edge`).
 - Guest bootstrap (`internal/cloudinit`) in two stages, because vCD runs the
   customisation script in a phase it can fail the VM in:
   - **preCustomization** writes only what vCD's own network step needs (netplan,
@@ -56,11 +67,12 @@ Implemented:
 
 Not implemented yet:
 
-- `govcd` VM delete and scale-down (cordon, PDB-aware drain, disk cleanup):
-  `scaleDown` is a no-op, so lowering `spec.replicas` currently does nothing.
-- Ingress LB pool membership (add only after the Node is Ready).
+- NSX-T ingress pools (`ingressPool.type: nsxt` is rejected with a clear event;
+  the node is still drained and deleted, but its pool member must be removed by
+  hand).
 - Finalizers and a failed-provisioning watchdog: a VM that boots but never joins
-  is counted in `observedReplicas` and is not replaced automatically.
+  is counted in `observedReplicas` and is not replaced automatically. A drain
+  that hits its timeout is marked `Failed` and kept, it is not retried for you.
 - Token renewal for joins that outlive `join.tokenTTL`; the token of a finished
   join is left to expire on its own, and its JWS entry with it. A failed create
   now revokes its token (the earlier leak left one usable credential per failed
@@ -86,6 +98,7 @@ One `K8sWorkerPool` describes the worker set of a single cluster. You own
 | `bootstrap.k8sVersion` | no | Full apt version pinned in the guest, e.g. `1.35.9-1.1`. |
 | `bootstrap.k8sMinorRepo` | no | `pkgs.k8s.io` minor repo, e.g. `v1.35`. |
 | `flavor.cpus` / `flavor.memoryMB` | yes | VM shape. |
+| `flavor.osDiskGB` | no | Grows the cloned template's system disk (bus 0/unit 0) before the first power-on. Terraform nodes use `disks_config.osdisk.sizegb`; a clone without this keeps the template size (10 GB on the current Ubuntu template). Shrinking is refused. |
 | `flavor.template` | no | vCD catalog template (must expose `disk.EnableUUID`). |
 | `flavor.disks[]` | no | Data disks: `sizeGB`, `mount` (`/var`, `/var/lib`), `busType`, `busNumber`, `unitNumber`, `storageProfile`. Mirrors Terraform `diskw1` / `diskw2`. |
 | `vcd.org` / `vcd.vdc` / `vcd.vapp` / `vcd.orgNetwork` | yes | Placement of the VM. |
@@ -94,8 +107,11 @@ One `K8sWorkerPool` describes the worker set of a single cluster. You own
 | `join.endpoint` | no | Control-plane address, `host:port` of the API VIP. |
 | `join.tokenTTL` | no | Lifetime of the per-VM bootstrap token (default `1h`). |
 | `join.labels` / `join.taints` | no | Pool-wide, applied to every Ready worker (`taints` in `key[=value]:Effect` form). |
-| `ingressPool` | no | `type` (`nsxv`/`nsxt`), `name`, `port`. Declared, not applied yet. |
-| `scaleDown` | no | `minReplicas`, `drainTimeout`. Declared, not applied yet. |
+| `ingressPool` | no | `type` (`nsxv`/`nsxt`), `name`, `port`, `edge`. `port` is the **node port** the pool forwards to, not the virtual-server port; `edge` is the NSX-V edge that owns the pool. Workers are added on Ready and removed before a drain. |
+| `scaleDown.minReplicas` | no | Floor for both scale-down paths. `0` disables the floor. |
+| `scaleDown.drainTimeout` | no | Budget for cordon+drain of one worker (default `10m`). When it expires the worker is `Failed` and its VM is kept. |
+| `scaleDown.deleteWorkers[]` | no | Worker names to remove regardless of their position. Each entry is drained and deleted, then removed from this list and `spec.replicas` is decremented so the worker is **not** recreated. |
+| `scaleDown.force` | no | Skip the node-local volume guard. Per-node override: annotation `infra.example.com/force-delete=true`. Never skips PDBs or the detach wait. |
 
 `status`:
 
@@ -103,12 +119,13 @@ One `K8sWorkerPool` describes the worker set of a single cluster. You own
 | --- | --- |
 | `observedReplicas` | Workers the controller knows about (VM exists). |
 | `ledger.nextIndex` / `used[]` / `free[]` | Address book. `used` holds every allocated worker IP; addresses of deleted VMs are never released automatically. |
-| `nodes[]` | Per worker: `name`, `ip`, `vmID`, `phase`, `cpu`, `memoryMB`, `diskGB`, `k8sReady`, `kubeletVersion`, `message`. |
+| `nodes[]` | Per worker: `name`, `ip`, `vmID`, `phase`, `cpu`, `memoryMB`, `diskGB`, `k8sReady`, `kubeletVersion`, `message`, `deleteStartedAt`. `message` is where a blocked removal explains itself (the PDB, the attached volume, the local PV). |
 | `conditions[]` | `Ready`, with reason `Converged` (`3/3 workers Ready`), `Progressing` while a worker is not Ready yet, `ScaleUpFailed` or `InvalidSpec` on errors. |
 
 Phases: `Provisioning` (VM created, Node not registered yet) -> `Joining` (Node
-registered, not Ready) -> `Ready`. `Draining`, `Deleting` and `Failed` are
-reserved for the scale-in path and are not produced today.
+registered, not Ready) -> `Ready`. Removal uses `Draining` (cordon, pool
+removal, pod eviction) -> `Deleting` (detach wait, Node and VM deletion).
+`Failed` means the drain hit `drainTimeout` and the VM was kept.
 
 Example (placeholder org, network and template; nothing cluster-specific):
 
@@ -132,6 +149,7 @@ spec:
   flavor:
     cpus: 4
     memoryMB: 8192
+    osDiskGB: 20
     template: ubuntu-24.04-k8s
     disks:
       - sizeGB: 10
@@ -170,10 +188,12 @@ spec:
   ingressPool:
     type: nsxv
     name: demo-cluster-ingress-pool
-    port: 443
+    edge: demo-edge-gateway
+    port: 30080        # ingress controller NodePort, not 443
   scaleDown:
     minReplicas: 2
     drainTimeout: 10m
+    deleteWorkers: []  # e.g. [demo-cluster-wrk-02]
 ```
 
 ## Layout
@@ -308,15 +328,54 @@ actually is.
 
 ### Scale in / removing a worker
 
-Not implemented yet. Lowering `spec.replicas` is accepted but has no effect: no
-VM is deleted and no node is drained. Until `DeleteVM` and the drain path land,
-removal is a manual procedure (undeploy and delete the VM, free its address in
-`status.ledger`, delete the Node and its bootstrap token).
+Three ways to ask, one implementation:
+
+| Request | Removes | Recreates? |
+| --- | --- | --- |
+| `spec.replicas: 2` (was 3) | the highest-ordinal worker (the one at the end of the pool) | no |
+| `spec.scaleDown.deleteWorkers: ["demo-cluster-wrk-02"]` | exactly that worker; the entry is pruned and `replicas` is decremented when it is gone | no |
+| `kubectl annotate node demo-cluster-wrk-03 infra.example.com/delete-worker=true` | exactly that worker, with `replicas` untouched | yes, a replacement is created (rolling replacement) |
+
+A removal is one step per reconcile pass, visible in `status.nodes[].phase`:
+
+1. **Guards.** Refuse to go below `scaleDown.minReplicas`. Refuse when Bound
+   `hostPath` PVs used by the node or PVs pinned to it by `nodeAffinity`
+   (local volumes) would lose their data - the message names the PVs and the
+   override (`scaleDown.force: true` or the node annotation
+   `infra.example.com/force-delete=true`).
+2. **Cordon + ingress pool.** Patch `spec.unschedulable`, then remove the
+   address from `ingressPool` so no new request is sent to a dying node. A pool
+   removal that cannot be performed (NSX-T, missing `edge`, pool not found)
+   raises a `IngressPoolMemberNotRemoved` event instead of silently pretending.
+3. **Drain through the eviction API.** DaemonSet and mirror pods are skipped;
+   every other pod is evicted with the eviction subresource, so a
+   PodDisruptionBudget blocks the eviction instead of being bypassed. While a
+   budget has no disruptions left the worker stays `Draining` and the message
+   names the budget. The whole step is bounded by `scaleDown.drainTimeout`; when
+   it expires the phase becomes `Failed` and the VM is kept.
+4. **Volume gate.** Wait until no `VolumeAttachment` references the node.
+   Destroying a VM with an attached volume strands the volume in the storage
+   backend and can leave the PV bound forever.
+5. **Delete.** Node object first, then the VM (power off, remove, disks
+   included), then release the address in `status.ledger` and drop the worker
+   from `status.nodes`.
+
+Notes:
+
+- `PVs` are not deleted. A `Retain` PV survives its PVC and must be cleaned up
+  by hand; a `Delete` PV is reclaimed only when its PVC is deleted.
+- Pods using `emptyDir` are evicted and their data goes with them - that is the
+  point of deleting a node.
+- A `Failed` removal is not retried automatically: fix the blocker (raise the
+  budget, relax the PDB) and remove the annotation, or re-request the worker,
+  then delete the entry from `status` by recreating the pool request.
+- Nothing is removed from the vApp except the VM: its disks are part of the VM,
+  the data-disk VMDKs included.
 
 ## Terraform integration contract
 
 - The Terraform module installs this chart behind a `node_controller.enabled`
-  toggle and pins `chart_version` / `image_tag` (currently `0.2.0`).
+  toggle and pins `chart_version` / `image_tag` (currently `0.3.0`).
 - **Once the controller is enabled, do not use Terraform to manage worker count
   or worker LB pool membership.** Use the CRD instead. The Terraform module's
   README must state this explicitly.
@@ -330,14 +389,13 @@ architecture, algorithms and open questions.
 
 ## Roadmap
 
-1. Implement `govcd` `DeleteVM` and finish scale-down: cordon, drain, LB
-   removal, delete, ledger free, node delete.
-2. Failed-provisioning watchdog (VM up but Node absent for N minutes).
-3. Token renewal / re-issued join for slow installs; delete the token and its
+1. Failed-provisioning watchdog (VM up but Node absent for N minutes).
+2. Token renewal / re-issued join for slow installs; delete the token and its
    JWS entry once the node is Ready (a failed create already revokes its token).
-4. LB pool membership after `Node Ready`; remove on scale-in.
-5. Finalizers, e2e on a dev tenant (2 -> 4 -> 2 via the CRD).
-6. Wire the Terraform `node_controller` variable.
+3. NSX-T ALB pool membership (the scale-in path already drains and deletes; it
+   only cannot edit the pool).
+4. Finalizers, e2e on a dev tenant (2 -> 4 -> 2 via the CRD, and a named
+   deletion in the middle of the pool).
 
 ## Container image
 
@@ -348,7 +406,7 @@ Build locally (the Dockerfile uses `golang:1.27.1-alpine` and
 `gcr.io/distroless/static:nonroot`):
 
 ```
-docker build -t docker.io/werton13/vcd-k8s-node-controller:0.2.0 .
+docker build -t docker.io/werton13/vcd-k8s-node-controller:0.3.0 .
 ```
 
 Public module defaults are used inside the build. On a restricted network,
@@ -358,14 +416,14 @@ override them:
 docker build \
   --build-arg GOPROXY=https://nexus.example.com/repository/golang/ \
   --build-arg GOSUMDB=off \
-  -t docker.io/werton13/vcd-k8s-node-controller:0.2.0 .
+  -t docker.io/werton13/vcd-k8s-node-controller:0.3.0 .
 ```
 
 Push (or use `make image-push`):
 
 ```
 docker login docker.io
-docker push docker.io/werton13/vcd-k8s-node-controller:0.2.0
+docker push docker.io/werton13/vcd-k8s-node-controller:0.3.0
 docker push docker.io/werton13/vcd-k8s-node-controller:latest
 ```
 

@@ -225,6 +225,12 @@ func (p *Provider) CreateVM(ctx context.Context, spec cloud.CreateVMSpec) (cloud
 		return cloud.VM{}, err
 	}
 
+	// Before the data disks: the system disk is the only disk in the spec at
+	// this point, so the resize PUT carries no half-attached disks.
+	if err := setSystemDiskSize(vm, spec.OSDiskGB); err != nil {
+		return cloud.VM{}, err
+	}
+
 	if spec.EnableUUID {
 		if _, err := vm.UpdateExtraConfig([]*types.ExtraConfigMarshal{
 			{Key: "disk.EnableUUID", Value: "TRUE"},
@@ -263,19 +269,203 @@ func (p *Provider) CreateVM(ctx context.Context, spec cloud.CreateVMSpec) (cloud
 	return *info, nil
 }
 
-// DeleteVM TODO: undeploy/power-off then vapp.RemoveVM(force=true, recursive=true).
-func (p *Provider) DeleteVM(ctx context.Context, id string) error {
-	return cloud.ErrNotImplemented
+// DeleteVM removes a worker VM and the disks that belong to it. It is
+// idempotent: a VM that is already absent returns nil, which lets a retried
+// scale-in finish after a partial deletion.
+func (p *Provider) DeleteVM(ctx context.Context, vappName, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	vdc, err := p.vdc()
+	if err != nil {
+		return err
+	}
+	vapp, err := vdc.GetVAppByName(vappName, true)
+	if err != nil {
+		if govcd.ContainsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("get vApp %q: %w", vappName, err)
+	}
+	vm, err := vapp.GetVMById(id, true)
+	if err != nil {
+		if govcd.ContainsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("get VM %q: %w", id, err)
+	}
+
+	// RemoveVM only accepts a powered-off VM. A hard power-off is deliberate:
+	// the guest has already been drained, and a wedged guest must not be able
+	// to block its own removal.
+	if vm.VM.Status == 4 { // POWERED_ON
+		task, err := vm.PowerOff()
+		if err != nil {
+			return fmt.Errorf("power off VM %q: %w", vm.VM.Name, err)
+		}
+		if err := task.WaitTaskCompletion(); err != nil {
+			return fmt.Errorf("wait for VM %q power-off: %w", vm.VM.Name, err)
+		}
+		if err := vm.Refresh(); err != nil {
+			return fmt.Errorf("refresh VM %q after power-off: %w", vm.VM.Name, err)
+		}
+	}
+
+	if err := vapp.RemoveVM(*vm); err != nil {
+		if govcd.ContainsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("remove VM %q from vApp %q: %w", vm.VM.Name, vappName, err)
+	}
+	return nil
 }
 
-// AddPoolMember TODO: NSX-V edge.UpdateLBServerPool / NSX-T NsxtAlbPool.Update.
+// AddPoolMember adds ip to an NSX-V edge load-balancer pool. It is
+// idempotent: an address that is already a member is left untouched.
 func (p *Provider) AddPoolMember(ctx context.Context, pool cloud.PoolRef, ip string) error {
-	return cloud.ErrNotImplemented
+	return p.updatePoolMember(ctx, pool, ip, true)
 }
 
-// RemovePoolMember TODO: see AddPoolMember.
+// RemovePoolMember removes ip from an NSX-V edge load-balancer pool.
 func (p *Provider) RemovePoolMember(ctx context.Context, pool cloud.PoolRef, ip string) error {
-	return cloud.ErrNotImplemented
+	return p.updatePoolMember(ctx, pool, ip, false)
+}
+
+// updatePoolMember edits one member of an NSX-V server pool. The whole pool is
+// PUT back (that is the NSX-V API shape), so the update starts from the pool as
+// the edge currently reports it: members added by Terraform or by hand survive.
+func (p *Provider) updatePoolMember(ctx context.Context, pool cloud.PoolRef, ip string, add bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if strings.TrimSpace(pool.Name) == "" {
+		return fmt.Errorf("%w: pool name is empty", cloud.ErrPoolNotConfigured)
+	}
+	switch pool.Type {
+	case "", "nsxv":
+	case "nsxt":
+		// NSX-T ALB pools are a different API surface (NsxtAlbPool), tracked
+		// separately; failing here keeps the caller honest instead of silently
+		// leaving a drained node in a live pool.
+		return fmt.Errorf("%w: NSX-T ingress pools are not implemented", cloud.ErrPoolNotConfigured)
+	default:
+		return fmt.Errorf("%w: unknown pool type %q", cloud.ErrPoolNotConfigured, pool.Type)
+	}
+	if strings.TrimSpace(pool.Edge) == "" {
+		return fmt.Errorf("%w: ingressPool.edge is empty", cloud.ErrPoolNotConfigured)
+	}
+
+	edge, err := p.edgeGateway(pool.Edge)
+	if err != nil {
+		return err
+	}
+	lbPool, err := edge.GetLbServerPoolByName(pool.Name)
+	if err != nil {
+		if govcd.ContainsNotFound(err) {
+			return fmt.Errorf("%w: pool %q not found on edge %q", cloud.ErrPoolNotConfigured, pool.Name, pool.Edge)
+		}
+		return fmt.Errorf("get LB pool %q: %w", pool.Name, err)
+	}
+
+	port := pool.Port
+	members := make([]types.LbPoolMember, 0, len(lbPool.Members)+1)
+	found := false
+	for _, m := range lbPool.Members {
+		if m.IpAddress == ip {
+			found = true
+			continue
+		}
+		members = append(members, m)
+	}
+	if add {
+		if found {
+			return nil
+		}
+		if port <= 0 {
+			return fmt.Errorf("%w: pool %q has port %d; set ingressPool.port to the node port", cloud.ErrPoolNotConfigured, pool.Name, port)
+		}
+		members = append(members, types.LbPoolMember{
+			Name:        ip,
+			IpAddress:   ip,
+			Port:        int(port),
+			MonitorPort: int(port),
+			Condition:   "enabled",
+			Weight:      1,
+			MaxConn:     100,
+		})
+	} else if !found {
+		return nil
+	}
+
+	lbPool.Members = members
+	if _, err := edge.UpdateLbServerPool(lbPool); err != nil {
+		return fmt.Errorf("update LB pool %q: %w", pool.Name, err)
+	}
+	return nil
+}
+
+// edgeGateway resolves the NSX-V edge that owns a load-balancer pool.
+func (p *Provider) edgeGateway(name string) (*govcd.EdgeGateway, error) {
+	vdc, err := p.vdc()
+	if err != nil {
+		return nil, err
+	}
+	edge, err := vdc.GetEdgeGatewayByName(name, true)
+	if err != nil {
+		if govcd.ContainsNotFound(err) {
+			return nil, fmt.Errorf("%w: edge gateway %q not found", cloud.ErrPoolNotConfigured, name)
+		}
+		return nil, fmt.Errorf("get edge gateway %q: %w", name, err)
+	}
+	return edge, nil
+}
+
+// setSystemDiskSize grows the system disk (bus 0/unit 0) of a freshly cloned
+// VM to sizeGB before the first power-on. Terraform's override_template_disk
+// does the same thing for the static nodes; a clone without it keeps the
+// catalog template size.
+func setSystemDiskSize(vm *govcd.VM, sizeGB int32) error {
+	if sizeGB <= 0 {
+		return nil
+	}
+	if vm.VM.VmSpecSection == nil {
+		if err := vm.Refresh(); err != nil {
+			return fmt.Errorf("refresh VM %q: %w", vm.VM.Name, err)
+		}
+	}
+	spec := vm.VM.VmSpecSection
+	if spec == nil || spec.DiskSection == nil {
+		return fmt.Errorf("VM %q has no disk section", vm.VM.Name)
+	}
+
+	wantMB := int64(sizeGB) * 1024
+	var system *types.DiskSettings
+	for _, disk := range spec.DiskSection.DiskSettings {
+		if disk != nil && disk.BusNumber == 0 && disk.UnitNumber == 0 {
+			system = disk
+			break
+		}
+	}
+	if system == nil {
+		return fmt.Errorf("VM %q has no system disk at bus 0/unit 0", vm.VM.Name)
+	}
+	switch {
+	case system.SizeMb == wantMB:
+		return nil
+	case system.SizeMb > wantMB:
+		// vCD cannot shrink a disk, and a template larger than the requested
+		// size is a configuration mismatch, not something to paper over.
+		return fmt.Errorf("VM %q system disk is %d MB, cannot shrink to %d MB", vm.VM.Name, system.SizeMb, wantMB)
+	}
+
+	system.SizeMb = wantMB
+	if _, err := vm.UpdateVmSpecSection(spec, "resize worker system disk"); err != nil {
+		return fmt.Errorf("resize system disk of VM %q to %d GB: %w", vm.VM.Name, sizeGB, err)
+	}
+	if err := vm.Refresh(); err != nil {
+		return fmt.Errorf("refresh VM %q after disk resize: %w", vm.VM.Name, err)
+	}
+	return nil
 }
 
 // vdc resolves the configured org and VDC. The controller is scoped to one
