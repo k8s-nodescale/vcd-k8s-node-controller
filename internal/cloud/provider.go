@@ -81,6 +81,9 @@ type Provider interface {
 	ListWorkerVMs(ctx context.Context, vapp string, selector map[string]string) ([]VM, error)
 	CreateVM(ctx context.Context, spec CreateVMSpec) (VM, error)
 	DeleteVM(ctx context.Context, vappName, id string) error
+	// PowerOffVM hard-powers-off a VM, keeping it in the vApp. It is
+	// idempotent and treats a missing VM as done.
+	PowerOffVM(ctx context.Context, vappName, id string) error
 	AddPoolMember(ctx context.Context, pool PoolRef, ip string) error
 	RemovePoolMember(ctx context.Context, pool PoolRef, ip string) error
 }

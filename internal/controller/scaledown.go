@@ -144,10 +144,21 @@ func (r *WorkerPoolReconciler) runDeletions(ctx context.Context, pool *infrav1.K
 }
 
 // deleteWorkerStep runs one step of cordon -> ingress removal -> drain ->
-// detach wait -> node delete -> VM delete -> IP release.
+// detach wait -> power off -> node delete -> VM delete -> IP release.
 func (r *WorkerPoolReconciler) deleteWorkerStep(ctx context.Context, pool *infrav1.K8sWorkerPool, alloc *ipam.Allocator, idx int, req deletionRequest) (bool, ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 	node := &pool.Status.Nodes[idx]
+
+	// Every Kubernetes call below uses kubeName, never node.Name: name is the
+	// vCD VM name (KION-WEB-DEV-wrk-03), while kubelet registers the Node
+	// object in lower case. With the VM name the API answers 404, Cordon and
+	// DeleteNode swallow it and Drain selects no pods, so the worker was
+	// deleted with its guest still running: no cordon, no drain, no PDB, and
+	// a NotReady Node object left behind forever.
+	kubeName, err := r.kubeNodeName(ctx, node)
+	if err != nil {
+		return false, ctrl.Result{}, err
+	}
 
 	if node.Phase == infrav1.NodePhaseFailed {
 		// The request is still standing, so the operator wants this worker gone:
@@ -175,8 +186,8 @@ func (r *WorkerPoolReconciler) deleteWorkerStep(ctx context.Context, pool *infra
 	budget := budgetFor(pool)
 
 	if node.DeleteStartedAt == nil {
-		if !pool.Spec.ScaleDown.Force && !req.force {
-			local, err := r.Kube.NodeLocalVolumes(ctx, node.Name)
+		if !pool.Spec.ScaleDown.Force && !req.force && kubeName != "" {
+			local, err := r.Kube.NodeLocalVolumes(ctx, kubeName)
 			if err != nil {
 				return false, ctrl.Result{}, err
 			}
@@ -195,9 +206,11 @@ func (r *WorkerPoolReconciler) deleteWorkerStep(ctx context.Context, pool *infra
 		node.Phase = infrav1.NodePhaseDraining
 		node.Message = "cordoned; removing from the ingress pool"
 
-		if err := r.Kube.Cordon(ctx, node.Name); err != nil && !apierrors.IsNotFound(err) {
-			node.Message = "cordon failed: " + err.Error()
-			return false, ctrl.Result{}, err
+		if kubeName != "" {
+			if err := r.Kube.Cordon(ctx, kubeName); err != nil && !apierrors.IsNotFound(err) {
+				node.Message = "cordon failed: " + err.Error()
+				return false, ctrl.Result{}, err
+			}
 		}
 		if err := r.removeFromIngressPool(ctx, pool, node.IP); err != nil {
 			// Not fatal: the pool's health monitor takes the address out once
@@ -223,7 +236,14 @@ func (r *WorkerPoolReconciler) deleteWorkerStep(ctx context.Context, pool *infra
 			r.eventf(pool, corev1.EventTypeWarning, "ScaleDownFailed", msg)
 			return true, ctrl.Result{RequeueAfter: requeueProgressing}, nil
 		}
-		err := r.Kube.Drain(ctx, node.Name, time.Until(deadline))
+		if kubeName == "" {
+			// No Node object: the worker never joined, or its registration is
+			// gone already. Nothing to drain, go straight to the deletion.
+			node.Phase = infrav1.NodePhaseDeleting
+			node.Message = "no Node object to drain; waiting for volumes to detach"
+			return false, ctrl.Result{RequeueAfter: deleteStepRequeue}, nil
+		}
+		err := r.Kube.Drain(ctx, kubeName, time.Until(deadline))
 		switch {
 		case err == nil, apierrors.IsNotFound(err):
 			node.Phase = infrav1.NodePhaseDeleting
@@ -238,16 +258,28 @@ func (r *WorkerPoolReconciler) deleteWorkerStep(ctx context.Context, pool *infra
 		}
 
 	case infrav1.NodePhaseDeleting:
-		if err := r.Kube.WaitVolumesDetached(ctx, node.Name, volumeWaitTimeout); err != nil {
-			if errors.Is(err, kube.ErrVolumesAttached) {
-				node.Message = err.Error()
-				return false, ctrl.Result{RequeueAfter: drainRetryRequeue}, nil
+		if kubeName != "" {
+			if err := r.Kube.WaitVolumesDetached(ctx, kubeName, volumeWaitTimeout); err != nil {
+				if errors.Is(err, kube.ErrVolumesAttached) {
+					node.Message = err.Error()
+					return false, ctrl.Result{RequeueAfter: drainRetryRequeue}, nil
+				}
+				return false, ctrl.Result{}, err
 			}
+		}
+		// Stop the guest before the Node object is deleted. A Node deleted
+		// while kubelet still runs is re-registered within seconds, so the
+		// worker comes back as a NotReady corpse that nothing owns and whose
+		// pods are never garbage collected.
+		if err := r.Cloud.PowerOffVM(ctx, pool.Spec.VCD.VApp, node.VMID); err != nil {
+			node.Message = "VM power-off failed: " + err.Error()
 			return false, ctrl.Result{}, err
 		}
-		if err := r.Kube.DeleteNode(ctx, node.Name); err != nil && !apierrors.IsNotFound(err) {
-			node.Message = "node deletion failed: " + err.Error()
-			return false, ctrl.Result{}, err
+		if kubeName != "" {
+			if err := r.Kube.DeleteNode(ctx, kubeName); err != nil && !apierrors.IsNotFound(err) {
+				node.Message = "node deletion failed: " + err.Error()
+				return false, ctrl.Result{}, err
+			}
 		}
 		if err := r.Cloud.DeleteVM(ctx, pool.Spec.VCD.VApp, node.VMID); err != nil {
 			node.Message = "VM deletion failed: " + err.Error()
@@ -365,6 +397,28 @@ func (r *WorkerPoolReconciler) eventf(pool *infrav1.K8sWorkerPool, eventType, re
 		return
 	}
 	r.Recorder.Event(pool, eventType, reason, message)
+}
+
+// kubeNodeName returns the Kubernetes Node object name of a worker, resolving
+// it against the live Node list when status does not carry it yet (status
+// written by an older build, or a worker adopted in this pass). An empty
+// result means the worker has no Node object, which the removal path treats as
+// "nothing to drain": the VM is stopped and removed only.
+func (r *WorkerPoolReconciler) kubeNodeName(ctx context.Context, node *infrav1.WorkerNodeStatus) (string, error) {
+	if node.NodeName != "" {
+		return node.NodeName, nil
+	}
+	nodes, err := r.Kube.ListNodes(ctx)
+	if err != nil {
+		return "", err
+	}
+	for _, n := range nodes {
+		if strings.EqualFold(n.Name, node.Name) {
+			node.NodeName = n.Name
+			return n.Name, nil
+		}
+	}
+	return "", nil
 }
 
 func nodeIndex(nodes []infrav1.WorkerNodeStatus, name string) int {

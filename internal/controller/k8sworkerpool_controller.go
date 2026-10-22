@@ -222,6 +222,11 @@ func (r *WorkerPoolReconciler) refreshReadiness(ctx context.Context, pool *infra
 			continue
 		}
 		info, ok := byName[strings.ToLower(st.Name)]
+		if ok {
+			// Remember the real Node object name: status.name is the vCD name,
+			// kubelet registers the Node in lower case.
+			st.NodeName = info.Name
+		}
 		switch {
 		case !ok:
 			st.Phase = infrav1.NodePhaseProvisioning

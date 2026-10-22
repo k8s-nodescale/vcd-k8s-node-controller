@@ -185,7 +185,15 @@ type IPLedger struct {
 
 // WorkerNodeStatus describes a single managed worker.
 type WorkerNodeStatus struct {
-	Name           string    `json:"name"`
+	// Name is the vCD VM name, e.g. KION-WEB-DEV-wrk-03: it keeps the case of
+	// spec.namePrefix because that is how vCD stores it.
+	Name string `json:"name"`
+	// NodeName is the name of the Kubernetes Node object as kubelet registered
+	// it, always lower case. Every Kubernetes call (cordon, drain, volume
+	// detach wait, Node delete) must use this name: passing Name asks for an
+	// object that does not exist and the call silently does nothing.
+	// +optional
+	NodeName       string    `json:"nodeName,omitempty"`
 	IP             string    `json:"ip,omitempty"`
 	VMID           string    `json:"vmID,omitempty"`
 	Phase          NodePhase `json:"phase,omitempty"`

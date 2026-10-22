@@ -119,7 +119,7 @@ One `K8sWorkerPool` describes the worker set of a single cluster. You own
 | --- | --- |
 | `observedReplicas` | Workers the controller knows about (VM exists). |
 | `ledger.nextIndex` / `used[]` / `free[]` | Address book. `used` holds every allocated worker IP; addresses of deleted VMs are never released automatically. |
-| `nodes[]` | Per worker: `name`, `ip`, `vmID`, `phase`, `cpu`, `memoryMB`, `diskGB`, `k8sReady`, `kubeletVersion`, `message`, `deleteStartedAt`. `message` is where a blocked removal explains itself (the PDB, the attached volume, the local PV). |
+| `nodes[]` | Per worker: `name` (the vCD VM name), `nodeName` (the Kubernetes Node object name, lower case - the only name the controller passes to the Kubernetes API), `ip`, `vmID`, `phase`, `cpu`, `memoryMB`, `diskGB`, `k8sReady`, `kubeletVersion`, `message`, `deleteStartedAt`. `message` is where a blocked removal explains itself (the PDB, the attached volume, the local PV). |
 | `conditions[]` | `Ready`, with reason `Converged` (`3/3 workers Ready`), `Progressing` while a worker is not Ready yet, `ScaleUpFailed` or `InvalidSpec` on errors. |
 
 Phases: `Provisioning` (VM created, Node not registered yet) -> `Joining` (Node
@@ -257,8 +257,20 @@ The chart installs the CRD, the controller and the RBAC it needs, including
 
 ## How to use
 
-**Only scale-out is available today.** The controller creates workers; it does
-not remove them yet (`scaleDown` is a no-op, see the roadmap).
+`spec.replicas` is the intent; the controller converges reality to it and every step
+shows up in `status.nodes[].phase`. Both directions are supported:
+
+| Goal | Request | Effect |
+| --- | --- | --- |
+| more workers | raise `spec.replicas` | creates the missing workers |
+| fewer workers | lower `spec.replicas` | removes the highest-ordinal worker, never below `scaleDown.minReplicas` |
+| one specific worker gone | `spec.scaleDown.deleteWorkers: ["<worker>"]` | removes that worker and decrements `replicas`; no replacement |
+| one specific worker replaced | `kubectl annotate node <worker> infra.example.com/delete-worker=true` | removes it and creates a replacement (`replicas` untouched) |
+
+The scale-out path is described next, the removal path under **Scale in /
+removing a worker**. What the pool counts as its own is in **Ownership**, and
+what happens when a worker disappears without a request is in **Drift, missing
+workers and the reconciliation policy**.
 
 ### Scale out
 
@@ -285,6 +297,12 @@ The next reconcile then does the whole job in one pass:
    `/var/lib` onto the data disks;
 5. as soon as the Node object exists the phase moves `Provisioning` ->
    `Joining` -> `Ready`, and `join.labels` / `join.taints` are applied.
+
+A new worker gets `flavor.osDiskGB` on its system disk (bus 0/unit 0), applied
+to the clone before the first power-on. The knob does not resize anything: a
+worker that already exists keeps the disk it was created with. A template whose
+system disk is already larger than `osDiskGB` is an error rather than a silent
+shrink.
 
 Budget about five minutes per worker: ~2 min vCD clone and power-on, ~1 min
 first boot with the disk move, ~1 min guest bootstrap and join, the rest waiting
@@ -356,9 +374,29 @@ A removal is one step per reconcile pass, visible in `status.nodes[].phase`:
 4. **Volume gate.** Wait until no `VolumeAttachment` references the node.
    Destroying a VM with an attached volume strands the volume in the storage
    backend and can leave the PV bound forever.
-5. **Delete.** Node object first, then the VM (power off, remove, disks
-   included), then release the address in `status.ledger` and drop the worker
-   from `status.nodes`.
+5. **Power off the guest.** A hard power-off, not a guest shutdown: the pods
+   are already gone and a wedged guest must not be able to block its own
+   removal. This is what makes the next step stick.
+6. **Delete the Node object.** Only now: a Node deleted while kubelet still
+   runs is re-registered within seconds and stays behind as a `NotReady` corpse
+   that nothing owns and whose pods are never garbage collected.
+7. **Remove the VM and free the address.** The VM leaves the vApp (data disks
+   included), the address goes back to `status.ledger.free` and the worker
+   leaves `status.nodes`. Pods of the deleted Node are reaped by the pod
+   garbage collector.
+
+#### What "deleting a Kubernetes node" means here
+
+`DELETE /api/v1/nodes/<name>` removes one registry record. It does not stop
+kubelet and it does not touch the VM, which is why the order above matters
+twice: powering the guest off first stops kubelet from re-registering the Node,
+and deleting the Node object is what lets the pod garbage collector reap the
+DaemonSet and mirror pods a drained worker leaves behind - while the Node object
+exists, they stay in the API forever, `Running` on a node that is not there.
+
+The controller deletes a Node object only for a worker it is removing itself (or,
+under `AutoHeal`, for the worker it is repairing). Masters, the DVM and VMs
+outside `<namePrefix>-wrk-` are never touched: they are not part of the pool.
 
 Notes:
 
@@ -366,11 +404,157 @@ Notes:
   by hand; a `Delete` PV is reclaimed only when its PVC is deleted.
 - Pods using `emptyDir` are evicted and their data goes with them - that is the
   point of deleting a node.
-- A `Failed` removal is not retried automatically: fix the blocker (raise the
-  budget, relax the PDB) and remove the annotation, or re-request the worker,
-  then delete the entry from `status` by recreating the pool request.
+- A `Failed` removal keeps retrying while the request stands: one pass reports
+  `Failed` with the reason (the PDB, the attached volume), the next one starts a
+  fresh `drainTimeout` budget and goes back to `Draining`. A count-based
+  scale-down refuses to start while any worker is `Failed`, so one stuck removal
+  never cascades into a second one. Prune the request (`deleteWorkers` entry or
+  the node annotation) to stop it.
 - Nothing is removed from the vApp except the VM: its disks are part of the VM,
   the data-disk VMDKs included.
+- The removal is resumable. Every step is persisted in `status` before it is
+  attempted, so a controller restart - or the controller's own pod being evicted
+  by the drain it started - resumes where the previous pass stopped instead of
+  starting over.
+
+> **0.3.1 and earlier did not do this.** The removal path passed the vCD VM name
+> (`KION-WEB-DEV-wrk-03`) to the Kubernetes API instead of the Node object name
+> (`kion-web-dev-wrk-03`). `Cordon` and `DeleteNode` swallowed the 404 and `Drain`
+> selected no pods, so a worker was removed with its guest still running: no
+> cordon, no drain, no PodDisruptionBudget, no Node deletion, and a `NotReady`
+> Node object left in the cluster forever. From 0.3.2 the Node name is kept in
+> `status.nodes[].nodeName` and every Kubernetes call uses it, and the guest is
+> powered off before the Node object is deleted.
+
+## Ownership
+
+The pool owns every VM in `spec.vcd.vApp` whose name starts with
+`<spec.namePrefix>-wrk-`, together with the Node object of each of those
+workers. That is a name-prefix rule, not a metadata rule: a VM created by
+Terraform during the initial bootstrap carries no controller metadata and is
+adopted on the first pass exactly like one the controller created itself.
+Adoption puts the worker into `status.nodes`, reserves its address in
+`status.ledger` and makes it a candidate for every deletion path.
+
+Consequences worth knowing:
+
+- Everything in `status.nodes` is deletable by the pool. There is no read-only
+  class of worker, and `DeleteVM` has no ownership check.
+- A VM created outside the pool that happens to match the prefix (a manual
+  clone, a `terraform apply` that re-creates a removed worker) is adopted on the
+  next pass and counted towards `spec.replicas`.
+- Until 0.4.0 adoption is silent and a worker adopted in the current pass is a
+  scale-down candidate in that pass. From 0.4.0 adoption raises a
+  `WorkerAdopted` event and a worker adopted in the current pass is skipped by the
+  scale-down of that pass, so an outside `apply` cannot turn into "the controller
+  deleted a different worker". Until then, do not create `<prefix>-wrk-*` VMs by
+  hand.
+- Because ownership is by prefix, the Terraform workers are the pool's workers
+  too; see the Terraform integration contract below for how to remove one.
+
+## Drift, missing workers and the reconciliation policy
+
+Status quo in 0.3.x: a worker that disappears without a request is replaced
+immediately and silently. `status.observedReplicas` simply drops, the pool sees
+`spec.replicas > observed` and provisions a new worker - under a new address and
+therefore a new name, because the vanished worker's address stays reserved in
+`status.ledger.used`. A `deleteWorkers` entry that names an already-absent
+worker is pruned without touching `replicas`, which then triggers that
+replacement. Nothing reports the hole: the pool just converges to a smaller,
+differently named cluster.
+
+Planned for 0.4.0: `spec.reconciliation.policy`.
+
+| Value | Meaning |
+| --- | --- |
+| `Notify` (default) | never create a VM for a worker that disappeared outside the loop; report it |
+| `AutoHeal` | recreate the disappeared worker in its own slot: same name, same address |
+
+`Notify` is the default because creating a VM is the expensive, state-creating
+decision - healing has to be opted into. Both values act only on slots the pool
+owns (see **Ownership**); neither touches masters, the DVM or VMs outside the
+prefix, and a worker with a pending removal is never healed.
+
+The unit of reconciliation is the **slot**: one address in `status.ledger.used`
+plus the worker name derived from its ordinal. A slot whose VM is gone keeps its
+address reserved and is reported in `status.nodes` with phase `Missing`, so
+`status` shows a hole (`Ready=False`, reason `WorkerMissing`, message naming the
+worker and its IP) instead of quietly shrinking to the new reality.
+
+| Situation | `Notify` | `AutoHeal` |
+| --- | --- | --- |
+| VM gone, Node object gone or stale | report, keep the slot reserved, create nothing | recreate the worker in its slot, then delete the stale Node object |
+| Node object gone, VM alive | report; the message carries the manual command | reboot the guest once and let kubelet re-register |
+| `deleteWorkers` names a worker that is already gone | prune the entry and set `spec.replicas` to the observed count, so the CR is lined up with reality and nothing is created | same: an explicit removal always wins over healing |
+| `spec.replicas` lowered while a slot is already missing | write the missing slot off, no running worker is deleted | same |
+
+The reserved address is not lost either way: the next scale-out consumes missing
+slots first, so a worker that comes back keeps the name and address it had.
+`AutoHeal` is bounded - exponential back-off between attempts and a retry limit,
+after which the slot is parked as `Failed` with the reason and nothing else is
+retried - so a broken template cannot spin.
+
+### Controller placement, the last worker, and scale from zero
+
+The controller has to outlive the pool for two operations: removing the last
+worker and going from zero workers back to N. Both need a pod that does not run
+on a pool worker, because a pass that deletes its own last host cannot finish:
+the process dies with the VM, and nothing is left to write `status` or to create
+the next worker.
+
+**Recommended: run the controller on the control plane.** It asks for 100m CPU
+and 512Mi; the masters in this platform have 2 vCPU and ~3.8GiB allocatable, so
+the footprint is negligible next to etcd, apiserver and CoreDNS. Masters are
+never pool members - the pool only owns `<namePrefix>-wrk-*` - so they are not
+deletable through the CRD and the controller cannot delete its own host.
+
+```yaml
+# values-control-plane.yaml
+nodeSelector:
+  node-role.kubernetes.io/control-plane: ""
+tolerations:
+  - key: node-role.kubernetes.io/control-plane
+    effect: NoSchedule
+replicaCount: 2
+affinity:
+  podAntiAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchLabels:
+            app.kubernetes.io/name: vcd-nodescale
+        topologyKey: kubernetes.io/hostname
+```
+
+```
+helm upgrade vcd-nodescale vcd-nodescale -n vcd-nodescale-system \
+  --repo https://werton13.github.io/vcd-k8s-node-controller \
+  -f values-control-plane.yaml
+```
+
+- Two replicas with `leaderElection: true` (the chart default) make a master
+  rebuild or a restart a non-event; the required anti-affinity keeps them on
+  different masters, and an unsatisfiable anti-affinity (single master) leaves
+  one replica `Pending`, which is the right failure mode.
+- With the controller off the pool, `scaleDown.minReplicas: 0` is supported and
+  `spec.replicas` may go to 0 and back up. The pool at 0 reports `0/0 workers
+  Ready` and `Converged`.
+- With the controller on a pool worker the last worker cannot be removed safely:
+  the request is refused with `LastWorkerProtected` instead of leaving a
+  half-finished removal behind.
+- While the pool is at zero the cluster has no workers, so ingress, workload
+  pods and the CSI node plugins are gone by definition. The control plane,
+  CoreDNS, the controller and the vCD API remain, which is exactly what is
+  needed to bring workers back.
+- Check that CoreDNS can run on a master before emptying the pool: the
+  controller resolves the vCD API through cluster DNS. kubeadm's CoreDNS
+  tolerates the control-plane taint and normally lands there; if it does not,
+  set `dnsPolicy: Default` on the controller (chart value from 0.4.0).
+
+Caveats of the control-plane placement: the pod holds vCD credentials with
+VM-delete rights, and now runs next to etcd - keep the vCD account scoped to the
+cluster's VDC and vApp, and do not run the controller with an admin account. A
+master that is destroyed takes the pod with it, though the CR `status` is the
+source of truth and the remaining replica resumes immediately.
 
 ## Terraform integration contract
 
@@ -381,6 +565,16 @@ Notes:
   README must state this explicitly.
 - Initial cluster bootstrap remains Terraform + Ansible/DVM; the controller only
   handles post-bootstrap scaling.
+- The workers Terraform creates are adopted by the pool like any other
+  (`<namePrefix>-wrk-*`), which makes them deletable by the CRD. Do not remove a
+  bootstrap worker with `spec.scaleDown.deleteWorkers`: Terraform still owns
+  that VM in state and will re-create it at the same address, while the pool has
+  freed the address and may hand it to a different worker. Remove bootstrap
+  workers through Terraform (`workers.vm_count`) and lower `spec.replicas` in the
+  same change so the pool does not scale back up.
+- `spec.reconciliation.policy` defaults to `Notify` from 0.4.0: a worker that
+  disappears without a request is reported, not replaced. `AutoHeal` is an
+  explicit opt-in.
 
 ## Design
 
@@ -396,6 +590,14 @@ architecture, algorithms and open questions.
    only cannot edit the pool).
 4. Finalizers, e2e on a dev tenant (2 -> 4 -> 2 via the CRD, and a named
    deletion in the middle of the pool).
+5. `spec.reconciliation.policy: Notify|AutoHeal` (default `Notify`), the `Missing`
+   phase, reserved slots, bounded `AutoHeal` retries and the `WorkerAdopted`
+   event.
+6. Control-plane placement as a first-class option: `nodeSelector`, `tolerations`,
+   `replicaCount`, `priorityClassName` and `dnsPolicy` in the chart and in the
+   Terraform module, so `scaleDown.minReplicas: 0` and scale-from-zero work; plus
+   `LastWorkerProtected` for the case where the controller still runs on a pool
+   worker.
 
 ## Container image
 

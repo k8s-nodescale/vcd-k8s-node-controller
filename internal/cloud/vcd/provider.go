@@ -298,17 +298,8 @@ func (p *Provider) DeleteVM(ctx context.Context, vappName, id string) error {
 	// RemoveVM only accepts a powered-off VM. A hard power-off is deliberate:
 	// the guest has already been drained, and a wedged guest must not be able
 	// to block its own removal.
-	if vm.VM.Status == 4 { // POWERED_ON
-		task, err := vm.PowerOff()
-		if err != nil {
-			return fmt.Errorf("power off VM %q: %w", vm.VM.Name, err)
-		}
-		if err := task.WaitTaskCompletion(); err != nil {
-			return fmt.Errorf("wait for VM %q power-off: %w", vm.VM.Name, err)
-		}
-		if err := vm.Refresh(); err != nil {
-			return fmt.Errorf("refresh VM %q after power-off: %w", vm.VM.Name, err)
-		}
+	if err := powerOff(vm); err != nil {
+		return err
 	}
 
 	if err := vapp.RemoveVM(*vm); err != nil {
@@ -316,6 +307,54 @@ func (p *Provider) DeleteVM(ctx context.Context, vappName, id string) error {
 			return nil
 		}
 		return fmt.Errorf("remove VM %q from vApp %q: %w", vm.VM.Name, vappName, err)
+	}
+	return nil
+}
+
+// PowerOffVM hard-powers-off a VM without removing it. The removal path uses
+// it to stop kubelet before the Node object is deleted: a guest that is still
+// running re-registers its Node within seconds and leaves a NotReady corpse.
+// It is idempotent, and a VM that is already gone counts as done.
+func (p *Provider) PowerOffVM(ctx context.Context, vappName, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	vdc, err := p.vdc()
+	if err != nil {
+		return err
+	}
+	vapp, err := vdc.GetVAppByName(vappName, true)
+	if err != nil {
+		if govcd.ContainsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("get vApp %q: %w", vappName, err)
+	}
+	vm, err := vapp.GetVMById(id, true)
+	if err != nil {
+		if govcd.ContainsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("get VM %q: %w", id, err)
+	}
+	return powerOff(vm)
+}
+
+// powerOff powers the VM off when it is on and refreshes it afterwards, so the
+// caller can act on the new status.
+func powerOff(vm *govcd.VM) error {
+	if vm.VM.Status != 4 { // POWERED_ON
+		return nil
+	}
+	task, err := vm.PowerOff()
+	if err != nil {
+		return fmt.Errorf("power off VM %q: %w", vm.VM.Name, err)
+	}
+	if err := task.WaitTaskCompletion(); err != nil {
+		return fmt.Errorf("wait for VM %q power-off: %w", vm.VM.Name, err)
+	}
+	if err := vm.Refresh(); err != nil {
+		return fmt.Errorf("refresh VM %q after power-off: %w", vm.VM.Name, err)
 	}
 	return nil
 }

@@ -25,6 +25,8 @@ type fakeCloud struct {
 	vms             []cloud.VM
 	created         []cloud.CreateVMSpec
 	deleted         []string
+	poweredOff      []string
+	events          *[]string
 	poolRemovals    []string
 	calls           int
 	failAt          int
@@ -58,8 +60,19 @@ func (f *fakeCloud) CreateVM(ctx context.Context, spec cloud.CreateVMSpec) (clou
 	return vm, nil
 }
 
+func (f *fakeCloud) PowerOffVM(ctx context.Context, vappName, id string) error {
+	f.poweredOff = append(f.poweredOff, id)
+	if f.events != nil {
+		*f.events = append(*f.events, "cloud:poweroff "+id)
+	}
+	return nil
+}
+
 func (f *fakeCloud) DeleteVM(ctx context.Context, vappName, id string) error {
 	f.deleted = append(f.deleted, id)
+	if f.events != nil {
+		*f.events = append(*f.events, "cloud:deletevm "+id)
+	}
 	kept := f.vms[:0]
 	for _, vm := range f.vms {
 		if vm.ID != id {
@@ -79,6 +92,7 @@ func (f *fakeCloud) RemovePoolMember(ctx context.Context, pool cloud.PoolRef, ip
 
 type fakeKube struct {
 	nodes         []kube.NodeInfo
+	events        *[]string
 	taints        map[string][]corev1.Taint
 	labels        map[string]map[string]string
 	revokedTokens []string
@@ -122,6 +136,9 @@ func (f *fakeKube) NodeLocalVolumes(ctx context.Context, name string) ([]string,
 }
 func (f *fakeKube) DeleteNode(ctx context.Context, name string) error {
 	f.deletedNodes = append(f.deletedNodes, name)
+	if f.events != nil {
+		*f.events = append(*f.events, "kube:deletenode "+name)
+	}
 	return nil
 }
 func (f *fakeKube) SetTaints(ctx context.Context, name string, taints []corev1.Taint) error {

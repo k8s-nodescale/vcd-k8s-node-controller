@@ -286,3 +286,78 @@ func TestToPoolRefCarriesEdge(t *testing.T) {
 }
 
 var _ = errors.Is
+
+// A vCD VM name keeps the prefix case while kubelet registers the Node object
+// in lower case. The removal path must resolve the Node name: before the fix it
+// passed the VM name to the Kubernetes API, every call answered 404 or matched
+// nothing, and the worker was removed with its guest still running.
+func TestReconcileDeletionUsesNodeNameAndStopsGuestFirst(t *testing.T) {
+	pool := testPool(2)
+	pool.Spec.NamePrefix = "POOL"
+	vms := []cloud.VM{
+		{ID: "vm-POOL-wrk-01", Name: "POOL-wrk-01", IP: "192.168.100.7", CPU: 2, MemoryMB: 4096, DiskGB: 60},
+		{ID: "vm-POOL-wrk-02", Name: "POOL-wrk-02", IP: "192.168.100.8", CPU: 2, MemoryMB: 4096, DiskGB: 60},
+		{ID: "vm-POOL-wrk-03", Name: "POOL-wrk-03", IP: "192.168.100.9", CPU: 2, MemoryMB: 4096, DiskGB: 60},
+	}
+	var order []string
+	fc := &fakeCloud{vms: vms, events: &order}
+	fk := &fakeKube{
+		nodes:  readyNodes("pool-wrk-01", "pool-wrk-02", "pool-wrk-03"),
+		events: &order,
+	}
+	r := newTestReconciler(t, fc, fk, pool)
+
+	reconcilePasses(t, r, pool, 6)
+
+	got := getPool(t, r, pool)
+	if names := nodeNames(got); len(names) != 2 || got.Spec.Replicas != 2 {
+		t.Fatalf("workers = %v, replicas = %d; want 2 and 2", names, got.Spec.Replicas)
+	}
+	for _, want := range []struct {
+		what  string
+		calls []string
+		node  string
+	}{
+		{"cordon", fk.cordoned, "pool-wrk-03"},
+		{"drain", fk.drained, "pool-wrk-03"},
+		{"node delete", fk.deletedNodes, "pool-wrk-03"},
+	} {
+		if len(want.calls) != 1 || want.calls[0] != want.node {
+			t.Fatalf("%s called with %v, want [%s] (the Kubernetes Node name, not the vCD VM name)",
+				want.what, want.calls, want.node)
+		}
+	}
+	if len(fc.poweredOff) != 1 || fc.poweredOff[0] != "vm-POOL-wrk-03" {
+		t.Fatalf("powered off = %v, want [vm-POOL-wrk-03]", fc.poweredOff)
+	}
+
+	// The guest must be off before its Node object goes away, and the VM
+	// removal comes last: a Node deleted under a live kubelet re-registers
+	// within seconds and is left behind as a NotReady corpse.
+	var seq []string
+	for _, e := range order {
+		if strings.Contains(e, "wrk-03") {
+			seq = append(seq, e)
+		}
+	}
+	want := []string{
+		"cloud:poweroff vm-POOL-wrk-03",
+		"kube:deletenode pool-wrk-03",
+		"cloud:deletevm vm-POOL-wrk-03",
+	}
+	if len(seq) != len(want) {
+		t.Fatalf("removal sequence = %v, want %v", seq, want)
+	}
+	for i := range want {
+		if seq[i] != want[i] {
+			t.Fatalf("removal sequence = %v, want %v", seq, want)
+		}
+	}
+
+	// A converged pool must not touch the worker again.
+	reconcilePasses(t, r, pool, 2)
+	if len(fk.cordoned) != 1 || len(fk.deletedNodes) != 1 || len(fc.poweredOff) != 1 {
+		t.Fatalf("removal repeated on a converged pool: cordon=%v nodes=%v off=%v",
+			fk.cordoned, fk.deletedNodes, fc.poweredOff)
+	}
+}
