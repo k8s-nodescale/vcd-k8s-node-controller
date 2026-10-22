@@ -706,6 +706,23 @@ architecture, algorithms and open questions.
    section 10.6.
 8. Template changes and shrinks as a recreate into the same ledger slot (the
    natural 0.6 candidate).
+9. Capacity pre-flight against the virtual data center. Before a scale-out or
+   scale-up, read the current consumption of the already deployed VMs and
+   estimate whether the free capacity covers the request in every main
+   category - memory, vCPU and storage (plus whatever else the provider rates
+   against). When it does not fit, the new workers are parked in a `Queued`
+   phase with reason `NoResourceAvailable` instead of failing the create; the
+   reconcile retries when capacity appears.
+10. Provider decoupling. Move the platform-API calls behind a narrow interface
+    and a separate package (optionally a separate container / provider
+    service) so vCloud Director is just one implementation. Deliver a vSphere
+    (platform API) implementation behind the same interface - for now only the
+    stub and the interface extraction are needed.
+11. Management sidecar. Ship an optional sidecar in the controller pod that
+    serves a small web UI/API: pool state, per-node load (requests) and real
+    utilisation from the node-exporter that every installation deploys, plus
+    the actions scale-out, scale-in, scale-up and replace-node. The sidecar
+    calls the same CRD, so behaviour stays identical to `kubectl` use.
 
 ## Container image
 
