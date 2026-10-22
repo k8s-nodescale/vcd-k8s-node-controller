@@ -110,6 +110,19 @@ func rolloutInFlight(pool *infrav1.K8sWorkerPool) int {
 	return n
 }
 
+// failedResizeHealable reports whether a slot left in Failed can be closed out
+// on this pass: the VM carries the target shape, so only the closing steps
+// (uncordon, ingress pool) are missing.
+func failedResizeHealable(pool *infrav1.K8sWorkerPool, target *infrav1.FlavorStatus) bool {
+	for i := range pool.Status.Nodes {
+		n := &pool.Status.Nodes[i]
+		if n.Resize != nil && n.Resize.Phase == resizePhaseFailed && compareFlavor(n.Flavor, target) == flavorEqual {
+			return true
+		}
+	}
+	return false
+}
+
 // rolloutBlocksRemoval is true only while a roll is actually making progress. A
 // paused (failed) roll must not lock the pool: deleting the failed worker is the
 // documented escape, and it has to be allowed.
@@ -152,7 +165,11 @@ func (r *WorkerPoolReconciler) reconcileRollout(ctx context.Context, pool *infra
 		}
 	}
 
-	if inFlight == 0 && len(pending) == 0 {
+	// A Failed slot is not in flight, but it may still be closable when the VM
+	// already carries the target shape and only a closing step failed.
+	healable := failedResizeHealable(pool, target)
+
+	if inFlight == 0 && len(pending) == 0 && !healable {
 		if len(unsupported) > 0 {
 			var names []string
 			for _, i := range unsupported {
@@ -220,6 +237,13 @@ func (r *WorkerPoolReconciler) reconcileRollout(ctx context.Context, pool *infra
 			continue
 		}
 		if n.Resize.Phase == resizePhaseFailed {
+			// A step failed, but the VM may already carry the target shape - the
+			// pool add at the very end is the usual culprit. Retry the closing
+			// steps, which are idempotent, instead of freezing the slot in
+			// Resizing/Failed for good.
+			if err := r.advanceResize(ctx, pool, n, target); err == nil && n.Resize == nil {
+				continue
+			}
 			failed = true
 			continue
 		}
@@ -337,23 +361,54 @@ func (r *WorkerPoolReconciler) advanceResize(ctx context.Context, pool *infrav1.
 		if compareFlavor(n.Flavor, target) != flavorEqual {
 			return fmt.Errorf("worker %s reports %+v after the resize, want %+v", n.Name, n.Flavor, target)
 		}
-		if err := r.Kube.Uncordon(ctx, kubeName); err != nil && !apierrors.IsNotFound(err) {
-			return fmt.Errorf("uncordon %s: %w", kubeName, err)
-		}
-		if err := r.Cloud.AddPoolMember(ctx, toPoolRef(pool), n.IP); err != nil && !errors.Is(err, cloud.ErrPoolNotConfigured) {
-			return fmt.Errorf("add %s back to the ingress pool: %w", n.IP, err)
-		}
-		n.Resize = nil
-		n.Phase = infrav1.NodePhaseReady
-		n.Message = ""
-		r.eventf(pool, corev1.EventTypeNormal, "WorkerResizeComplete",
-			fmt.Sprintf("worker %s is back in service with %d vCPU / %d MB", n.Name, target.CPUs, target.MemoryMB))
-		return nil
+		return r.finishResize(ctx, pool, n, target, kubeName)
 
 	case resizePhaseFailed:
+		// Only a worker that already carries the target shape can be closed out
+		// here; anything else keeps its failure for the operator.
+		if compareFlavor(n.Flavor, target) != flavorEqual {
+			return nil
+		}
+		nodes, err := r.Kube.ListNodes(ctx)
+		if err != nil {
+			return err
+		}
+		for i := range nodes {
+			if strings.EqualFold(nodes[i].Name, kubeName) && nodes[i].Ready {
+				n.Resize.Message = "retrying the closing steps of the resize"
+				return r.finishResize(ctx, pool, n, target, kubeName)
+			}
+		}
 		return nil
 	}
 	return fmt.Errorf("worker %s: unknown rollout phase %q", n.Name, n.Resize.Phase)
+}
+
+// finishResize puts a resized worker back into service. The worker is uncordoned
+// first, so a pool update that the edge keeps rejecting does not hold a healthy
+// node out of the cluster: the slot stays in the resize state and the next pass
+// retries the (idempotent) pool add.
+func (r *WorkerPoolReconciler) finishResize(ctx context.Context, pool *infrav1.K8sWorkerPool, n *infrav1.WorkerNodeStatus, target *infrav1.FlavorStatus, kubeName string) error {
+	if err := r.Kube.Uncordon(ctx, kubeName); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("uncordon %s: %w", kubeName, err)
+	}
+	if err := r.Cloud.AddPoolMember(ctx, toPoolRef(pool), n.IP); err != nil && !errors.Is(err, cloud.ErrPoolNotConfigured) {
+		msg := fmt.Sprintf("resized and in service; waiting for the ingress pool: %v", err)
+		if n.Resize.Message != msg {
+			log.FromContext(ctx).Error(err, "add the worker back to the ingress pool", "worker", n.Name, "ip", n.IP)
+			r.eventf(pool, corev1.EventTypeWarning, "IngressPoolFailed",
+				fmt.Sprintf("worker %s (%s) is back in service but not in the ingress pool: %v", n.Name, n.IP, err))
+		}
+		n.Resize.Message = msg
+		n.Message = msg
+		return nil
+	}
+	n.Resize = nil
+	n.Phase = infrav1.NodePhaseReady
+	n.Message = ""
+	r.eventf(pool, corev1.EventTypeNormal, "WorkerResizeComplete",
+		fmt.Sprintf("worker %s is back in service with %d vCPU / %d MB", n.Name, target.CPUs, target.MemoryMB))
+	return nil
 }
 
 // resizeAllowed lists the workers opted into a Manual rollout through the

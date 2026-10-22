@@ -348,3 +348,44 @@ func TestRolloutPausesOnFailureAndLetsDeleteWorkersThrough(t *testing.T) {
 		t.Fatalf("Ready condition = %#v, deleteWorkers must be allowed while the roll is paused", cond)
 	}
 }
+
+// A step that failed after the VM had already reached the target - the ingress
+// pool add at the end of a resize - is retried on the next pass instead of
+// parking the slot in Resizing/Failed until the worker is deleted.
+func TestRolloutRetriesTheClosingStepsOfAFailedResize(t *testing.T) {
+	pool := testPool(1)
+	pool.Spec.IngressPool = infrav1.IngressPool{Name: "pool-ingress", Edge: "edge", Port: 30080}
+	fc := &fakeCloud{}
+	fk := &fakeKube{nodes: readyNodes("pool-wrk-01")}
+	r := newTestReconciler(t, fc, fk, pool)
+
+	reconcileOnce(t, r, pool)
+
+	// Simulate 0.5.0 leaving the slot behind: the VM carries the wanted flavor
+	// and the Node is Ready, but the closing pool add failed.
+	got := getPool(t, r, pool)
+	n := nodeByName(got, "pool-wrk-01")
+	if n == nil {
+		t.Fatal("pool-wrk-01 is missing")
+	}
+	n.Resize = &infrav1.ResizeStatus{Phase: resizePhaseFailed, Message: "add 192.168.100.7 back to the ingress pool: invalid member name"}
+	n.Phase = infrav1.NodePhaseResizing
+	if err := r.Status().Update(context.Background(), got); err != nil {
+		t.Fatal(err)
+	}
+	before := len(fc.poolAdds)
+
+	reconcileOnce(t, r, pool)
+
+	got = getPool(t, r, pool)
+	n = nodeByName(got, "pool-wrk-01")
+	if n == nil || n.Resize != nil {
+		t.Fatalf("pool-wrk-01 = %#v, want the failed resize cleared (rollout %+v, ready cond %+v)", n, got.Status.Rollout, metaReady(got))
+	}
+	if n.Phase != infrav1.NodePhaseReady {
+		t.Fatalf("phase = %q, want %s", n.Phase, infrav1.NodePhaseReady)
+	}
+	if len(fc.poolAdds) != before+1 || fc.poolAdds[len(fc.poolAdds)-1] != "192.168.100.7" {
+		t.Fatalf("pool adds = %v, want one more for 192.168.100.7", fc.poolAdds)
+	}
+}
