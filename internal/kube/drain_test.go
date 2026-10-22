@@ -91,6 +91,35 @@ func TestDrainEvictsWorkloadPodsAndSkipsDaemonSetAndMirror(t *testing.T) {
 	}
 }
 
+func TestDrainLeavesPodsThatTolerateTheCordon(t *testing.T) {
+	old := drainPollEvery
+	drainPollEvery = time.Millisecond
+	defer func() { drainPollEvery = old }()
+
+	// The tigera-operator singleton tolerates every taint, so its controller
+	// puts it straight back on a cordoned node; evicting it would re-arm the
+	// drain forever.
+	operator := pod("tigera-operator-x", "wrk-03", "tigera-operator")
+	operator.Spec.Tolerations = []corev1.Toleration{
+		{Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoExecute},
+		{Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule},
+	}
+
+	cs := testClient(
+		&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "wrk-03"}},
+		operator,
+	)
+	var evicted []string
+	evictWith(cs, &evicted, nil)
+
+	if err := NewClient(cs).Drain(context.Background(), "wrk-03", 100*time.Millisecond); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if len(evicted) != 0 {
+		t.Fatalf("evicted %v, want none: the pod tolerates the cordon", evicted)
+	}
+}
+
 func TestDrainReportsBlockingPodDisruptionBudget(t *testing.T) {
 	old := drainPollEvery
 	drainPollEvery = time.Millisecond

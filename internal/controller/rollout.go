@@ -227,7 +227,7 @@ func (r *WorkerPoolReconciler) reconcileRollout(ctx context.Context, pool *infra
 			// A drain that cannot finish yet is progress, not a failure: the
 			// pass retries and the PDB is what decides.
 			if errors.Is(err, kube.ErrDrainIncomplete) {
-				n.Resize.Message = "drain in progress (a PodDisruptionBudget is holding pods)"
+				n.Resize.Message = "drain in progress (a PodDisruptionBudget or an unmovable pod is holding the node)"
 				continue
 			}
 			n.Resize.Phase = resizePhaseFailed

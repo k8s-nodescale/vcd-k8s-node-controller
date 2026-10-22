@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -271,6 +272,28 @@ func (r *WorkerPoolReconciler) reconcile(ctx context.Context, pool *infrav1.K8sW
 }
 
 // refreshReadiness maps the actual Kubernetes Nodes onto status.nodes.
+// ensureIngressPool puts a worker that has just become Ready into the ingress
+// pool. Creation does not do it on purpose: a clone is not a pool member until
+// its kubelet serves the node port. An absent or unsupported pool is fine (the
+// pool is optional), but a rejected update is reported so a Ready worker is not
+// silently left out of the load balancer.
+func (r *WorkerPoolReconciler) ensureIngressPool(ctx context.Context, pool *infrav1.K8sWorkerPool, st *infrav1.WorkerNodeStatus) {
+	if pool.Spec.IngressPool.Name == "" || st.IP == "" {
+		return
+	}
+	if err := r.Cloud.AddPoolMember(ctx, toPoolRef(pool), st.IP); err != nil {
+		if errors.Is(err, cloud.ErrPoolNotConfigured) {
+			return
+		}
+		log.FromContext(ctx).Error(err, "add the worker to the ingress pool", "worker", st.Name, "ip", st.IP)
+		r.eventf(pool, corev1.EventTypeWarning, "IngressPoolFailed",
+			fmt.Sprintf("worker %s (%s) is Ready but not in the ingress pool: %v", st.Name, st.IP, err))
+		return
+	}
+	r.eventf(pool, corev1.EventTypeNormal, "IngressPoolMember",
+		fmt.Sprintf("worker %s (%s) added to the ingress pool", st.Name, st.IP))
+}
+
 func (r *WorkerPoolReconciler) refreshReadiness(ctx context.Context, pool *infrav1.K8sWorkerPool) error {
 	nodes, err := r.Kube.ListNodes(ctx)
 	if err != nil {
@@ -317,6 +340,7 @@ func (r *WorkerPoolReconciler) refreshReadiness(ctx context.Context, pool *infra
 			st.K8sReady = false
 			st.Message = "waiting for the node to register"
 		case info.Ready:
+			becameReady := st.Phase != infrav1.NodePhaseReady
 			st.Phase = infrav1.NodePhaseReady
 			st.K8sReady = true
 			st.Message = ""
@@ -326,6 +350,9 @@ func (r *WorkerPoolReconciler) refreshReadiness(ctx context.Context, pool *infra
 			st.HealLastAttempt = nil
 			if info.KubeletVersion != "" {
 				st.KubeletVersion = info.KubeletVersion
+			}
+			if becameReady {
+				r.ensureIngressPool(ctx, pool, st)
 			}
 		default:
 			st.Phase = infrav1.NodePhaseJoining

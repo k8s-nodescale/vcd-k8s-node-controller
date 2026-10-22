@@ -160,6 +160,14 @@ func (c *Client) podsToEvict(ctx context.Context, node string) ([]corev1.Pod, er
 		if podTerminal(&pod) || isDaemonSetPod(&pod) || isMirrorPod(&pod) {
 			continue
 		}
+		// A pod that tolerates the unschedulable taint is put straight back on
+		// the cordoned node by its controller (the tigera-operator singleton
+		// does exactly this with "operator: Exists"). Evicting it again only
+		// re-arms the drain: like a DaemonSet pod it belongs to the node and
+		// goes away with it.
+		if toleratesUnschedulable(&pod) {
+			continue
+		}
 		out = append(out, pod)
 	}
 	return out, nil
@@ -173,6 +181,20 @@ func (c *Client) podsOnNode(ctx context.Context, node string) ([]corev1.Pod, err
 		return nil, fmt.Errorf("list pods on node %s: %w", node, err)
 	}
 	return list.Items, nil
+}
+
+// toleratesUnschedulable reports whether the scheduler may place this pod on a
+// cordoned node again.
+func toleratesUnschedulable(pod *corev1.Pod) bool {
+	for _, t := range pod.Spec.Tolerations {
+		if t.Key == corev1.TaintNodeUnschedulable {
+			return true
+		}
+		if t.Key == "" && t.Operator == corev1.TolerationOpExists {
+			return true
+		}
+	}
+	return false
 }
 
 // blockingPDBs returns the budgets that currently allow no disruption and

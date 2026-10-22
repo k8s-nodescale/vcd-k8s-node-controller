@@ -105,3 +105,23 @@ func TestUpdatePoolMemberRejectsUnaddressablePools(t *testing.T) {
 		})
 	}
 }
+
+func TestPoolMemberNameIsNSXVCompatible(t *testing.T) {
+	if got := poolMemberName("192.168.100.8"); got != "node-192-168-100-8" {
+		t.Fatalf("poolMemberName = %q, want node-192-168-100-8", got)
+	}
+	// NSX-V: letters, digits, dash and underscore, and the first character has
+	// to be a letter.
+	for _, ip := range []string{"192.168.100.8", "fd00::5"} {
+		name := poolMemberName(ip)
+		if name[0] < 'a' || name[0] > 'z' {
+			t.Fatalf("member name %q does not start with a letter", name)
+		}
+		for _, r := range name {
+			ok := r == '-' || r == '_' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
+			if !ok {
+				t.Fatalf("member name %q carries %q", name, r)
+			}
+		}
+	}
+}

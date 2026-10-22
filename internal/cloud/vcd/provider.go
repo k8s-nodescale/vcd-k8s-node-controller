@@ -570,7 +570,7 @@ func (p *Provider) updatePoolMember(ctx context.Context, pool cloud.PoolRef, ip 
 			return fmt.Errorf("%w: pool %q has port %d; set ingressPool.port to the node port", cloud.ErrPoolNotConfigured, pool.Name, port)
 		}
 		members = append(members, types.LbPoolMember{
-			Name:        ip,
+			Name:        poolMemberName(ip),
 			IpAddress:   ip,
 			Port:        int(port),
 			MonitorPort: int(port),
@@ -587,6 +587,13 @@ func (p *Provider) updatePoolMember(ctx context.Context, pool cloud.PoolRef, ip 
 		return fmt.Errorf("update LB pool %q: %w", pool.Name, err)
 	}
 	return nil
+}
+
+// poolMemberName builds the NSX-V member name for an address. NSX-V accepts
+// letters, digits, dash and underscore and the name has to start with a letter,
+// so a bare address is rejected (API error 14571, "invalid member name").
+func poolMemberName(ip string) string {
+	return "node-" + strings.NewReplacer(".", "-", ":", "-").Replace(ip)
 }
 
 // edgeGateway resolves the NSX-V edge that owns a load-balancer pool.

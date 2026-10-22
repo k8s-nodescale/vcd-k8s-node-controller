@@ -28,6 +28,7 @@ type fakeCloud struct {
 	poweredOff      []string
 	events          *[]string
 	poolRemovals    []string
+	poolAdds        []string
 	cycles          []string
 	resizes         []string
 	failResize      bool
@@ -124,6 +125,7 @@ func (f *fakeCloud) ResizeVM(ctx context.Context, vappName, id string, cpus, mem
 }
 
 func (f *fakeCloud) AddPoolMember(ctx context.Context, pool cloud.PoolRef, ip string) error {
+	f.poolAdds = append(f.poolAdds, ip)
 	return nil
 }
 func (f *fakeCloud) RemovePoolMember(ctx context.Context, pool cloud.PoolRef, ip string) error {
@@ -299,6 +301,30 @@ func getPool(t *testing.T, r *WorkerPoolReconciler, pool *infrav1.K8sWorkerPool)
 		t.Fatal(err)
 	}
 	return &got
+}
+
+func TestReconcileAddsReadyWorkerToTheIngressPool(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(1)
+	pool.Spec.IngressPool = infrav1.IngressPool{Name: "pool-ingress", Edge: "edge", Port: 30080}
+	fc := &fakeCloud{}
+	fk := &fakeKube{nodes: readyNodes("pool-wrk-01")}
+	r := newTestReconciler(t, fc, fk, pool)
+
+	if _, err := r.Reconcile(ctx, requestFor(pool)); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if len(fc.poolAdds) != 1 || fc.poolAdds[0] != "192.168.100.7" {
+		t.Fatalf("pool adds = %v, want [192.168.100.7]", fc.poolAdds)
+	}
+
+	// A worker that is already Ready is not added again on every pass.
+	if _, err := r.Reconcile(ctx, requestFor(pool)); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if len(fc.poolAdds) != 1 {
+		t.Fatalf("pool adds after the second pass = %v, want one", fc.poolAdds)
+	}
 }
 
 func TestReconcileScalesUpAndIsIdempotent(t *testing.T) {
