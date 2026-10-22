@@ -662,7 +662,7 @@ the pool instead), and a worker whose `hostPath`/`local` PVs would be destroyed
 ## Terraform integration contract
 
 - The Terraform module installs this chart behind a `node_controller.enabled`
-  toggle and pins `chart_version` / `image_tag` (currently `0.5.0`).
+  toggle and pins `chart_version` / `image_tag` (currently `0.5.1`).
 - **Once the controller is enabled, do not use Terraform to manage worker count
   or worker LB pool membership.** Use the CRD instead. The Terraform module's
   README must state this explicitly.
@@ -684,46 +684,6 @@ the pool instead), and a worker whose `hostPath`/`local` PVs would be destroyed
 See [`docs/conception.md`](docs/conception.md) for the full decision record,
 architecture, algorithms and open questions.
 
-## Roadmap
-
-1. Failed-provisioning watchdog (VM up but Node absent for N minutes).
-2. Token renewal / re-issued join for slow installs; delete the token and its
-   JWS entry once the node is Ready (a failed create already revokes its token).
-3. NSX-T ALB pool membership (the scale-in path already drains and deletes; it
-   only cannot edit the pool).
-4. Finalizers, e2e on a dev tenant (2 -> 4 -> 2 via the CRD, and a named
-   deletion in the middle of the pool).
-5. ~~`spec.reconciliation.policy: Notify|AutoHeal`, the `Missing` phase,
-   reserved slots, bounded `AutoHeal` retries and the `WorkerAdopted` event.~~
-   Landed in 0.5.0.
-6. ~~Control-plane placement (`nodeSelector`, `tolerations`, `replicaCount`,
-   `priorityClassName`, `dnsPolicy`) and `scaleDown.allowLastWorker` with
-   `LastWorkerProtected` / `WorkerHostsController`.~~ Landed in 0.5.0 (the
-   Terraform module still has to pass the placement values through).
-7. ~~Rolling compute-spec changes: drain -> power off -> resize -> power on ->
-   Ready -> uncordon, batched by `maxUnavailable`, resumable from
-   `status.rollout`.~~ Landed in 0.5.0; work notes in `docs/conception.md`
-   section 10.6.
-8. Template changes and shrinks as a recreate into the same ledger slot (the
-   natural 0.6 candidate).
-9. Capacity pre-flight against the virtual data center. Before a scale-out or
-   scale-up, read the current consumption of the already deployed VMs and
-   estimate whether the free capacity covers the request in every main
-   category - memory, vCPU and storage (plus whatever else the provider rates
-   against). When it does not fit, the new workers are parked in a `Queued`
-   phase with reason `NoResourceAvailable` instead of failing the create; the
-   reconcile retries when capacity appears.
-10. Provider decoupling. Move the platform-API calls behind a narrow interface
-    and a separate package (optionally a separate container / provider
-    service) so vCloud Director is just one implementation. Deliver a vSphere
-    (platform API) implementation behind the same interface - for now only the
-    stub and the interface extraction are needed.
-11. Management sidecar. Ship an optional sidecar in the controller pod that
-    serves a small web UI/API: pool state, per-node load (requests) and real
-    utilisation from the node-exporter that every installation deploys, plus
-    the actions scale-out, scale-in, scale-up and replace-node. The sidecar
-    calls the same CRD, so behaviour stays identical to `kubectl` use.
-
 ## Container image
 
 The image is published to Docker Hub on a `v*` tag:
@@ -733,7 +693,7 @@ Build locally (the Dockerfile uses `golang:1.27.1-alpine` and
 `gcr.io/distroless/static:nonroot`):
 
 ```
-docker build -t docker.io/werton13/vcd-k8s-node-controller:0.5.0 .
+docker build -t docker.io/werton13/vcd-k8s-node-controller:0.5.1 .
 ```
 
 Public module defaults are used inside the build. On a restricted network,
@@ -743,14 +703,14 @@ override them:
 docker build \
   --build-arg GOPROXY=https://nexus.example.com/repository/golang/ \
   --build-arg GOSUMDB=off \
-  -t docker.io/werton13/vcd-k8s-node-controller:0.5.0 .
+  -t docker.io/werton13/vcd-k8s-node-controller:0.5.1 .
 ```
 
 Push (or use `make image-push`):
 
 ```
 docker login docker.io
-docker push docker.io/werton13/vcd-k8s-node-controller:0.5.0
+docker push docker.io/werton13/vcd-k8s-node-controller:0.5.1
 docker push docker.io/werton13/vcd-k8s-node-controller:latest
 ```
 
