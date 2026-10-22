@@ -538,9 +538,9 @@ helm upgrade vcd-nodescale vcd-nodescale -n vcd-nodescale-system \
 - With the controller off the pool, `scaleDown.minReplicas: 0` is supported and
   `spec.replicas` may go to 0 and back up. The pool at 0 reports `0/0 workers
   Ready` and `Converged`.
-- With the controller on a pool worker the last worker cannot be removed safely:
-  the request is refused with `LastWorkerProtected` instead of leaving a
-  half-finished removal behind.
+- Emptying the pool is possible, but it is a deliberate owner decision, not
+  something the controller does because a number in the spec says so - see
+  [The last worker is a deliberate choice](#the-last-worker-is-a-deliberate-choice).
 - While the pool is at zero the cluster has no workers, so ingress, workload
   pods and the CSI node plugins are gone by definition. The control plane,
   CoreDNS, the controller and the vCD API remain, which is exactly what is
@@ -556,10 +556,41 @@ cluster's VDC and vApp, and do not run the controller with an admin account. A
 master that is destroyed takes the pod with it, though the CR `status` is the
 source of truth and the remaining replica resumes immediately.
 
+#### The last worker is a deliberate choice
+
+Emptying the pool is never an accident and never a side effect of a count: it
+needs `scaleDown.minReplicas: 0` and, from 0.4.0,
+`scaleDown.allowLastWorker: true`. Without the flag a request that would take
+the pool to zero is refused with `LastWorkerProtected` and the worker is left
+alone. **Deleting the last worker is a critical event for everything that runs on
+the cluster** - set the flag only when you mean it, and read the following first:
+
+- Every pod on that worker is evicted: ingress-nginx, any CoreDNS replica that
+  landed there, metrics-server, the CSI node plugins, the calico-node DaemonSet.
+  A PodDisruptionBudget whose `minAvailable` equals its current replica count
+  (the classic `minAvailable: 1` on a single-replica workload) blocks the drain
+  forever. That block is the correct answer: the workload has nowhere else to go.
+  Draining the last worker therefore fails with `Failed` and the VM is kept -
+  which is the controller telling you the pool is load-bearing, not a bug.
+- What remains is the control plane, CoreDNS when it can run on a master, the
+  controller and the vCD API. Nothing else can be scheduled, so every workload
+  with a PDB, a `hostPort` or a `local`/`hostPath` PV is down until the pool is
+  refilled. On a cluster with one worker this is a full outage of the payload, by
+  design, on request.
+- Scaling back up from 0 is a cold start: new VMs, cloud-init, kubelet join,
+  calico and CSI - minutes per worker, not seconds. Do not empty the pool
+  "overnight to save resources" and expect a fast morning.
+
+Two cases are refused regardless of the flag, because they are physics rather
+than policy: the node the controller itself runs on (a pass that deletes its own
+host cannot write `status` or create the replacement - move the controller off
+the pool instead), and a worker whose `hostPath`/`local` PVs would be destroyed
+(`scaleDown.force` overrides only the PV check, never a PDB).
+
 ## Terraform integration contract
 
 - The Terraform module installs this chart behind a `node_controller.enabled`
-  toggle and pins `chart_version` / `image_tag` (currently `0.3.1`).
+  toggle and pins `chart_version` / `image_tag` (currently `0.3.2`).
 - **Once the controller is enabled, do not use Terraform to manage worker count
   or worker LB pool membership.** Use the CRD instead. The Terraform module's
   README must state this explicitly.
@@ -596,8 +627,14 @@ architecture, algorithms and open questions.
 6. Control-plane placement as a first-class option: `nodeSelector`, `tolerations`,
    `replicaCount`, `priorityClassName` and `dnsPolicy` in the chart and in the
    Terraform module, so `scaleDown.minReplicas: 0` and scale-from-zero work; plus
+   `scaleDown.allowLastWorker` so emptying the pool is an explicit decision and
    `LastWorkerProtected` for the case where the controller still runs on a pool
    worker.
+7. Rolling compute-spec changes (0.5.0): when `spec.flavor` no longer matches
+   what a worker runs with, take it through drain -> power off -> resize the VM ->
+   power on -> wait Ready -> uncordon, one worker at a time by default or in
+   batches limited by `maxUnavailable`, with the rollout resumable from
+   `status.rollout`. Design notes in `docs/conception.md` section 10.6.
 
 ## Container image
 
@@ -608,7 +645,7 @@ Build locally (the Dockerfile uses `golang:1.27.1-alpine` and
 `gcr.io/distroless/static:nonroot`):
 
 ```
-docker build -t docker.io/werton13/vcd-k8s-node-controller:0.3.1 .
+docker build -t docker.io/werton13/vcd-k8s-node-controller:0.3.2 .
 ```
 
 Public module defaults are used inside the build. On a restricted network,
@@ -618,14 +655,14 @@ override them:
 docker build \
   --build-arg GOPROXY=https://nexus.example.com/repository/golang/ \
   --build-arg GOSUMDB=off \
-  -t docker.io/werton13/vcd-k8s-node-controller:0.3.1 .
+  -t docker.io/werton13/vcd-k8s-node-controller:0.3.2 .
 ```
 
 Push (or use `make image-push`):
 
 ```
 docker login docker.io
-docker push docker.io/werton13/vcd-k8s-node-controller:0.3.1
+docker push docker.io/werton13/vcd-k8s-node-controller:0.3.2
 docker push docker.io/werton13/vcd-k8s-node-controller:latest
 ```
 

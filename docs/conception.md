@@ -462,3 +462,126 @@ selected no pods, so workers were removed with the guest still running, no
 cordon, no drain, no PDB, and a `NotReady` Node object left in the cluster.
 0.3.2 keeps the Node name in `status.nodes[].nodeName`, uses it for every
 Kubernetes call and powers the guest off before deleting the Node object.
+
+### 10.5 Emptying the pool — DECIDED: an explicit, deliberate owner action
+
+The controller must be able to take a pool to zero (that is what makes
+scale-from-zero and "park the cluster" possible), but it must never do so
+because a count says so, and it must not hide the consequence behind a
+"protected" refusal that looks like a bug.
+
+Two conditions, both explicit: `scaleDown.minReplicas: 0` and
+`scaleDown.allowLastWorker: true`. Without the flag a request that would empty
+the pool is refused with `LastWorkerProtected` and the worker is left alone. With
+it, the removal proceeds through the normal pipeline, which means the PDBs still
+decide whether it can finish.
+
+Being explicit about the blast radius is part of the design, and it is documented
+in the README rather than buried here: the last drain evicts every pod on that
+worker (ingress, any CoreDNS replica that landed there, metrics-server, CSI node
+plugins, the calico DaemonSet); a `PodDisruptionBudget` whose `minAvailable`
+equals its replica count blocks the drain forever, and that block is the correct
+answer, so the worker stays and the node is marked `Failed`; what remains at
+zero is the control plane, CoreDNS when it can run on a master, the controller
+and the vCD API, so everything with a PDB, a `hostPort` or a `local`/`hostPath` PV
+is down until the pool is refilled; and refilling is a cold start measured in
+minutes per worker.
+
+Two refusals survive the flag because they are not policy: the node the
+controller itself runs on (the pass would die with it), and a worker with
+`local`/`hostPath` PVs (`scaleDown.force` overrides only that check, never a
+PDB).
+
+### 10.6 Rolling compute-spec change — PLANNED for 0.5.0
+
+Goal: change CPU, memory or disk of the workers with no redeploy of the cluster
+and no manual vCD work.
+
+**Source of truth.** `spec.flavor` describes what a worker should be, and every
+`status.nodes[]` entry gains the flavor the VM actually runs with, read back
+from vCD. A worker whose actual flavor differs from the spec is a roll-out
+candidate, so the loop is idempotent, survives a lost status, and also notices a
+VM someone resized by hand.
+
+**Why a power cycle rather than a hot change.** vCD can hot-add CPU and - on
+guests that support it and with the VM flag enabled - memory, but Kubernetes
+capacity follows only after kubelet re-reads it, and a grown disk still needs the
+guest to extend the filesystem. A cold power cycle turns all three into a known
+state and makes the Node re-register with the new capacity. Shrinking is not
+supported by vCD for CPU/memory flags and impossible for disks: a shrink is a
+"recreate" operation, out of scope here, and the controller will report it as an
+unsupported change instead of silently ignoring it.
+
+**Per-worker sequence** (the existing removal pipeline with a resize in the middle
+instead of a delete):
+
+```
+cordon (nodeName)
+  -> remove from ingress pool
+  -> drain (eviction API, PDB honoured)
+  -> wait for VolumeAttachments to detach
+  -> power off the VM
+  -> ChangeCPUCount / ChangeMemorySize / ChangeDiskSize (grow only)
+  -> power on
+  -> wait Node Ready and status.capacity matches the new flavor
+  -> update status.nodes[].flavor
+  -> uncordon
+  -> add back to the ingress pool
+  -> next worker
+```
+
+Every step is idempotent, which is what makes a controller restart in the middle
+of a roll safe: cordoning a cordoned node, draining an empty node and powering
+off an off VM are all no-ops, so an interrupted worker is simply re-driven from
+the top.
+
+**Batching.** `rollout.maxUnavailable` (int or percentage, default `1`) sets how
+many workers may be out of service at the same time; drains of a batch run
+concurrently, each bounded by `drainTimeout`. The user-chosen number is only
+the upper bound - the real limit is relocation headroom, and PDBs enforce it by
+making the eviction API refuse instead of pushing the survivors over the edge. A
+PDB block parks that batch (`Failed` on those nodes, VMs intact, roll paused),
+not the whole pool. Scale-up is allowed during a roll (it only adds capacity);
+scale-in and `deleteWorkers` are refused with `RolloutInProgress`, because a worker
+cannot be resized and removed in the same pass.
+
+**Order.** Highest ordinal first, so `wrk-01` - usually the ingress and, on a
+small cluster, the controller's own host - moves last; `rollout.order: Ascending`
+for the opposite.
+
+**Failure and resumption.** `rollout.pauseOnFailure: true` (default): a worker that
+does not return Ready within `rollout.readyTimeout` parks the CR at `Failed` with
+that worker cordoned and its VM intact, and the roll stops there. The manual
+escape is the existing `deleteWorkers` path: replace the worker, then resume.
+
+```yaml
+spec:
+  flavor:
+    numCpus: 8
+    memoryMB: 16384
+    osDiskGB: 40
+  rollout:
+    strategy: Rolling          # Rolling | Manual
+    maxUnavailable: 1          # int or "25%"
+    order: Descending          # Descending | Ascending
+    pauseOnFailure: true
+    readyTimeout: 10m
+status:
+  rollout:
+    phase: Progressing
+    targetFlavor: {numCpus: 8, memoryMB: 16384, osDiskGB: 40}
+    workersTotal: 3
+    workersDone: 1
+    currentWorker: KION-WEB-DEV-wrk-02
+    lastError: ""
+```
+
+`strategy: Manual` rolls nothing until the owner marks one worker with
+`node-controller.io/resize: allow` - for environments where the window matters more
+than the API.
+
+**Later.** A template change or a shrink is a recreate: drain, power off, delete
+the VM, create a new one from the new spec **into the same ledger slot**, so the
+name and the address are preserved. The ledger is what makes that possible, and
+it is the natural 0.6 candidate.
+
