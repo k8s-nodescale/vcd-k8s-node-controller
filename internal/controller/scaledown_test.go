@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -202,23 +203,40 @@ func TestReconcileDrainTimeoutFailsWithoutDeletingVM(t *testing.T) {
 	}
 	r := newTestReconciler(t, fc, fk, pool)
 
-	reconcilePasses(t, r, pool, 3)
+	// Pass 1 starts the removal, pass 2 hits the (1ms) drain budget.
+	reconcilePasses(t, r, pool, 2)
 
 	got := getPool(t, r, pool)
 	if len(fc.deleted) != 0 {
 		t.Fatalf("VM deleted after a failed drain: %v", fc.deleted)
 	}
-	var phase infrav1.NodePhase
-	for _, node := range got.Status.Nodes {
-		if node.Name == "pool-wrk-03" {
-			phase = node.Phase
-			if node.Message == "" {
-				t.Fatal("failed worker has no message explaining the drain timeout")
-			}
+	var failed *infrav1.WorkerNodeStatus
+	for i := range got.Status.Nodes {
+		if got.Status.Nodes[i].Name == "pool-wrk-03" {
+			failed = &got.Status.Nodes[i]
 		}
 	}
-	if phase != infrav1.NodePhaseFailed {
-		t.Fatalf("phase = %q, want Failed", phase)
+	if failed == nil {
+		t.Fatal("worker disappeared after a failed drain")
+	}
+	if failed.Phase != infrav1.NodePhaseFailed {
+		t.Fatalf("phase = %q, want Failed", failed.Phase)
+	}
+	if !strings.Contains(failed.Message, "drain did not finish") {
+		t.Fatalf("message does not explain the timeout: %q", failed.Message)
+	}
+	cond := meta.FindStatusCondition(got.Status.Conditions, "Ready")
+	if cond == nil || cond.Reason != "ScaleDownFailed" {
+		t.Fatalf("condition = %#v, want ScaleDownFailed", cond)
+	}
+
+	// A standing request retries with a fresh budget instead of staying stuck.
+	reconcilePasses(t, r, pool, 1)
+	got = getPool(t, r, pool)
+	for _, node := range got.Status.Nodes {
+		if node.Name == "pool-wrk-03" && node.Phase != infrav1.NodePhaseDraining {
+			t.Fatalf("phase after retry = %q, want Draining", node.Phase)
+		}
 	}
 }
 

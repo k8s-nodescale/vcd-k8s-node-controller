@@ -150,10 +150,16 @@ func (r *WorkerPoolReconciler) deleteWorkerStep(ctx context.Context, pool *infra
 	node := &pool.Status.Nodes[idx]
 
 	if node.Phase == infrav1.NodePhaseFailed {
-		// A failed drain stays visible until the user removes the request or
-		// fixes the blocker; retrying a PDB-blocked drain every pass only
-		// floods the API server with evictions.
-		return true, ctrl.Result{RequeueAfter: requeueConverged}, nil
+		// The request is still standing, so the operator wants this worker gone:
+		// start a fresh drainTimeout budget. A PDB that never allows a
+		// disruption makes this retry every budget, which is slower than a
+		// tight loop and still leaves the reason in the message.
+		now := metav1.Now()
+		node.DeleteStartedAt = &now
+		node.Phase = infrav1.NodePhaseDraining
+		node.Message = "retrying the drain with a fresh budget"
+		r.eventf(pool, corev1.EventTypeNormal, "WorkerDeletionRetried",
+			fmt.Sprintf("retrying drain of %s with drainTimeout=%s", node.Name, budgetFor(pool)))
 	}
 
 	minReplicas := pool.Spec.ScaleDown.MinReplicas
@@ -166,10 +172,7 @@ func (r *WorkerPoolReconciler) deleteWorkerStep(ctx context.Context, pool *infra
 		return true, ctrl.Result{RequeueAfter: requeueConverged}, nil
 	}
 
-	budget := pool.Spec.ScaleDown.DrainTimeout.Duration
-	if budget <= 0 {
-		budget = defaultDrainTimeout
-	}
+	budget := budgetFor(pool)
 
 	if node.DeleteStartedAt == nil {
 		if !pool.Spec.ScaleDown.Force && !req.force {
@@ -293,6 +296,20 @@ func (r *WorkerPoolReconciler) scaleDown(ctx context.Context, pool *infrav1.K8sW
 		return workerOrdinal(candidates[i].Name) > workerOrdinal(candidates[j].Name)
 	})
 
+	// A worker left in Failed still occupies an address and counts as observed.
+	// Deleting a healthy worker to satisfy the count would hide it, so the pool
+	// stops until the failed worker is resolved or its request is withdrawn.
+	for _, node := range pool.Status.Nodes {
+		if node.Phase != infrav1.NodePhaseFailed {
+			continue
+		}
+		msg := fmt.Sprintf("scale-down paused: %s is Failed (%s); retry or withdraw its deletion request first",
+			node.Name, node.Message)
+		r.setCondition(pool, metav1.ConditionFalse, "ScaleDownFailed", msg)
+		r.eventf(pool, corev1.EventTypeWarning, "ScaleDownFailed", msg)
+		return true, ctrl.Result{RequeueAfter: requeueConverged}, nil
+	}
+
 	minReplicas := pool.Spec.ScaleDown.MinReplicas
 	var requests []deletionRequest
 	for _, node := range candidates {
@@ -314,6 +331,14 @@ func (r *WorkerPoolReconciler) scaleDown(ctx context.Context, pool *infrav1.K8sW
 		return true, ctrl.Result{RequeueAfter: requeueConverged}, nil
 	}
 	return r.runDeletions(ctx, pool, alloc, requests)
+}
+
+// budgetFor returns the drain budget the pool actually uses.
+func budgetFor(pool *infrav1.K8sWorkerPool) time.Duration {
+	if budget := pool.Spec.ScaleDown.DrainTimeout.Duration; budget > 0 {
+		return budget
+	}
+	return defaultDrainTimeout
 }
 
 // removeFromIngressPool takes the worker address out of the ingress pool so no
