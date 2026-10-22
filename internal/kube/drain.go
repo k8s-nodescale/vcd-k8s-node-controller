@@ -55,6 +55,26 @@ func (c *Client) Cordon(ctx context.Context, name string) error {
 	return nil
 }
 
+// Uncordon clears the unschedulable mark. The rollout calls it once a resized
+// worker is Ready again.
+func (c *Client) Uncordon(ctx context.Context, name string) error {
+	node, err := c.cs.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("get node %s: %w", name, err)
+	}
+	if !node.Spec.Unschedulable {
+		return nil
+	}
+	patch := []byte("{\"spec\":{\"unschedulable\":false}}")
+	if _, err := c.cs.CoreV1().Nodes().Patch(ctx, name, types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
+		return fmt.Errorf("uncordon node %s: %w", name, err)
+	}
+	return nil
+}
+
 // Drain evicts pods through the eviction API. That is what makes
 // PodDisruptionBudgets meaningful: the API server answers 429 TooManyRequests
 // while a budget has no disruptions left, and the pod stays put instead of

@@ -31,6 +31,32 @@ resources:
     cpu: 500m
     memory: 512Mi
 
+# Placement. Running the controller on the control plane is the recommended
+# default once the pool may be emptied (scaleDown.minReplicas: 0 with
+# scaleDown.allowLastWorker): on a worker, the last-worker guard refuses to
+# delete the node the controller runs on, so the pool can never reach zero.
+#
+# Example control-plane placement:
+#   nodeSelector:
+#     node-role.kubernetes.io/control-plane: ""
+#   tolerations:
+#     - key: node-role.kubernetes.io/control-plane
+#       operator: Exists
+#       effect: NoSchedule
+#   priorityClassName: system-cluster-critical
 nodeSelector: {}
 tolerations: []
 affinity: {}
+
+# priorityClassName raises the controller above the workloads it evicts: the
+# drain it starts must not evict the controller itself.
+priorityClassName: ""
+
+# dnsPolicy is worth setting to Default when the controller runs on the control
+# plane and CoreDNS may be pinned to a worker: at zero workers a worker-pinned
+# CoreDNS has nowhere to run, and the controller still has to resolve the vCD
+# API and the Kubernetes API.
+dnsPolicy: ""
+
+# Two replicas with leader election and a required anti-affinity make the
+# controller survive a node removal. See README "Controller placement".

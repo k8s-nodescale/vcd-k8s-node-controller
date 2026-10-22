@@ -56,6 +56,16 @@ type WorkerPoolReconciler struct {
 	// spec.vcd.org/vdc points somewhere else instead of silently ignoring it.
 	Org string
 	VDC string
+
+	// PodName and PodNamespace identify this controller's Pod (downward API).
+	// They let the last-worker guard refuse to delete the worker the pass
+	// itself runs on.
+	PodName      string
+	PodNamespace string
+
+	// ownNode caches the Node resolved from PodName, including an empty
+	// result, so the guard costs one API call per process.
+	ownNode *string
 }
 
 // +kubebuilder:rbac:groups=infra.example.com,resources=k8sworkerpools,verbs=get;list;watch;create;update;patch;delete
@@ -139,15 +149,54 @@ func (r *WorkerPoolReconciler) reconcile(ctx context.Context, pool *infrav1.K8sW
 		return ctrl.Result{RequeueAfter: requeueInvalidSpec}, nil
 	}
 
-	nodes, err := mergeNodes(pool, actual, alloc)
+	nodes, adopted, err := mergeNodes(pool, actual, alloc)
+	if err != nil {
+		r.setCondition(pool, metav1.ConditionFalse, "InvalidIPPlan", err.Error())
+		return ctrl.Result{RequeueAfter: requeueInvalidSpec}, nil
+	}
+
+	// A worker whose VM disappeared outside the loop keeps its slot: the
+	// address stays reserved and the entry stays in status.nodes with phase
+	// Missing (or as Failed once AutoHeal gives up). Without this the replica
+	// arithmetic would read the loss as a shortfall and silently provision a
+	// successor under a new name, which is what 0.3.x did.
+	nodes, err = r.mergeMissingSlots(pool, nodes, alloc)
 	if err != nil {
 		r.setCondition(pool, metav1.ConditionFalse, "InvalidIPPlan", err.Error())
 		return ctrl.Result{RequeueAfter: requeueInvalidSpec}, nil
 	}
 
 	pool.Status.Nodes = nodes
-	pool.Status.ObservedReplicas = int32(len(actual))
+	pool.Status.ObservedReplicas = int32(len(nodes))
 	pool.Status.Ledger = toStatusLedger(alloc.Ledger())
+
+	// Terraform's bootstrap workers carry no controller metadata and are
+	// adopted on the first pass. Make the ownership transfer visible, and do
+	// not remove one in the same pass it was adopted in: an outside
+	// terraform apply must not turn into "the controller deleted a worker".
+	for _, name := range adopted {
+		logger.Info("adopted worker", "node", name, "pool", pool.Name)
+		r.eventf(pool, corev1.EventTypeNormal, "WorkerAdopted",
+			fmt.Sprintf("worker %s is owned by pool %s from now on", name, pool.Name))
+	}
+
+	// A rollout owns the pool while it runs: taking a worker out of service
+	// and removing another at the same time would spend the same disruption
+	// budget twice.
+	if rolloutBlocksRemoval(pool) {
+		switch {
+		case len(pool.Spec.ScaleDown.DeleteWorkers) > 0:
+			msg := "scaleDown.deleteWorkers is paused: a rollout is in progress (RolloutInProgress)"
+			r.setCondition(pool, metav1.ConditionFalse, "RolloutInProgress", msg)
+			r.eventf(pool, corev1.EventTypeWarning, "RolloutInProgress", msg)
+			return ctrl.Result{RequeueAfter: requeueProgressing}, nil
+		case pool.Spec.Replicas < int32(len(pool.Status.Nodes)):
+			msg := "scale-in is paused: a rollout is in progress (RolloutInProgress)"
+			r.setCondition(pool, metav1.ConditionFalse, "RolloutInProgress", msg)
+			r.eventf(pool, corev1.EventTypeWarning, "RolloutInProgress", msg)
+			return ctrl.Result{RequeueAfter: requeueProgressing}, nil
+		}
+	}
 
 	// Named deletions (spec.scaleDown.deleteWorkers and the per-node
 	// annotation) run before the replica arithmetic: deleting a specific
@@ -156,6 +205,15 @@ func (r *WorkerPoolReconciler) reconcile(ctx context.Context, pool *infrav1.K8sW
 		if err != nil {
 			logger.Error(err, "worker deletion failed", "pool", pool.Name)
 			r.setCondition(pool, metav1.ConditionFalse, "ScaleDownFailed", err.Error())
+			return res, err
+		}
+		return res, nil
+	}
+
+	if handled, res, err := r.reconcileMissing(ctx, pool, alloc); handled {
+		if err != nil {
+			logger.Error(err, "AutoHeal failed", "pool", pool.Name)
+			r.setCondition(pool, metav1.ConditionFalse, "AutoHealFailed", err.Error())
 			return res, err
 		}
 		return res, nil
@@ -170,7 +228,7 @@ func (r *WorkerPoolReconciler) reconcile(ctx context.Context, pool *infrav1.K8sW
 			return ctrl.Result{}, err
 		}
 	case desired < pool.Status.ObservedReplicas:
-		handled, res, err := r.scaleDown(ctx, pool, alloc, pool.Status.ObservedReplicas-desired)
+		handled, res, err := r.scaleDown(ctx, pool, alloc, pool.Status.ObservedReplicas-desired, adopted)
 		if err != nil {
 			logger.Error(err, "scale down failed", "pool", pool.Name)
 			r.setCondition(pool, metav1.ConditionFalse, "ScaleDownFailed", err.Error())
@@ -179,6 +237,17 @@ func (r *WorkerPoolReconciler) reconcile(ctx context.Context, pool *infrav1.K8sW
 		if handled {
 			return res, nil
 		}
+	}
+
+	// The rollout runs after the replica arithmetic so a scale-up during a
+	// roll is allowed; a scale-in is refused inside the rollout itself.
+	if handled, res, err := r.reconcileRollout(ctx, pool, alloc); handled {
+		if err != nil {
+			logger.Error(err, "rollout failed", "pool", pool.Name)
+			r.setCondition(pool, metav1.ConditionFalse, "RolloutFailed", err.Error())
+			return res, err
+		}
+		return res, nil
 	}
 
 	if err := r.refreshReadiness(ctx, pool); err != nil {
@@ -217,8 +286,12 @@ func (r *WorkerPoolReconciler) refreshReadiness(ctx context.Context, pool *infra
 	for i := range pool.Status.Nodes {
 		st := &pool.Status.Nodes[i]
 		// A worker that is being deleted keeps its phase: overwriting it with
-		// Ready would restart the drain on every pass.
-		if st.DeleteStartedAt != nil {
+		// Ready would restart the drain on every pass. A Missing or a parked
+		// Failed slot has no VM to ask, and its phase is the report itself.
+		if st.DeleteStartedAt != nil || st.Phase == infrav1.NodePhaseMissing || st.Resize != nil {
+			continue
+		}
+		if st.VMID == "" && st.Phase == infrav1.NodePhaseFailed {
 			continue
 		}
 		info, ok := byName[strings.ToLower(st.Name)]
@@ -228,6 +301,17 @@ func (r *WorkerPoolReconciler) refreshReadiness(ctx context.Context, pool *infra
 			st.NodeName = info.Name
 		}
 		switch {
+		case !ok && st.NodeName != "" && st.VMID != "":
+			// The VM is alive but its Node object is gone: kubelet lost its
+			// registration (stopped, certificates rotated away, or the Node was
+			// deleted by hand). Only a reboot repairs that; Notify reports it
+			// and leaves the worker alone.
+			st.K8sReady = false
+			st.Phase = infrav1.NodePhaseJoining
+			st.Message = "lost its Node registration; the VM is still running"
+			if policyFor(pool) == infrav1.ReconciliationAutoHeal {
+				r.healLostNode(ctx, pool, st)
+			}
 		case !ok:
 			st.Phase = infrav1.NodePhaseProvisioning
 			st.K8sReady = false
@@ -236,6 +320,10 @@ func (r *WorkerPoolReconciler) refreshReadiness(ctx context.Context, pool *infra
 			st.Phase = infrav1.NodePhaseReady
 			st.K8sReady = true
 			st.Message = ""
+			// A worker that came back is a healthy slot again: the AutoHeal
+			// budget starts over.
+			st.HealAttempts = 0
+			st.HealLastAttempt = nil
 			if info.KubeletVersion != "" {
 				st.KubeletVersion = info.KubeletVersion
 			}
@@ -265,12 +353,21 @@ func (r *WorkerPoolReconciler) refreshReadiness(ctx context.Context, pool *infra
 func evaluatePoolCondition(pool *infrav1.K8sWorkerPool) (metav1.ConditionStatus, string, string) {
 	desired := pool.Spec.Replicas
 	var ready int32
+	var missing []string
 	for _, n := range pool.Status.Nodes {
-		if n.Phase == infrav1.NodePhaseReady {
+		switch n.Phase {
+		case infrav1.NodePhaseReady:
 			ready++
+		case infrav1.NodePhaseMissing:
+			missing = append(missing, fmt.Sprintf("%s (%s)", n.Name, n.IP))
 		}
 	}
 	switch {
+	case len(missing) > 0:
+		// A slot whose VM disappeared is never "just progressing": name what is
+		// gone, so an operator can recreate or write it off.
+		return metav1.ConditionFalse, "WorkerMissing",
+			fmt.Sprintf("%d worker(s) missing from vCD: %s", len(missing), strings.Join(missing, ", "))
 	case pool.Status.ObservedReplicas != desired:
 		return metav1.ConditionFalse, "Scaling",
 			fmt.Sprintf("desired=%d observed=%d ready=%d", desired, pool.Status.ObservedReplicas, ready)
@@ -432,19 +529,27 @@ func (r *WorkerPoolReconciler) validateSpec(pool *infrav1.K8sWorkerPool) string 
 // mergeNodes rebuilds status.nodes from the VMs that actually exist and adopts
 // their addresses into the ledger. Per-node phase and Kubernetes readiness are
 // carried over by name.
-func mergeNodes(pool *infrav1.K8sWorkerPool, vms []cloud.VM, alloc *ipam.Allocator) ([]infrav1.WorkerNodeStatus, error) {
+func mergeNodes(pool *infrav1.K8sWorkerPool, vms []cloud.VM, alloc *ipam.Allocator) ([]infrav1.WorkerNodeStatus, []string, error) {
 	previous := make(map[string]infrav1.WorkerNodeStatus, len(pool.Status.Nodes))
 	for _, n := range pool.Status.Nodes {
 		previous[n.Name] = n
 	}
 
+	var adopted []string
 	out := make([]infrav1.WorkerNodeStatus, 0, len(vms))
 	for _, vm := range vms {
-		node := previous[vm.Name]
+		node, known := previous[vm.Name]
+		if !known {
+			// No status entry for this VM: a Terraform bootstrap worker on the
+			// first pass, or a VM somebody created by hand. It is adopted into
+			// the pool instead of being a VM the pool reports on but cannot
+			// remove.
+			adopted = append(adopted, vm.Name)
+		}
 		node.Name = vm.Name
 		if vm.IP != "" {
 			if err := alloc.Adopt(vm.IP); err != nil {
-				return nil, fmt.Errorf("VM %q: %w", vm.Name, err)
+				return nil, nil, fmt.Errorf("VM %q: %w", vm.Name, err)
 			}
 			node.IP = vm.IP
 		}
@@ -467,10 +572,17 @@ func mergeNodes(pool *infrav1.K8sWorkerPool, vms []cloud.VM, alloc *ipam.Allocat
 		if vm.DiskGB > 0 {
 			node.DiskGB = vm.DiskGB
 		}
+		// What the VM actually runs with; spec.flavor is the desired side. A VM
+		// resized by hand is noticed by the same comparison the rollout uses.
+		node.Flavor = &infrav1.FlavorStatus{
+			CPUs:     vm.CPU,
+			MemoryMB: vm.MemoryMB,
+			OSDiskGB: vm.OSDiskGB,
+		}
 		out = append(out, node)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out, nil
+	return out, adopted, nil
 }
 
 // scaleUp provisions n workers. The ledger is kept in memory and persisted by
@@ -480,23 +592,6 @@ func mergeNodes(pool *infrav1.K8sWorkerPool, vms []cloud.VM, alloc *ipam.Allocat
 // vCD; otherwise it is released for reuse.
 func (r *WorkerPoolReconciler) scaleUp(ctx context.Context, pool *infrav1.K8sWorkerPool, alloc *ipam.Allocator, n int32) error {
 	logger := log.FromContext(ctx)
-
-	ttl := pool.Spec.Join.TokenTTL.Duration
-	if ttl <= 0 {
-		ttl = time.Hour
-	}
-	dnsJSON, err := json.Marshal(pool.Spec.Bootstrap.DNS)
-	if err != nil {
-		return fmt.Errorf("encode DNS servers: %w", err)
-	}
-	cloudInitDisks, err := toCloudInitDisks(pool.Spec.Flavor.Disks)
-	if err != nil {
-		return err
-	}
-
-	syncLedger := func() {
-		pool.Status.Ledger = toStatusLedger(alloc.Ledger())
-	}
 
 	for i := int32(0); i < n; i++ {
 		ip, err := alloc.Allocate()
@@ -510,87 +605,12 @@ func (r *WorkerPoolReconciler) scaleUp(ctx context.Context, pool *infrav1.K8sWor
 		}
 		name := workerName(pool.Spec.NamePrefix, ordinal)
 
-		// token is set once a bootstrap token exists for this attempt, so release
-		// can revoke it: a token that outlives a failed create is a live
-		// credential for a node that will never exist (customization-phases.md
-		// §5.4 - observed: 21 leaked tokens in one afternoon).
-		var token string
-		// release frees the address and revokes the token when nothing was created.
-		release := func(cause error) error {
-			_ = alloc.Free(ip)
-			if token != "" {
-				if err := r.Kube.RevokeBootstrapToken(ctx, token); err != nil {
-					logger.Error(err, "revoke bootstrap token", "node", name, "token", tokenID(token))
-				}
-			}
-			syncLedger()
-			return cause
-		}
-		token, err = r.Kube.CreateBootstrapToken(ctx, ttl)
+		vm, err := r.createWorker(ctx, pool, alloc, name, ip)
 		if err != nil {
-			return release(fmt.Errorf("create bootstrap token for %s: %w", name, err))
-		}
-		caHash, err := r.Kube.CAHash(ctx)
-		if err != nil {
-			return release(fmt.Errorf("compute CA hash for %s: %w", name, err))
-		}
-		join, err := buildJoinCommand(pool.Spec.Join.Endpoint, token, caHash)
-		if err != nil {
-			return release(fmt.Errorf("build join command for %s: %w", name, err))
+			return err
 		}
 
-		userData, initscript, err := r.Renderer.Render(cloudinit.Params{
-			NodeName:         name,
-			NodeIP:           ip,
-			CIDRPrefix:       cidrPrefix(pool.Spec.IPPlan.CIDR),
-			GatewayIP:        gatewayIP(pool.Spec.IPPlan.CIDR),
-			NICName:          pool.Spec.Bootstrap.NICName,
-			DNSServersJSON:   string(dnsJSON),
-			OSUser:           pool.Spec.Bootstrap.OSUser,
-			OSPasswordHash:   pool.Spec.Bootstrap.OSPasswordHash,
-			SSHAuthorizedKey: pool.Spec.Bootstrap.SSHAuthorizedKey,
-			K8sVersion:       pool.Spec.Bootstrap.K8sVersion,
-			K8sMinorRepo:     pool.Spec.Bootstrap.K8sMinorRepo,
-			JoinEndpoint:     pool.Spec.Join.Endpoint,
-			JoinCommand:      join,
-			Disks:            cloudInitDisks,
-		})
-		if err != nil {
-			return release(fmt.Errorf("render bootstrap for %s: %w", name, err))
-		}
-
-		vm, err := r.Cloud.CreateVM(ctx, cloud.CreateVMSpec{
-			Name:       name,
-			IP:         ip,
-			VApp:       pool.Spec.VCD.VApp,
-			OrgNetwork: pool.Spec.VCD.OrgNetwork,
-			Catalog:    pool.Spec.VCD.Catalog,
-			CatalogOrg: pool.Spec.VCD.CatalogOrg,
-			Template:   pool.Spec.Flavor.Template,
-			CPUs:       pool.Spec.Flavor.CPUs,
-			MemoryMB:   pool.Spec.Flavor.MemoryMB,
-			OSDiskGB:   pool.Spec.Flavor.OSDiskGB,
-			Disks:      toCloudDisks(pool.Spec.Flavor.Disks),
-			Initscript: initscript,
-			UserData:   userData,
-			Metadata: map[string]string{
-				"managed-by": "vcd-nodescale",
-				"pool":       pool.Name,
-				"node-name":  name,
-				// Which build baked this VM, and which bootstrap token it holds:
-				// without these a stuck guest cannot be traced or cleaned up
-				// (customization-phases.md §5.1, §5.4).
-				"render":   r.Renderer.Stamp(),
-				"token-id": tokenID(token),
-			},
-			EnableUUID: true,
-		})
-		if err != nil {
-			return r.reserveUnlessGone(ctx, pool, alloc, ip, name,
-				fmt.Errorf("create worker %s: %w", name, err))
-		}
-
-		cpu, memMB, diskGB := vm.CPU, vm.MemoryMB, vm.DiskGB
+		cpu, memMB := vm.CPU, vm.MemoryMB
 		if cpu == 0 {
 			cpu = pool.Spec.Flavor.CPUs
 		}
@@ -604,13 +624,119 @@ func (r *WorkerPoolReconciler) scaleUp(ctx context.Context, pool *infrav1.K8sWor
 			Phase:    infrav1.NodePhaseProvisioning,
 			CPU:      cpu,
 			MemoryMB: memMB,
-			DiskGB:   diskGB,
+			DiskGB:   vm.DiskGB,
+			Flavor: &infrav1.FlavorStatus{
+				CPUs:     vm.CPU,
+				MemoryMB: vm.MemoryMB,
+				OSDiskGB: vm.OSDiskGB,
+			},
 		})
 		pool.Status.ObservedReplicas = int32(len(pool.Status.Nodes))
-		syncLedger()
+		pool.Status.Ledger = toStatusLedger(alloc.Ledger())
 		logger.Info("created worker", "node", name, "ip", ip, "vmID", vm.ID)
 	}
 	return nil
+}
+
+// createWorker provisions one worker VM into the slot (name, ip). It owns the
+// bootstrap token lifecycle and the address bookkeeping of a failed attempt:
+// the token is revoked and the address released unless the VM itself survived,
+// because a token that outlives a failed create is a live credential for a node
+// that will never exist (customization-phases.md §5.4: 21 leaked tokens in one
+// afternoon).
+func (r *WorkerPoolReconciler) createWorker(ctx context.Context, pool *infrav1.K8sWorkerPool, alloc *ipam.Allocator, name, ip string) (cloud.VM, error) {
+	logger := log.FromContext(ctx)
+
+	ttl := pool.Spec.Join.TokenTTL.Duration
+	if ttl <= 0 {
+		ttl = time.Hour
+	}
+	dnsJSON, err := json.Marshal(pool.Spec.Bootstrap.DNS)
+	if err != nil {
+		return cloud.VM{}, fmt.Errorf("encode DNS servers: %w", err)
+	}
+	cloudInitDisks, err := toCloudInitDisks(pool.Spec.Flavor.Disks)
+	if err != nil {
+		return cloud.VM{}, err
+	}
+
+	var token string
+	release := func(cause error) (cloud.VM, error) {
+		_ = alloc.Free(ip)
+		pool.Status.Ledger = toStatusLedger(alloc.Ledger())
+		if token != "" {
+			if err := r.Kube.RevokeBootstrapToken(ctx, token); err != nil {
+				logger.Error(err, "revoke bootstrap token", "node", name, "token", tokenID(token))
+			}
+		}
+		return cloud.VM{}, cause
+	}
+
+	token, err = r.Kube.CreateBootstrapToken(ctx, ttl)
+	if err != nil {
+		return release(fmt.Errorf("create bootstrap token for %s: %w", name, err))
+	}
+	caHash, err := r.Kube.CAHash(ctx)
+	if err != nil {
+		return release(fmt.Errorf("compute CA hash for %s: %w", name, err))
+	}
+	join, err := buildJoinCommand(pool.Spec.Join.Endpoint, token, caHash)
+	if err != nil {
+		return release(fmt.Errorf("build join command for %s: %w", name, err))
+	}
+
+	userData, initscript, err := r.Renderer.Render(cloudinit.Params{
+		NodeName:         name,
+		NodeIP:           ip,
+		CIDRPrefix:       cidrPrefix(pool.Spec.IPPlan.CIDR),
+		GatewayIP:        gatewayIP(pool.Spec.IPPlan.CIDR),
+		NICName:          pool.Spec.Bootstrap.NICName,
+		DNSServersJSON:   string(dnsJSON),
+		OSUser:           pool.Spec.Bootstrap.OSUser,
+		OSPasswordHash:   pool.Spec.Bootstrap.OSPasswordHash,
+		SSHAuthorizedKey: pool.Spec.Bootstrap.SSHAuthorizedKey,
+		K8sVersion:       pool.Spec.Bootstrap.K8sVersion,
+		K8sMinorRepo:     pool.Spec.Bootstrap.K8sMinorRepo,
+		JoinEndpoint:     pool.Spec.Join.Endpoint,
+		JoinCommand:      join,
+		Disks:            cloudInitDisks,
+	})
+	if err != nil {
+		return release(fmt.Errorf("render bootstrap for %s: %w", name, err))
+	}
+
+	vm, err := r.Cloud.CreateVM(ctx, cloud.CreateVMSpec{
+		Name:       name,
+		IP:         ip,
+		VApp:       pool.Spec.VCD.VApp,
+		OrgNetwork: pool.Spec.VCD.OrgNetwork,
+		Catalog:    pool.Spec.VCD.Catalog,
+		CatalogOrg: pool.Spec.VCD.CatalogOrg,
+		Template:   pool.Spec.Flavor.Template,
+		CPUs:       pool.Spec.Flavor.CPUs,
+		MemoryMB:   pool.Spec.Flavor.MemoryMB,
+		OSDiskGB:   pool.Spec.Flavor.OSDiskGB,
+		Disks:      toCloudDisks(pool.Spec.Flavor.Disks),
+		Initscript: initscript,
+		UserData:   userData,
+		Metadata: map[string]string{
+			"managed-by": "vcd-nodescale",
+			"pool":       pool.Name,
+			"node-name":  name,
+			// Which build baked this VM, and which bootstrap token it holds:
+			// without these a stuck guest cannot be traced or cleaned up
+			// (customization-phases.md §5.1, §5.4).
+			"render":   r.Renderer.Stamp(),
+			"token-id": tokenID(token),
+		},
+		EnableUUID: true,
+	})
+	if err != nil {
+		cause := fmt.Errorf("create worker %s: %w", name, err)
+		_ = r.reserveUnlessGone(ctx, pool, alloc, ip, name, cause)
+		return cloud.VM{}, cause
+	}
+	return vm, nil
 }
 
 // ownedWorkerVMs keeps the VMs that belong to the pool. Ownership is decided by

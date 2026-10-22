@@ -225,6 +225,33 @@ func (a *Allocator) removeFree(addr netip.Addr) {
 	a.ledger.Free = kept
 }
 
+// Reserve keeps ip out of the Allocate pool without a VM behind it. The
+// reconciler calls it for a slot whose VM disappeared outside the loop: the
+// address stays allocated so the identity (address plus the worker name derived
+// from its ordinal) survives until the operator writes the slot off.
+func (a *Allocator) Reserve(ip string) error {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return fmt.Errorf("parse ip %q: %w", ip, err)
+	}
+	if !a.prefix.Contains(addr) {
+		return fmt.Errorf("ip %s is outside %s", ip, a.prefix)
+	}
+	if _, ok := a.reserved[addr]; ok {
+		return fmt.Errorf("ip %s is reserved for infrastructure", ip)
+	}
+	if _, ok := a.used[addr]; !ok {
+		a.used[addr] = struct{}{}
+		a.ledger.Used = append(a.ledger.Used, addr.String())
+	}
+	a.removeFree(addr)
+	sort.Strings(a.ledger.Used)
+	if ord, err := a.Ordinal(ip); err == nil && ord > a.ledger.NextIndex {
+		a.ledger.NextIndex = ord
+	}
+	return nil
+}
+
 // Free releases an allocated IP and makes it eligible for reuse.
 func (a *Allocator) Free(ip string) error {
 	addr, err := netip.ParseAddr(ip)

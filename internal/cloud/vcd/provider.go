@@ -359,6 +359,152 @@ func powerOff(vm *govcd.VM) error {
 	return nil
 }
 
+// PowerOnVM powers a stopped VM on. It is idempotent, and a VM that is
+// already gone counts as done.
+func (p *Provider) PowerOnVM(ctx context.Context, vappName, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	vdc, err := p.vdc()
+	if err != nil {
+		return err
+	}
+	vapp, err := vdc.GetVAppByName(vappName, true)
+	if err != nil {
+		if govcd.ContainsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("get vApp %q: %w", vappName, err)
+	}
+	vm, err := vapp.GetVMById(id, true)
+	if err != nil {
+		if govcd.ContainsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("get VM %q: %w", id, err)
+	}
+	return powerOn(vm)
+}
+
+// CycleVM power-cycles a VM. AutoHeal uses it when the VM is alive but its
+// Node object disappeared: a guest reboot re-registers kubelet with the
+// cluster, which a metadata-only repair cannot do.
+func (p *Provider) CycleVM(ctx context.Context, vappName, id string) error {
+	if err := p.PowerOffVM(ctx, vappName, id); err != nil {
+		return err
+	}
+	return p.PowerOnVM(ctx, vappName, id)
+}
+
+func powerOn(vm *govcd.VM) error {
+	if vm.VM.Status == 4 { // POWERED_ON
+		return nil
+	}
+	task, err := vm.PowerOn()
+	if err != nil {
+		return fmt.Errorf("power on VM %q: %w", vm.VM.Name, err)
+	}
+	if err := task.WaitTaskCompletion(); err != nil {
+		return fmt.Errorf("wait for VM %q power-on: %w", vm.VM.Name, err)
+	}
+	if err := vm.Refresh(); err != nil {
+		return fmt.Errorf("refresh VM %q after power-on: %w", vm.VM.Name, err)
+	}
+	return nil
+}
+
+// ResizeVM grows a powered-off worker to the requested shape. A shrink is
+// refused: vCD cannot reduce CPU or memory and a smaller disk would destroy
+// data, so shrinking is a recreate operation (drain, delete the VM, create a
+// new one in the same ledger slot), not a resize.
+func (p *Provider) ResizeVM(ctx context.Context, vappName, id string, cpus, memoryMB, osDiskGB int32) (cloud.VM, error) {
+	if err := ctx.Err(); err != nil {
+		return cloud.VM{}, err
+	}
+	vdc, err := p.vdc()
+	if err != nil {
+		return cloud.VM{}, err
+	}
+	vapp, err := vdc.GetVAppByName(vappName, true)
+	if err != nil {
+		return cloud.VM{}, fmt.Errorf("get vApp %q: %w", vappName, err)
+	}
+	vm, err := vapp.GetVMById(id, true)
+	if err != nil {
+		return cloud.VM{}, fmt.Errorf("get VM %q: %w", id, err)
+	}
+	if vm.VM.Status != 8 { // POWERED_OFF
+		return cloud.VM{}, fmt.Errorf("VM %q must be powered off to resize (status %s)", vm.VM.Name, vappStatus(vm.VM.Status))
+	}
+
+	curCPU, curMem, _ := vmResources(vm)
+	curDisk := systemDiskGB(vm)
+	switch {
+	case cpus > 0 && cpus < curCPU:
+		return cloud.VM{}, fmt.Errorf("VM %q has %d vCPU, cannot shrink to %d", vm.VM.Name, curCPU, cpus)
+	case memoryMB > 0 && memoryMB < curMem:
+		return cloud.VM{}, fmt.Errorf("VM %q has %d MB memory, cannot shrink to %d MB", vm.VM.Name, curMem, memoryMB)
+	case osDiskGB > 0 && curDisk > 0 && osDiskGB < curDisk:
+		return cloud.VM{}, fmt.Errorf("VM %q has a %d GB system disk, cannot shrink to %d GB", vm.VM.Name, curDisk, osDiskGB)
+	}
+
+	// The system disk is changed through the VM spec section, so it goes
+	// first: that call carries the current CPU and memory with it, and doing
+	// it after ChangeCPUCount would write the pre-resize values back.
+	if osDiskGB > 0 {
+		if err := setSystemDiskSize(vm, osDiskGB); err != nil {
+			return cloud.VM{}, err
+		}
+	}
+	if cpus > 0 && cpus != curCPU {
+		task, err := vm.ChangeCPUCount(int(cpus))
+		if err != nil {
+			return cloud.VM{}, fmt.Errorf("set vCPU of VM %q to %d: %w", vm.VM.Name, cpus, err)
+		}
+		if err := task.WaitTaskCompletion(); err != nil {
+			return cloud.VM{}, fmt.Errorf("wait for vCPU change of VM %q: %w", vm.VM.Name, err)
+		}
+	}
+	if memoryMB > 0 && memoryMB != curMem {
+		task, err := vm.ChangeMemorySize(int(memoryMB))
+		if err != nil {
+			return cloud.VM{}, fmt.Errorf("set memory of VM %q to %d MB: %w", vm.VM.Name, memoryMB, err)
+		}
+		if err := task.WaitTaskCompletion(); err != nil {
+			return cloud.VM{}, fmt.Errorf("wait for memory change of VM %q: %w", vm.VM.Name, err)
+		}
+	}
+	if err := vm.Refresh(); err != nil {
+		return cloud.VM{}, fmt.Errorf("refresh VM %q after resize: %w", vm.VM.Name, err)
+	}
+	info, err := p.vmInfo(vm, nil)
+	if err != nil {
+		return cloud.VM{}, err
+	}
+	if info == nil {
+		return cloud.VM{}, fmt.Errorf("VM %q disappeared during the resize", id)
+	}
+	if info.OSDiskGB == 0 {
+		info.OSDiskGB = systemDiskGB(vm)
+	}
+	return *info, nil
+}
+
+// systemDiskGB is the size of the system disk (bus 0/unit 0), which is what
+// spec.flavor.osDiskGB describes. vmResources sums all disks instead, so it
+// cannot be used for a flavor comparison.
+func systemDiskGB(vm *govcd.VM) int32 {
+	if vm == nil || vm.VM == nil || vm.VM.VmSpecSection == nil || vm.VM.VmSpecSection.DiskSection == nil {
+		return 0
+	}
+	for _, disk := range vm.VM.VmSpecSection.DiskSection.DiskSettings {
+		if disk != nil && disk.BusNumber == 0 && disk.UnitNumber == 0 {
+			return int32((disk.SizeMb + 1023) / 1024)
+		}
+	}
+	return 0
+}
+
 // AddPoolMember adds ip to an NSX-V edge load-balancer pool. It is
 // idempotent: an address that is already a member is left untouched.
 func (p *Provider) AddPoolMember(ctx context.Context, pool cloud.PoolRef, ip string) error {
@@ -582,6 +728,7 @@ func (p *Provider) vmInfo(vm *govcd.VM, selector map[string]string) (*cloud.VM, 
 		CPU:        cpu,
 		MemoryMB:   memMB,
 		DiskGB:     diskGB,
+		OSDiskGB:   systemDiskGB(vm),
 		Metadata:   metadata,
 	}, nil
 }

@@ -147,7 +147,7 @@ func TestMergeNodesKeepsNodeReportedResources(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	nodes, err := mergeNodes(pool, []cloud.VM{{
+	nodes, _, err := mergeNodes(pool, []cloud.VM{{
 		Name: "pool-wrk-01", IP: "192.168.100.7", CPU: 2, MemoryMB: 8192, DiskGB: 50,
 	}}, alloc)
 	if err != nil {

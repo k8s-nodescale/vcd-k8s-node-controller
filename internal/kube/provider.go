@@ -35,6 +35,8 @@ type Provider interface {
 	WaitReady(ctx context.Context, name string, timeout time.Duration) error
 	// Cordon marks the node unschedulable. It is idempotent.
 	Cordon(ctx context.Context, name string) error
+	// Uncordon clears the unschedulable mark. It is idempotent.
+	Uncordon(ctx context.Context, name string) error
 	// Drain evicts the evictable pods of a node through the eviction API, so
 	// PodDisruptionBudgets are honoured. It returns ErrDrainIncomplete when
 	// pods are still present when the (short) pass budget expires; the caller

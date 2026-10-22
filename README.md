@@ -64,6 +64,21 @@ Implemented:
 - Exactly one status write per pass, with conflicts treated as "retry next
   pass". Two writes per pass used to make the controller fight its own
   resourceVersion and never converge.
+- Drift and reconciliation policy: a worker whose VM disappears keeps its slot
+  (same name, address reserved) as `Missing` and is reported; `AutoHeal` instead
+  recreates it in place with a bounded retry budget. See
+  [Drift and the reconciliation policy](#drift-missing-workers-and-the-reconciliation-policy).
+- `scaleDown.allowLastWorker` with `scaleDown.minReplicas: 0` empties the pool
+  (refused on the controller's own node and on node-local volumes), and the chart
+  exposes `replicaCount`, `nodeSelector`, `tolerations`, `affinity`,
+  `priorityClassName` and `dnsPolicy` so the controller can live on the control
+  plane.
+- Rolling compute-spec changes: `spec.flavor` is the desired shape and
+  `status.nodes[].flavor` the observed one; a mismatch drives the worker through
+  cordon -> pool out -> drain -> power off -> resize -> power on -> Ready ->
+  uncordon, resumable from `status`, bounded by `rollout.maxUnavailable`. A
+  shrink is reported as `UnsupportedChange`. See
+  [Rolling compute-spec changes](#rolling-compute-spec-changes).
 
 Not implemented yet:
 
@@ -112,20 +127,32 @@ One `K8sWorkerPool` describes the worker set of a single cluster. You own
 | `scaleDown.drainTimeout` | no | Budget for cordon+drain of one worker (default `10m`). When it expires the worker is `Failed` and its VM is kept. |
 | `scaleDown.deleteWorkers[]` | no | Worker names to remove regardless of their position. Each entry is drained and deleted, then removed from this list and `spec.replicas` is decremented so the worker is **not** recreated. |
 | `scaleDown.force` | no | Skip the node-local volume guard. Per-node override: annotation `infra.example.com/force-delete=true`. Never skips PDBs or the detach wait. |
+| `scaleDown.allowLastWorker` | no | Permit a request that leaves the pool with zero workers. Needs `scaleDown.minReplicas: 0`. Refused anyway on the worker the controller runs on and on node-local volumes. |
+| `reconciliation.policy` | no | `Notify` (default) or `AutoHeal`. What happens when a worker's VM disappears outside the controller. |
+| `reconciliation.autoHealRetries` | no | Recreations AutoHeal attempts for one slot before parking it as `Failed` (default `3`). |
+| `reconciliation.autoHealBackoff` | no | Minimum time between two AutoHeal attempts for the same slot (default `2m`). |
+| `rollout.strategy` | no | `Rolling` (default) applies `spec.flavor` automatically; `Manual` only to workers annotated `infra.example.com/resize=allow`. |
+| `rollout.maxUnavailable` | no | How many workers may be out of service at once during a roll (int or percentage, default `1`). PDBs are the real brake. |
+| `rollout.order` | no | `Descending` (default, highest ordinal first) or `Ascending`. |
+| `rollout.pauseOnFailure` | no | Stop the roll when a worker does not come back (default `true`). |
+| `rollout.readyTimeout` | no | How long a resized worker may take to become Ready (default `10m`). |
 
 `status`:
 
 | Field | Meaning |
 | --- | --- |
-| `observedReplicas` | Workers the controller knows about (VM exists). |
+| `observedReplicas` | Worker **slots** the controller knows about: VMs that exist plus slots whose VM disappeared and stay reserved (`Missing` / parked `Failed`). |
 | `ledger.nextIndex` / `used[]` / `free[]` | Address book. `used` holds every allocated worker IP; addresses of deleted VMs are never released automatically. |
-| `nodes[]` | Per worker: `name` (the vCD VM name), `nodeName` (the Kubernetes Node object name, lower case - the only name the controller passes to the Kubernetes API), `ip`, `vmID`, `phase`, `cpu`, `memoryMB`, `diskGB`, `k8sReady`, `kubeletVersion`, `message`, `deleteStartedAt`. `message` is where a blocked removal explains itself (the PDB, the attached volume, the local PV). |
-| `conditions[]` | `Ready`, with reason `Converged` (`3/3 workers Ready`), `Progressing` while a worker is not Ready yet, `ScaleUpFailed` or `InvalidSpec` on errors. |
+| `nodes[]` | Per worker: `name` (the vCD VM name), `nodeName` (the Kubernetes Node object name, lower case - the only name the controller passes to the Kubernetes API), `ip`, `vmID`, `phase`, `cpu`, `memoryMB`, `diskGB`, `k8sReady`, `kubeletVersion`, `message`, `deleteStartedAt`, `flavor` (what the VM actually runs with, read back from vCD), `healAttempts` / `healLastAttempt` (the AutoHeal budget), `resize` (the per-worker rollout step). `message` is where a blocked removal explains itself (the PDB, the attached volume, the local PV). |
+| `rollout` | `phase` (`Idle`, `Progressing`, `Paused`), `targetFlavor`, `workersTotal`, `workersDone`, `currentWorker`, `lastError`, `startedAt`. |
+| `conditions[]` | `Ready`, with reason `Converged` (`3/3 workers Ready`), `Progressing` while a worker is not Ready yet, `WorkerMissing` when a slot lost its VM, `LastWorkerProtected` / `WorkerHostsController` on a refused emptying, `RolloutInProgress` while a roll holds the pool, `UnsupportedChange` for a shrink, plus `ScaleUpFailed`, `ScaleDownFailed`, `RolloutFailed` and `InvalidSpec` on errors. |
 
 Phases: `Provisioning` (VM created, Node not registered yet) -> `Joining` (Node
 registered, not Ready) -> `Ready`. Removal uses `Draining` (cordon, pool
 removal, pod eviction) -> `Deleting` (detach wait, Node and VM deletion).
-`Failed` means the drain hit `drainTimeout` and the VM was kept.
+`Resizing` marks a worker inside a rollout. `Missing` means the VM disappeared
+outside the controller and its slot is reserved; `Failed` means either the drain
+hit `drainTimeout` (VM kept) or AutoHeal exhausted its attempts.
 
 Example (placeholder org, network and template; nothing cluster-specific):
 
@@ -426,6 +453,49 @@ Notes:
 > `status.nodes[].nodeName` and every Kubernetes call uses it, and the guest is
 > powered off before the Node object is deleted.
 
+### Rolling compute-spec changes
+
+`spec.flavor` is what a worker should be; `status.nodes[].flavor` is what its VM
+actually runs with, read back from vCD on every pass. A difference between them
+is a roll-out candidate, so the loop also notices a VM somebody resized by hand.
+
+    kubectl -n vcd-nodescale-system patch k8sworkerpool default --type merge -p '{"spec":{"flavor":{"cpus":8,"memoryMB":16384}}}'
+    kubectl -n vcd-nodescale-system get k8sworkerpool default -o custom-columns=PHASE:.status.rollout.phase,DONE:.status.rollout.workersDone,TOTAL:.status.rollout.workersTotal,NOW:.status.rollout.currentWorker
+
+Each worker goes through the removal pipeline with a resize in the middle
+instead of a delete:
+
+    cordon (nodeName) -> ingress pool out -> drain (PDB) -> VolumeAttachment wait
+      -> power off VM -> grow CPU/memory/system disk -> power on
+      -> wait Node Ready and the flavor to match -> uncordon -> ingress pool in
+
+One worker at a time by default. `rollout.maxUnavailable` (int or percentage)
+lets a batch be out of service together; PDBs remain the real brake, and a batch
+whose drain cannot finish keeps retrying with the reason in
+`status.nodes[].resize.message`. `rollout.order: Ascending` rolls `wrk-01`
+first instead of last.
+
+Every step is persisted before it is attempted, so a controller restart in the
+middle of a roll resumes at the same worker instead of starting over - the same
+mechanism that makes a named removal resumable.
+
+While a roll runs, scale-in and `deleteWorkers` are refused with
+`RolloutInProgress`; scale-up is allowed and only adds capacity. A worker that
+does not come back within `rollout.readyTimeout` (default `10m`) is parked as
+`Failed` with its VM intact, and with `rollout.pauseOnFailure: true` (the
+default) the whole roll pauses there: `status.rollout.phase: Paused` and
+`lastError` name the worker. Resolve it (usually `deleteWorkers`, then let the
+pool create a fresh worker at the current spec) and the roll resumes.
+
+Shrinking is refused by vCD for CPU/memory and would destroy data for a disk, so
+it is a recreate, not a resize: the pool reports `Ready=False` with reason
+`UnsupportedChange` and touches nothing. Use `deleteWorkers` to replace such
+a worker at the smaller shape.
+
+`strategy: Manual` disables automatic rolls: only workers annotated
+`infra.example.com/resize=allow` are resized, which suits environments where
+the maintenance window matters more than the API.
+
 ## Ownership
 
 The pool owns every VM in `spec.vcd.vApp` whose name starts with
@@ -443,19 +513,17 @@ Consequences worth knowing:
 - A VM created outside the pool that happens to match the prefix (a manual
   clone, a `terraform apply` that re-creates a removed worker) is adopted on the
   next pass and counted towards `spec.replicas`.
-- Until 0.4.0 adoption is silent and a worker adopted in the current pass is a
-  scale-down candidate in that pass. From 0.4.0 adoption raises a
-  `WorkerAdopted` event and a worker adopted in the current pass is skipped by the
-  scale-down of that pass, so an outside `apply` cannot turn into "the controller
-  deleted a different worker". Until then, do not create `<prefix>-wrk-*` VMs by
-  hand.
+- Adoption is visible: a VM that enters `status.nodes` for the first time
+  raises a `WorkerAdopted` event, and a worker adopted in the current pass is
+  skipped by the scale-down of that pass, so an outside `apply` cannot turn into
+  "the controller deleted a different worker".
 - Because ownership is by prefix, the Terraform workers are the pool's workers
   too; see the Terraform integration contract below for how to remove one.
 
 ## Drift, missing workers and the reconciliation policy
 
-Status quo in 0.3.x: a worker that disappears without a request is replaced
-immediately and silently. `status.observedReplicas` simply drops, the pool sees
+0.3.x behaviour, for the record: a worker that disappeared without a request
+was replaced immediately and silently. `status.observedReplicas` simply drops, the pool sees
 `spec.replicas > observed` and provisions a new worker - under a new address and
 therefore a new name, because the vanished worker's address stays reserved in
 `status.ledger.used`. A `deleteWorkers` entry that names an already-absent
@@ -463,7 +531,7 @@ worker is pruned without touching `replicas`, which then triggers that
 replacement. Nothing reports the hole: the pool just converges to a smaller,
 differently named cluster.
 
-Planned for 0.4.0: `spec.reconciliation.policy`.
+The behaviour is decided by `spec.reconciliation.policy`.
 
 | Value | Meaning |
 | --- | --- |
@@ -483,16 +551,20 @@ worker and its IP) instead of quietly shrinking to the new reality.
 
 | Situation | `Notify` | `AutoHeal` |
 | --- | --- | --- |
-| VM gone, Node object gone or stale | report, keep the slot reserved, create nothing | recreate the worker in its slot, then delete the stale Node object |
+| VM gone, Node object gone or stale | report, keep the slot reserved, create nothing | recreate the worker in its slot; the new kubelet re-registers the same Node object |
 | Node object gone, VM alive | report; the message carries the manual command | reboot the guest once and let kubelet re-register |
 | `deleteWorkers` names a worker that is already gone | prune the entry and set `spec.replicas` to the observed count, so the CR is lined up with reality and nothing is created | same: an explicit removal always wins over healing |
 | `spec.replicas` lowered while a slot is already missing | write the missing slot off, no running worker is deleted | same |
 
-The reserved address is not lost either way: the next scale-out consumes missing
-slots first, so a worker that comes back keeps the name and address it had.
-`AutoHeal` is bounded - exponential back-off between attempts and a retry limit,
-after which the slot is parked as `Failed` with the reason and nothing else is
-retried - so a broken template cannot spin.
+The reserved address belongs to that slot: writing the slot off (a scale-in, or
+a `deleteWorkers` entry naming it) frees the address, and an `AutoHeal` refills
+it with the same name. A plain scale-out never steals a reserved address, so a
+missing worker cannot be silently replaced by a differently named successor.
+`AutoHeal` is bounded - a fixed back-off (`reconciliation.autoHealBackoff`,
+default `2m`) between attempts and a retry limit
+(`reconciliation.autoHealRetries`, default `3`), after which the slot is parked
+as `Failed` with the reason and nothing else is retried - so a broken template
+cannot spin.
 
 ### Controller placement, the last worker, and scale from zero
 
@@ -590,7 +662,7 @@ the pool instead), and a worker whose `hostPath`/`local` PVs would be destroyed
 ## Terraform integration contract
 
 - The Terraform module installs this chart behind a `node_controller.enabled`
-  toggle and pins `chart_version` / `image_tag` (currently `0.3.2`).
+  toggle and pins `chart_version` / `image_tag` (currently `0.5.0`).
 - **Once the controller is enabled, do not use Terraform to manage worker count
   or worker LB pool membership.** Use the CRD instead. The Terraform module's
   README must state this explicitly.
@@ -621,20 +693,19 @@ architecture, algorithms and open questions.
    only cannot edit the pool).
 4. Finalizers, e2e on a dev tenant (2 -> 4 -> 2 via the CRD, and a named
    deletion in the middle of the pool).
-5. `spec.reconciliation.policy: Notify|AutoHeal` (default `Notify`), the `Missing`
-   phase, reserved slots, bounded `AutoHeal` retries and the `WorkerAdopted`
-   event.
-6. Control-plane placement as a first-class option: `nodeSelector`, `tolerations`,
-   `replicaCount`, `priorityClassName` and `dnsPolicy` in the chart and in the
-   Terraform module, so `scaleDown.minReplicas: 0` and scale-from-zero work; plus
-   `scaleDown.allowLastWorker` so emptying the pool is an explicit decision and
-   `LastWorkerProtected` for the case where the controller still runs on a pool
-   worker.
-7. Rolling compute-spec changes (0.5.0): when `spec.flavor` no longer matches
-   what a worker runs with, take it through drain -> power off -> resize the VM ->
-   power on -> wait Ready -> uncordon, one worker at a time by default or in
-   batches limited by `maxUnavailable`, with the rollout resumable from
-   `status.rollout`. Design notes in `docs/conception.md` section 10.6.
+5. ~~`spec.reconciliation.policy: Notify|AutoHeal`, the `Missing` phase,
+   reserved slots, bounded `AutoHeal` retries and the `WorkerAdopted` event.~~
+   Landed in 0.5.0.
+6. ~~Control-plane placement (`nodeSelector`, `tolerations`, `replicaCount`,
+   `priorityClassName`, `dnsPolicy`) and `scaleDown.allowLastWorker` with
+   `LastWorkerProtected` / `WorkerHostsController`.~~ Landed in 0.5.0 (the
+   Terraform module still has to pass the placement values through).
+7. ~~Rolling compute-spec changes: drain -> power off -> resize -> power on ->
+   Ready -> uncordon, batched by `maxUnavailable`, resumable from
+   `status.rollout`.~~ Landed in 0.5.0; work notes in `docs/conception.md`
+   section 10.6.
+8. Template changes and shrinks as a recreate into the same ledger slot (the
+   natural 0.6 candidate).
 
 ## Container image
 
@@ -645,7 +716,7 @@ Build locally (the Dockerfile uses `golang:1.27.1-alpine` and
 `gcr.io/distroless/static:nonroot`):
 
 ```
-docker build -t docker.io/werton13/vcd-k8s-node-controller:0.3.2 .
+docker build -t docker.io/werton13/vcd-k8s-node-controller:0.5.0 .
 ```
 
 Public module defaults are used inside the build. On a restricted network,
@@ -655,14 +726,14 @@ override them:
 docker build \
   --build-arg GOPROXY=https://nexus.example.com/repository/golang/ \
   --build-arg GOSUMDB=off \
-  -t docker.io/werton13/vcd-k8s-node-controller:0.3.2 .
+  -t docker.io/werton13/vcd-k8s-node-controller:0.5.0 .
 ```
 
 Push (or use `make image-push`):
 
 ```
 docker login docker.io
-docker push docker.io/werton13/vcd-k8s-node-controller:0.3.2
+docker push docker.io/werton13/vcd-k8s-node-controller:0.5.0
 docker push docker.io/werton13/vcd-k8s-node-controller:latest
 ```
 

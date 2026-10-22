@@ -2,10 +2,11 @@ package v1alpha1
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
 // NodePhase describes the lifecycle phase of a managed worker node.
-// +kubebuilder:validation:Enum=Pending;Provisioning;Joining;Ready;Draining;Deleting;Failed
+// +kubebuilder:validation:Enum=Pending;Provisioning;Joining;Ready;Missing;Resizing;Draining;Deleting;Failed
 type NodePhase string
 
 const (
@@ -16,6 +17,44 @@ const (
 	NodePhaseDraining     NodePhase = "Draining"
 	NodePhaseDeleting     NodePhase = "Deleting"
 	NodePhaseFailed       NodePhase = "Failed"
+	// NodePhaseMissing marks a slot whose VM is gone from vCD. The address
+	// stays reserved and the name stays claimed; the pool reports the loss
+	// instead of provisioning a replacement under a new name.
+	NodePhaseMissing NodePhase = "Missing"
+	// NodePhaseResizing marks a worker the rollout is taking through
+	// cordon -> drain -> power off -> resize -> power on -> Ready.
+	NodePhaseResizing NodePhase = "Resizing"
+)
+
+// Reconciliation policies.
+const (
+	// ReconciliationNotify reports a worker that disappeared outside the
+	// controller and keeps its slot reserved. It never creates a VM for it.
+	ReconciliationNotify = "Notify"
+	// ReconciliationAutoHeal recreates a missing worker into its own slot
+	// (same name, same address) with bounded retries.
+	ReconciliationAutoHeal = "AutoHeal"
+)
+
+// Rollout strategies and orders.
+const (
+	RolloutStrategyRolling = "Rolling"
+	RolloutStrategyManual  = "Manual"
+
+	RolloutOrderDescending = "Descending"
+	RolloutOrderAscending  = "Ascending"
+
+	// ResizeAnnotation opts a single worker into a Manual rollout:
+	// kubectl annotate node <worker> infra.example.com/resize=allow
+	ResizeAnnotation = "infra.example.com/resize"
+)
+
+// Rollout phases reported in status.rollout.
+const (
+	RolloutPhaseIdle        = "Idle"
+	RolloutPhaseProgressing = "Progressing"
+	RolloutPhasePaused      = "Paused"
+	RolloutPhaseFailed      = "Failed"
 )
 
 // K8sWorkerPoolSpec defines the desired worker pool.
@@ -30,7 +69,9 @@ type K8sWorkerPoolSpec struct {
 	// Bootstrap carries OS/cloud-init inputs used to render new worker user-data.
 	Bootstrap BootstrapConfig `json:"bootstrap,omitempty"`
 
-	// Flavor describes the compute and disk shape of a worker.
+	// Flavor describes the compute and disk shape of a worker. It is the
+	// source of truth for a rollout: a worker whose VM does not match it is a
+	// resize candidate (see spec.rollout).
 	Flavor NodeFlavor `json:"flavor"`
 
 	// VCD points at the target vCloud Director objects.
@@ -48,6 +89,73 @@ type K8sWorkerPoolSpec struct {
 
 	// ScaleDown controls safe removal of workers.
 	ScaleDown ScaleDownPolicy `json:"scaleDown,omitempty"`
+
+	// Reconciliation controls what happens when a worker's VM disappears
+	// outside the controller (deleted by hand in vCD, or lost with a vCD
+	// failure). The default, Notify, keeps the slot reserved and reports it.
+	// +optional
+	Reconciliation ReconciliationPolicy `json:"reconciliation,omitempty"`
+
+	// Rollout controls compute-spec changes (CPU, memory, system disk). The
+	// zero value means a Rolling rollout, one worker at a time.
+	// +optional
+	Rollout RolloutPolicy `json:"rollout,omitempty"`
+}
+
+// ReconciliationPolicy decides what the controller does with a worker whose VM
+// is gone from vCD.
+type ReconciliationPolicy struct {
+	// Policy is Notify or AutoHeal.
+	// +kubebuilder:validation:Enum=Notify;AutoHeal
+	// +kubebuilder:default=Notify
+	// +optional
+	Policy string `json:"policy,omitempty"`
+
+	// AutoHealRetries is how many recreations AutoHeal attempts for a slot
+	// before parking it as Failed. Only used with policy AutoHeal.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=3
+	// +optional
+	AutoHealRetries int32 `json:"autoHealRetries,omitempty"`
+
+	// AutoHealBackoff is the minimum time between two AutoHeal attempts for
+	// the same slot.
+	// +kubebuilder:default="2m"
+	// +optional
+	AutoHealBackoff metav1.Duration `json:"autoHealBackoff,omitempty"`
+}
+
+// RolloutPolicy controls how spec.flavor changes are applied to existing workers.
+type RolloutPolicy struct {
+	// Strategy is Rolling (resize automatically) or Manual (only workers
+	// annotated infra.example.com/resize=allow are resized).
+	// +kubebuilder:validation:Enum=Rolling;Manual
+	// +kubebuilder:default=Rolling
+	// +optional
+	Strategy string `json:"strategy,omitempty"`
+
+	// MaxUnavailable bounds how many workers may be out of service at once.
+	// It is an upper bound only: PodDisruptionBudgets are the real brake.
+	// +kubebuilder:default=1
+	// +optional
+	MaxUnavailable intstr.IntOrString `json:"maxUnavailable,omitempty"`
+
+	// Order picks which end of the pool is rolled first. Descending (the
+	// default) resizes the highest ordinal first, so wrk-01 moves last.
+	// +kubebuilder:validation:Enum=Descending;Ascending
+	// +kubebuilder:default=Descending
+	// +optional
+	Order string `json:"order,omitempty"`
+
+	// PauseOnFailure stops the rollout when a worker does not come back.
+	// +kubebuilder:default=true
+	// +optional
+	PauseOnFailure *bool `json:"pauseOnFailure,omitempty"`
+
+	// ReadyTimeout bounds how long a resized worker may take to become Ready.
+	// +kubebuilder:default="10m"
+	// +optional
+	ReadyTimeout metav1.Duration `json:"readyTimeout,omitempty"`
 }
 
 // BootstrapConfig carries the OS-level inputs for generated cloud-init.
@@ -156,7 +264,8 @@ type ScaleDownPolicy struct {
 	// cordon, ingress-pool removal, PDB-aware drain, volume-detach check, then
 	// node and VM deletion. When the worker is gone the entry is removed from
 	// this list and spec.replicas is decremented, so the worker is not
-	// recreated. Unknown names are dropped with a warning event.
+	// recreated. Unknown names are dropped with a warning event; naming a
+	// worker that is already gone only aligns spec.replicas with reality.
 	// +optional
 	DeleteWorkers []string `json:"deleteWorkers,omitempty"`
 
@@ -166,6 +275,15 @@ type ScaleDownPolicy struct {
 	// infra.example.com/force-delete=true.
 	// +optional
 	Force bool `json:"force,omitempty"`
+
+	// AllowLastWorker permits a request that would leave the pool with zero
+	// workers. Emptying the pool is a deliberate owner decision: every pod on
+	// the last worker is evicted (PDBs still decide whether it can finish) and
+	// the cluster keeps only the control plane. It requires minReplicas: 0.
+	// Two refusals survive the flag because they are not policy: the worker
+	// this controller itself runs on, and a worker holding node-local volumes.
+	// +optional
+	AllowLastWorker bool `json:"allowLastWorker,omitempty"`
 }
 
 // K8sWorkerPoolStatus is the observed state.
@@ -174,6 +292,7 @@ type K8sWorkerPoolStatus struct {
 	Ledger           IPLedger           `json:"ledger,omitempty"`
 	Nodes            []WorkerNodeStatus `json:"nodes,omitempty"`
 	Conditions       []metav1.Condition `json:"conditions,omitempty"`
+	Rollout          RolloutStatus      `json:"rollout,omitempty"`
 }
 
 // IPLedger is the persistent IP allocation ledger.
@@ -204,10 +323,56 @@ type WorkerNodeStatus struct {
 	KubeletVersion string    `json:"kubeletVersion,omitempty"`
 	Message        string    `json:"message,omitempty"`
 
+	// Flavor is what the VM actually runs with, read back from vCD. It is the
+	// rollout's observed side: spec.flavor is the desired side.
+	// +optional
+	Flavor *FlavorStatus `json:"flavor,omitempty"`
+
 	// DeleteStartedAt anchors the scaleDown.drainTimeout budget for a worker
 	// that is being removed. It is cleared when the worker leaves status.
 	// +optional
 	DeleteStartedAt *metav1.Time `json:"deleteStartedAt,omitempty"`
+
+	// HealAttempts counts AutoHeal attempts for a missing slot. It is reset
+	// when the slot becomes Ready again.
+	// +optional
+	HealAttempts int32 `json:"healAttempts,omitempty"`
+
+	// HealLastAttempt is when AutoHeal last acted on this slot.
+	// +optional
+	HealLastAttempt *metav1.Time `json:"healLastAttempt,omitempty"`
+
+	// Resize tracks the rollout of this worker, when one is in progress.
+	// +optional
+	Resize *ResizeStatus `json:"resize,omitempty"`
+}
+
+// FlavorStatus is the compute shape a VM runs with, as reported by vCD.
+type FlavorStatus struct {
+	CPUs     int32 `json:"cpus,omitempty"`
+	MemoryMB int32 `json:"memoryMB,omitempty"`
+	OSDiskGB int32 `json:"osDiskGB,omitempty"`
+}
+
+// ResizeStatus is the per-worker rollout state.
+type ResizeStatus struct {
+	// Phase is Cordoned, Draining, Stopped, Resizing, Booting, WaitingReady,
+	// Done or Failed.
+	Phase     string       `json:"phase,omitempty"`
+	StartedAt *metav1.Time `json:"startedAt,omitempty"`
+	Message   string       `json:"message,omitempty"`
+}
+
+// RolloutStatus is the pool-wide rollout state.
+type RolloutStatus struct {
+	// Phase is Idle, Progressing, Paused or Failed.
+	Phase         string        `json:"phase,omitempty"`
+	TargetFlavor  *FlavorStatus `json:"targetFlavor,omitempty"`
+	WorkersTotal  int32         `json:"workersTotal,omitempty"`
+	WorkersDone   int32         `json:"workersDone,omitempty"`
+	CurrentWorker string        `json:"currentWorker,omitempty"`
+	LastError     string        `json:"lastError,omitempty"`
+	StartedAt     *metav1.Time  `json:"startedAt,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -216,6 +381,7 @@ type WorkerNodeStatus struct {
 // +kubebuilder:printcolumn:name="Desired",type=integer,JSONPath=`.spec.replicas`
 // +kubebuilder:printcolumn:name="Observed",type=integer,JSONPath=`.status.observedReplicas`
 // +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
+// +kubebuilder:printcolumn:name="Rollout",type=string,JSONPath=`.status.rollout.phase`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // K8sWorkerPool is the Schema for the k8sworkerpools API.

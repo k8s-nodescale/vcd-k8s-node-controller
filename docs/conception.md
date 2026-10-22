@@ -372,8 +372,8 @@ then `kubeadm join`. Validate with `cloud-init schema --annotate`.
 
 ## 10. Reconciliation policy, ownership and placement (0.4.0 design)
 
-These entries extend section 3 and are the agreed direction; 0.3.2 implements
-only the correction in 10.4.
+These entries extend section 3. 0.3.2 shipped only the correction in 10.4;
+0.5.0 implements 10.1-10.6 as written here, with the deviations noted in 10.7.
 
 ### 10.1 Ownership — DECIDED: everything with the prefix, no metadata check
 
@@ -390,9 +390,10 @@ bootstrap workers are removed **through Terraform** (`workers.vm_count`) with
 is unsupported: Terraform would recreate the VM at the address the pool just
 freed and handed to another worker.
 
-Planned additions: a `WorkerAdopted` event, and a rule that a worker adopted in
-the current pass is not a scale-down candidate in that pass, so an outside
-`terraform apply` cannot turn into "the controller deleted a different worker".
+Implemented in 0.5.0: a `WorkerAdopted` event when a VM enters `status.nodes`
+for the first time, and the rule that a worker adopted in the current pass is not
+a scale-down candidate in that pass, so an outside `terraform apply` cannot turn
+into "the controller deleted a different worker".
 
 ### 10.2 Missing workers — DECIDED: `spec.reconciliation.policy: Notify | AutoHeal`
 
@@ -410,9 +411,11 @@ provisioning a replacement under a new name (which is what 0.3.x does, because
   reality, nothing is created. A count-based scale-in writes off a missing slot
   before it considers removing a live worker.
 - `AutoHeal`: recreate the slot (same name, same address) with bounded retries
-  (back-off + limit, then park as `Failed` with the reason). "VM alive, Node
-  object gone" is repaired by one guest reboot. A worker with a pending removal
-  is never healed.
+  - `reconciliation.autoHealBackoff` (fixed, default `2m`) between attempts and
+  `reconciliation.autoHealRetries` (default `3`) attempts, then park the slot
+  as `Failed` with the reason. "VM alive, Node object gone" is repaired by one
+  guest reboot under the same budget. A worker with a pending removal is never
+  healed.
 
 Rejected alternatives: healing by default (creates VMs, i.e. state and cost, on
 a transient vCD hiccup, and hides a pattern of outside deletions); freeing the
@@ -437,10 +440,15 @@ can go 0 -> N. With the controller on a pool worker the last worker is refused
 (`LastWorkerProtected`, detected by comparing the request with the controller's
 own Pod `spec.nodeName` from the downward API).
 
+Implemented in 0.5.0: the chart exposes `replicaCount`, `nodeSelector`,
+`tolerations`, `affinity`, `priorityClassName` and `dnsPolicy`, and the
+controller reads its own Pod through the downward API (`POD_NAME` /
+`POD_NAMESPACE`) for the last-worker guard.
+
 Open: whether a dedicated non-pool worker is preferable to the control plane in
-environments where the masters are small; the placement values
-(`nodeSelector`, `tolerations`, `replicaCount`, `priorityClassName`, `dnsPolicy`) must be exposed
-by both the chart and the Terraform module.
+environments where the masters are small, and the Terraform module still has to
+pass the placement values through to the chart (the chart values are there; the
+module variables and the `terraform.tfvars` pins are 0.5.0 release work).
 
 ### 10.4 Node object deletion — DECIDED: only with a power-off, only for owned workers
 
@@ -492,7 +500,7 @@ controller itself runs on (the pass would die with it), and a worker with
 `local`/`hostPath` PVs (`scaleDown.force` overrides only that check, never a
 PDB).
 
-### 10.6 Rolling compute-spec change — PLANNED for 0.5.0
+### 10.6 Rolling compute-spec change — IMPLEMENTED in 0.5.0
 
 Goal: change CPU, memory or disk of the workers with no redeploy of the cluster
 and no manual vCD work.
@@ -557,7 +565,7 @@ escape is the existing `deleteWorkers` path: replace the worker, then resume.
 ```yaml
 spec:
   flavor:
-    numCpus: 8
+    cpus: 8
     memoryMB: 16384
     osDiskGB: 40
   rollout:
@@ -569,7 +577,7 @@ spec:
 status:
   rollout:
     phase: Progressing
-    targetFlavor: {numCpus: 8, memoryMB: 16384, osDiskGB: 40}
+    targetFlavor: {cpus: 8, memoryMB: 16384, osDiskGB: 40}
     workersTotal: 3
     workersDone: 1
     currentWorker: KION-WEB-DEV-wrk-02
@@ -577,11 +585,44 @@ status:
 ```
 
 `strategy: Manual` rolls nothing until the owner marks one worker with
-`node-controller.io/resize: allow` - for environments where the window matters more
+`infra.example.com/resize=allow` - for environments where the window matters more
 than the API.
 
 **Later.** A template change or a shrink is a recreate: drain, power off, delete
 the VM, create a new one from the new spec **into the same ledger slot**, so the
 name and the address are preserved. The ledger is what makes that possible, and
 it is the natural 0.6 candidate.
+
+### 10.7 Implementation notes and deviations (0.5.0)
+
+What the code does, where it differs from the design above:
+
+- **Drains inside a batch are serialized.** `rollout.maxUnavailable` decides how
+  many workers may be *out of service* together (they are cordoned, drained and
+  stopped one after another inside the pass loop), not how many drains run in
+  parallel goroutines. The bound that matters - relocation headroom - is
+  enforced by the eviction API and PDBs, not by concurrency, and serializing
+  keeps one status write per pass.
+- **One step per pass per worker.** A worker advances at most one step per
+  reconcile (`Cordoned` -> `Stopped` -> `Booting` -> done), which is what makes
+  a controller restart mid-roll resume instead of restarting the worker.
+- **Ready is verified against vCD, not the Node's capacity.** After the power-on
+  the controller waits for `Ready=True` and for the flavor it read back from vCD
+  to equal `spec.flavor`; the Node's allocatable is not used as the resize
+  oracle, because it does not change until kubelet re-reads the new shape.
+- **The system disk grows through the VM spec section** (`VcdVmSpecSection`), CPU
+  and memory through `ChangeCPUCount`/`ChangeMemorySize`; the disk is applied
+  first so the spec-section write cannot carry the pre-resize CPU/memory back.
+- **Shrink is refused per worker.** `Ready=False` with reason
+  `UnsupportedChange`, no changes to the VM; replace the worker with
+  `deleteWorkers` instead.
+- **`AutoHeal` uses a fixed back-off**, not exponential (section 10.2). Bounded
+  attempts are what stop a broken template; a fixed interval is easier to reason
+  about and to observe in events.
+- **A missing slot is written off, not reused, by a plain scale-out.** A reserved
+  address is only freed by an explicit removal (scale-in or `deleteWorkers`) and
+  only refilled by `AutoHeal`; otherwise a scale-out would silently resurrect a
+  worker nobody asked to bring back.
+- **Placement lives in the chart, not the CRD.** The pool does not decide where
+  the controller runs; the chart values do.
 

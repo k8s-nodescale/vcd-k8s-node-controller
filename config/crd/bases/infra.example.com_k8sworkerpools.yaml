@@ -3,7 +3,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.23.0
+    controller-gen.kubebuilder.io/version: v0.19.0
   name: k8sworkerpools.infra.example.com
 spec:
   group: infra.example.com
@@ -25,6 +25,9 @@ spec:
       type: integer
     - jsonPath: .status.conditions[?(@.type=="Ready")].status
       name: Ready
+      type: string
+    - jsonPath: .status.rollout.phase
+      name: Rollout
       type: string
     - jsonPath: .metadata.creationTimestamp
       name: Age
@@ -76,7 +79,10 @@ spec:
                     type: string
                 type: object
               flavor:
-                description: Flavor describes the compute and disk shape of a worker.
+                description: |-
+                  Flavor describes the compute and disk shape of a worker. It is the
+                  source of truth for a rollout: a worker whose VM does not match it is a
+                  resize candidate (see spec.rollout).
                 properties:
                   cpus:
                     format: int32
@@ -205,14 +211,94 @@ spec:
                 description: NamePrefix is the DNS-safe prefix used to build worker
                   names (e.g. myorg-cluster-prod).
                 type: string
+              reconciliation:
+                description: |-
+                  Reconciliation controls what happens when a worker's VM disappears
+                  outside the controller (deleted by hand in vCD, or lost with a vCD
+                  failure). The default, Notify, keeps the slot reserved and reports it.
+                properties:
+                  autoHealBackoff:
+                    default: 2m
+                    description: |-
+                      AutoHealBackoff is the minimum time between two AutoHeal attempts for
+                      the same slot.
+                    type: string
+                  autoHealRetries:
+                    default: 3
+                    description: |-
+                      AutoHealRetries is how many recreations AutoHeal attempts for a slot
+                      before parking it as Failed. Only used with policy AutoHeal.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  policy:
+                    default: Notify
+                    description: Policy is Notify or AutoHeal.
+                    enum:
+                    - Notify
+                    - AutoHeal
+                    type: string
+                type: object
               replicas:
                 description: Replicas is the desired number of worker nodes.
                 format: int32
                 minimum: 0
                 type: integer
+              rollout:
+                description: |-
+                  Rollout controls compute-spec changes (CPU, memory, system disk). The
+                  zero value means a Rolling rollout, one worker at a time.
+                properties:
+                  maxUnavailable:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    default: 1
+                    description: |-
+                      MaxUnavailable bounds how many workers may be out of service at once.
+                      It is an upper bound only: PodDisruptionBudgets are the real brake.
+                    x-kubernetes-int-or-string: true
+                  order:
+                    default: Descending
+                    description: |-
+                      Order picks which end of the pool is rolled first. Descending (the
+                      default) resizes the highest ordinal first, so wrk-01 moves last.
+                    enum:
+                    - Descending
+                    - Ascending
+                    type: string
+                  pauseOnFailure:
+                    default: true
+                    description: PauseOnFailure stops the rollout when a worker does
+                      not come back.
+                    type: boolean
+                  readyTimeout:
+                    default: 10m
+                    description: ReadyTimeout bounds how long a resized worker may
+                      take to become Ready.
+                    type: string
+                  strategy:
+                    default: Rolling
+                    description: |-
+                      Strategy is Rolling (resize automatically) or Manual (only workers
+                      annotated infra.example.com/resize=allow are resized).
+                    enum:
+                    - Rolling
+                    - Manual
+                    type: string
+                type: object
               scaleDown:
                 description: ScaleDown controls safe removal of workers.
                 properties:
+                  allowLastWorker:
+                    description: |-
+                      AllowLastWorker permits a request that would leave the pool with zero
+                      workers. Emptying the pool is a deliberate owner decision: every pod on
+                      the last worker is evicted (PDBs still decide whether it can finish) and
+                      the cluster keeps only the control plane. It requires minReplicas: 0.
+                      Two refusals survive the flag because they are not policy: the worker
+                      this controller itself runs on, and a worker holding node-local volumes.
+                    type: boolean
                   deleteWorkers:
                     description: |-
                       DeleteWorkers names specific workers to remove, in order, regardless of
@@ -220,7 +306,8 @@ spec:
                       cordon, ingress-pool removal, PDB-aware drain, volume-detach check, then
                       node and VM deletion. When the worker is gone the entry is removed from
                       this list and spec.replicas is decremented, so the worker is not
-                      recreated. Unknown names are dropped with a warning event.
+                      recreated. Unknown names are dropped with a warning event; naming a
+                      worker that is already gone only aligns spec.replicas with reality.
                     items:
                       type: string
                     type: array
@@ -355,6 +442,32 @@ spec:
                     diskGB:
                       format: int32
                       type: integer
+                    flavor:
+                      description: |-
+                        Flavor is what the VM actually runs with, read back from vCD. It is the
+                        rollout's observed side: spec.flavor is the desired side.
+                      properties:
+                        cpus:
+                          format: int32
+                          type: integer
+                        memoryMB:
+                          format: int32
+                          type: integer
+                        osDiskGB:
+                          format: int32
+                          type: integer
+                      type: object
+                    healAttempts:
+                      description: |-
+                        HealAttempts counts AutoHeal attempts for a missing slot. It is reset
+                        when the slot becomes Ready again.
+                      format: int32
+                      type: integer
+                    healLastAttempt:
+                      description: HealLastAttempt is when AutoHeal last acted on
+                        this slot.
+                      format: date-time
+                      type: string
                     ip:
                       type: string
                     k8sReady:
@@ -386,10 +499,27 @@ spec:
                       - Provisioning
                       - Joining
                       - Ready
+                      - Missing
+                      - Resizing
                       - Draining
                       - Deleting
                       - Failed
                       type: string
+                    resize:
+                      description: Resize tracks the rollout of this worker, when
+                        one is in progress.
+                      properties:
+                        message:
+                          type: string
+                        phase:
+                          description: |-
+                            Phase is Cordoned, Draining, Stopped, Resizing, Booting, WaitingReady,
+                            Done or Failed.
+                          type: string
+                        startedAt:
+                          format: date-time
+                          type: string
+                      type: object
                     vmID:
                       type: string
                   required:
@@ -399,6 +529,40 @@ spec:
               observedReplicas:
                 format: int32
                 type: integer
+              rollout:
+                description: RolloutStatus is the pool-wide rollout state.
+                properties:
+                  currentWorker:
+                    type: string
+                  lastError:
+                    type: string
+                  phase:
+                    description: Phase is Idle, Progressing, Paused or Failed.
+                    type: string
+                  startedAt:
+                    format: date-time
+                    type: string
+                  targetFlavor:
+                    description: FlavorStatus is the compute shape a VM runs with,
+                      as reported by vCD.
+                    properties:
+                      cpus:
+                        format: int32
+                        type: integer
+                      memoryMB:
+                        format: int32
+                        type: integer
+                      osDiskGB:
+                        format: int32
+                        type: integer
+                    type: object
+                  workersDone:
+                    format: int32
+                    type: integer
+                  workersTotal:
+                    format: int32
+                    type: integer
+                type: object
             required:
             - observedReplicas
             type: object

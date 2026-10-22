@@ -28,6 +28,9 @@ type fakeCloud struct {
 	poweredOff      []string
 	events          *[]string
 	poolRemovals    []string
+	cycles          []string
+	resizes         []string
+	failResize      bool
 	calls           int
 	failAt          int
 	failAfterCreate bool
@@ -82,6 +85,44 @@ func (f *fakeCloud) DeleteVM(ctx context.Context, vappName, id string) error {
 	f.vms = kept
 	return nil
 }
+func (f *fakeCloud) PowerOnVM(ctx context.Context, vappName, id string) error {
+	if f.events != nil {
+		*f.events = append(*f.events, "cloud:poweron "+id)
+	}
+	return nil
+}
+
+func (f *fakeCloud) CycleVM(ctx context.Context, vappName, id string) error {
+	f.cycles = append(f.cycles, id)
+	if f.events != nil {
+		*f.events = append(*f.events, "cloud:cycle "+id)
+	}
+	return nil
+}
+
+func (f *fakeCloud) ResizeVM(ctx context.Context, vappName, id string, cpus, memoryMB, osDiskGB int32) (cloud.VM, error) {
+	f.resizes = append(f.resizes, id)
+	if f.failResize {
+		return cloud.VM{}, errors.New("injected resize failure")
+	}
+	for i := range f.vms {
+		if f.vms[i].ID != id {
+			continue
+		}
+		if cpus > 0 {
+			f.vms[i].CPU = cpus
+		}
+		if memoryMB > 0 {
+			f.vms[i].MemoryMB = memoryMB
+		}
+		if osDiskGB > 0 {
+			f.vms[i].OSDiskGB = osDiskGB
+		}
+		return f.vms[i], nil
+	}
+	return cloud.VM{}, errors.New("VM not found: " + id)
+}
+
 func (f *fakeCloud) AddPoolMember(ctx context.Context, pool cloud.PoolRef, ip string) error {
 	return nil
 }
@@ -121,6 +162,13 @@ func (f *fakeKube) Cordon(ctx context.Context, name string) error {
 	f.cordoned = append(f.cordoned, name)
 	return nil
 }
+func (f *fakeKube) Uncordon(ctx context.Context, name string) error {
+	if f.events != nil {
+		*f.events = append(*f.events, "kube:uncordon "+name)
+	}
+	return nil
+}
+
 func (f *fakeKube) Drain(ctx context.Context, name string, timeout time.Duration) error {
 	if f.drainErr != nil {
 		return f.drainErr

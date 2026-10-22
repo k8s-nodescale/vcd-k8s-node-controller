@@ -128,10 +128,17 @@ func (r *WorkerPoolReconciler) runDeletions(ctx context.Context, pool *infrav1.K
 	for _, req := range requests {
 		idx := nodeIndex(pool.Status.Nodes, req.name)
 		if idx < 0 {
-			// The VM is already gone: satisfy the request so it does not sit
-			// in the spec forever.
+			// The worker is already gone (its slot was written off, or the VM
+			// vanished): satisfy the request so it does not sit in the spec
+			// forever, and line spec.replicas up with what is left. Nothing is
+			// created to replace it.
 			if req.inSpec {
 				pruneDeleteWorker(pool, req.name)
+				if pool.Spec.Replicas > int32(len(pool.Status.Nodes)) {
+					pool.Spec.Replicas = int32(len(pool.Status.Nodes))
+				}
+				r.eventf(pool, corev1.EventTypeNormal, "WorkerDeleteRequestPruned",
+					fmt.Sprintf("worker %s is already gone; the request was dropped and spec.replicas aligned to %d", req.name, pool.Spec.Replicas))
 			}
 			continue
 		}
@@ -148,6 +155,30 @@ func (r *WorkerPoolReconciler) runDeletions(ctx context.Context, pool *infrav1.K
 func (r *WorkerPoolReconciler) deleteWorkerStep(ctx context.Context, pool *infrav1.K8sWorkerPool, alloc *ipam.Allocator, idx int, req deletionRequest) (bool, ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 	node := &pool.Status.Nodes[idx]
+
+	// A slot whose VM is already gone needs no drain and no cloud call: the
+	// request is satisfied by writing the slot off and releasing its address.
+	// Without this a named deletion of a vanished worker would try to power off
+	// an empty VM ID and park the pool in ScaleDownFailed.
+	if node.Phase == infrav1.NodePhaseMissing {
+		if node.IP != "" {
+			_ = alloc.Free(node.IP)
+		}
+		pool.Status.Ledger = toStatusLedger(alloc.Ledger())
+		pool.Status.Nodes = append(pool.Status.Nodes[:idx], pool.Status.Nodes[idx+1:]...)
+		pool.Status.ObservedReplicas--
+		pruneDeleteWorker(pool, node.Name)
+		if pool.Spec.Replicas > int32(len(pool.Status.Nodes)) {
+			pool.Spec.Replicas = int32(len(pool.Status.Nodes))
+		}
+		r.eventf(pool, corev1.EventTypeNormal, "WorkerWrittenOff",
+			fmt.Sprintf("missing worker %s (%s) written off; address released", node.Name, node.IP))
+		return true, ctrl.Result{RequeueAfter: deleteStepRequeue}, nil
+	}
+
+	// A failed resize left the worker cordoned and out of service; the removal
+	// pipeline takes it from here and the rollout must stop tracking it.
+	node.Resize = nil
 
 	// Every Kubernetes call below uses kubeName, never node.Name: name is the
 	// vCD VM name (KION-WEB-DEV-wrk-03), while kubelet registers the Node
@@ -173,13 +204,26 @@ func (r *WorkerPoolReconciler) deleteWorkerStep(ctx context.Context, pool *infra
 			fmt.Sprintf("retrying drain of %s with drainTimeout=%s", node.Name, budgetFor(pool)))
 	}
 
-	minReplicas := pool.Spec.ScaleDown.MinReplicas
-	if minReplicas > 0 && int32(len(pool.Status.Nodes)) <= minReplicas {
+	after := int32(len(pool.Status.Nodes)) - 1
+	if minReplicas := pool.Spec.ScaleDown.MinReplicas; minReplicas > 0 && after < minReplicas {
 		msg := fmt.Sprintf("refusing to delete %s: %d worker(s) would fall below scaleDown.minReplicas=%d",
-			node.Name, len(pool.Status.Nodes)-1, minReplicas)
+			node.Name, after, minReplicas)
 		node.Message = msg
 		r.setCondition(pool, metav1.ConditionFalse, "MinReplicasProtected", msg)
 		r.eventf(pool, corev1.EventTypeWarning, "MinReplicasProtected", msg)
+		return true, ctrl.Result{RequeueAfter: requeueConverged}, nil
+	}
+	// Emptying the pool is a deliberate owner decision: both conditions must
+	// be explicit, and two refusals survive the flag (the worker this pass runs
+	// on, and node-local volumes, checked below).
+	guardName := kubeName
+	if guardName == "" {
+		guardName = node.Name
+	}
+	if reason, msg := r.checkLastWorker(ctx, pool, guardName, int(after)); reason != "" {
+		node.Message = msg
+		r.setCondition(pool, metav1.ConditionFalse, reason, msg)
+		r.eventf(pool, corev1.EventTypeWarning, reason, msg)
 		return true, ctrl.Result{RequeueAfter: requeueConverged}, nil
 	}
 
@@ -314,12 +358,50 @@ func (r *WorkerPoolReconciler) deleteWorkerStep(ctx context.Context, pool *infra
 	}
 }
 
-// scaleDown removes n workers, highest ordinal first, never below minReplicas.
-func (r *WorkerPoolReconciler) scaleDown(ctx context.Context, pool *infrav1.K8sWorkerPool, alloc *ipam.Allocator, n int32) (bool, ctrl.Result, error) {
+// scaleDown removes n workers, highest ordinal first. A missing slot is
+// written off before a live worker is considered, and a worker adopted in this
+// pass is never a candidate: an outside terraform apply must not turn into
+// "the controller removed a different worker".
+func (r *WorkerPoolReconciler) scaleDown(ctx context.Context, pool *infrav1.K8sWorkerPool, alloc *ipam.Allocator, n int32, adopted []string) (bool, ctrl.Result, error) {
+	skip := make(map[string]bool, len(adopted))
+	for _, name := range adopted {
+		skip[strings.ToLower(name)] = true
+	}
+
+	// A slot whose VM disappeared costs nothing to write off: no drain, no VM
+	// to delete, only the ledger entry and the status row. Doing this first is
+	// what keeps a count-based scale-in from removing a live worker while the
+	// corpse of a vanished one still holds an address.
+	remaining := n
+	for i := 0; i < len(pool.Status.Nodes) && remaining > 0; {
+		node := pool.Status.Nodes[i]
+		if node.Phase != infrav1.NodePhaseMissing {
+			i++
+			continue
+		}
+		if node.IP != "" {
+			_ = alloc.Free(node.IP)
+		}
+		pool.Status.Ledger = toStatusLedger(alloc.Ledger())
+		pool.Status.Nodes = append(pool.Status.Nodes[:i], pool.Status.Nodes[i+1:]...)
+		pool.Status.ObservedReplicas--
+		pruneDeleteWorker(pool, node.Name)
+		r.eventf(pool, corev1.EventTypeNormal, "WorkerWrittenOff",
+			fmt.Sprintf("missing worker %s (%s) written off; address released", node.Name, node.IP))
+		remaining--
+	}
+	if remaining == 0 {
+		return true, ctrl.Result{RequeueAfter: deleteStepRequeue}, nil
+	}
+
 	candidates := make([]infrav1.WorkerNodeStatus, 0, len(pool.Status.Nodes))
 	for _, node := range pool.Status.Nodes {
 		switch node.Phase {
-		case infrav1.NodePhaseDraining, infrav1.NodePhaseDeleting, infrav1.NodePhaseFailed:
+		case infrav1.NodePhaseDraining, infrav1.NodePhaseDeleting, infrav1.NodePhaseFailed,
+			infrav1.NodePhaseMissing, infrav1.NodePhaseResizing:
+			continue
+		}
+		if skip[strings.ToLower(node.Name)] {
 			continue
 		}
 		candidates = append(candidates, node)
@@ -343,24 +425,37 @@ func (r *WorkerPoolReconciler) scaleDown(ctx context.Context, pool *infrav1.K8sW
 	}
 
 	minReplicas := pool.Spec.ScaleDown.MinReplicas
+	guard := false
 	var requests []deletionRequest
 	for _, node := range candidates {
-		if int32(len(requests)) >= n {
+		if int32(len(requests)) >= remaining {
 			break
 		}
-		if minReplicas > 0 && int32(len(pool.Status.Nodes)-len(requests)) <= minReplicas {
-			msg := fmt.Sprintf("scale-down stopped at %d worker(s): scaleDown.minReplicas=%d", len(pool.Status.Nodes)-len(requests), minReplicas)
+		left := int32(len(pool.Status.Nodes) - len(requests) - 1)
+		if minReplicas > 0 && left < minReplicas {
+			msg := fmt.Sprintf("scale-down stopped at %d worker(s): scaleDown.minReplicas=%d", left+1, minReplicas)
 			r.setCondition(pool, metav1.ConditionFalse, "MinReplicasProtected", msg)
 			r.eventf(pool, corev1.EventTypeWarning, "MinReplicasProtected", msg)
+			guard = true
+			break
+		}
+		if reason, msg := r.checkLastWorker(ctx, pool, strings.ToLower(node.Name), int(left)); reason != "" {
+			r.setCondition(pool, metav1.ConditionFalse, reason, msg)
+			r.eventf(pool, corev1.EventTypeWarning, reason, msg)
+			guard = true
 			break
 		}
 		requests = append(requests, deletionRequest{name: node.Name})
 	}
 	if len(requests) == 0 {
-		// Every candidate was already being removed, or minReplicas stopped
-		// the scale-down (the condition is already set): do not fall through
-		// to the readiness/condition pass and overwrite it.
-		return true, ctrl.Result{RequeueAfter: requeueConverged}, nil
+		if guard {
+			// A policy refused the removal and its condition must not be
+			// overwritten by the readiness pass in this same reconcile.
+			return true, ctrl.Result{RequeueAfter: requeueConverged}, nil
+		}
+		// Every candidate is already being removed or was adopted in this
+		// pass: let the readiness pass report progress.
+		return false, ctrl.Result{}, nil
 	}
 	return r.runDeletions(ctx, pool, alloc, requests)
 }
