@@ -14,10 +14,10 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	infrav1 "github.com/werton13/vcd-k8s-node-controller/api/v1alpha1"
-	"github.com/werton13/vcd-k8s-node-controller/internal/cloud"
-	"github.com/werton13/vcd-k8s-node-controller/internal/ipam"
-	"github.com/werton13/vcd-k8s-node-controller/internal/kube"
+	infrav1 "github.com/k8s-nodescale/vcd-k8s-node-controller/api/v1alpha1"
+	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/cloud"
+	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/ipam"
+	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/kube"
 )
 
 // Per-worker rollout phases, persisted in status.nodes[].resize.phase so a
@@ -314,7 +314,7 @@ func (r *WorkerPoolReconciler) advanceResize(ctx context.Context, pool *infrav1.
 		if err := r.Kube.WaitVolumesDetached(ctx, kubeName, volumeWaitTimeout); err != nil {
 			return err
 		}
-		if err := r.Cloud.PowerOffVM(ctx, pool.Spec.VCD.VApp, n.VMID); err != nil {
+		if err := r.Cloud.PowerOffVM(ctx, pool.Spec.VCD.VApp, n.ProviderID); err != nil {
 			return fmt.Errorf("stop %s: %w", n.Name, err)
 		}
 		n.Resize.Phase = resizePhaseStopped
@@ -323,11 +323,11 @@ func (r *WorkerPoolReconciler) advanceResize(ctx context.Context, pool *infrav1.
 		return nil
 
 	case resizePhaseStopped:
-		vm, err := r.Cloud.ResizeVM(ctx, pool.Spec.VCD.VApp, n.VMID, target.CPUs, target.MemoryMB, target.OSDiskGB)
+		vm, err := r.Cloud.ResizeVM(ctx, pool.Spec.VCD.VApp, n.ProviderID, target.CPUs, target.MemoryMB, target.OSDiskGB)
 		if err != nil {
 			return fmt.Errorf("resize %s: %w", n.Name, err)
 		}
-		if err := r.Cloud.PowerOnVM(ctx, pool.Spec.VCD.VApp, n.VMID); err != nil {
+		if err := r.Cloud.PowerOnVM(ctx, pool.Spec.VCD.VApp, n.ProviderID); err != nil {
 			return fmt.Errorf("power on %s: %w", n.Name, err)
 		}
 		n.Flavor = &infrav1.FlavorStatus{CPUs: vm.CPU, MemoryMB: vm.MemoryMB, OSDiskGB: vm.OSDiskGB}
@@ -412,7 +412,7 @@ func (r *WorkerPoolReconciler) finishResize(ctx context.Context, pool *infrav1.K
 }
 
 // resizeAllowed lists the workers opted into a Manual rollout through the
-// infra.example.com/resize=allow annotation.
+// k8s-nodescale.github.io/resize=allow annotation.
 func (r *WorkerPoolReconciler) resizeAllowed(ctx context.Context) (map[string]bool, error) {
 	nodes, err := r.Kube.ListNodes(ctx)
 	if err != nil {

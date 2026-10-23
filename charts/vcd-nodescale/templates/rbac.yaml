@@ -4,13 +4,13 @@ kind: ClusterRole
 metadata:
   name: {{ include "vcd-nodescale.fullname" . }}-manager-role
 rules:
-  - apiGroups: ["infra.example.com"]
+  - apiGroups: ["k8s-nodescale.github.io"]
     resources: ["k8sworkerpools"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  - apiGroups: ["infra.example.com"]
+  - apiGroups: ["k8s-nodescale.github.io"]
     resources: ["k8sworkerpools/status"]
     verbs: ["get", "update", "patch"]
-  - apiGroups: ["infra.example.com"]
+  - apiGroups: ["k8s-nodescale.github.io"]
     resources: ["k8sworkerpools/finalizers"]
     verbs: ["update"]
   - apiGroups: [""]

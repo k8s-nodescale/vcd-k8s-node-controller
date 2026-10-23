@@ -44,9 +44,14 @@ const (
 	RolloutOrderDescending = "Descending"
 	RolloutOrderAscending  = "Ascending"
 
+	// AnnotationDomain is both the API group and the prefix of every node
+	// annotation the controller reads. Nothing provider-specific belongs in
+	// this namespace: these annotations describe a Kubernetes node, not a VM.
+	AnnotationDomain = "k8s-nodescale.github.io"
+
 	// ResizeAnnotation opts a single worker into a Manual rollout:
-	// kubectl annotate node <worker> infra.example.com/resize=allow
-	ResizeAnnotation = "infra.example.com/resize"
+	// kubectl annotate node <worker> k8s-nodescale.github.io/resize=allow
+	ResizeAnnotation = AnnotationDomain + "/resize"
 )
 
 // Rollout phases reported in status.rollout.
@@ -128,7 +133,7 @@ type ReconciliationPolicy struct {
 // RolloutPolicy controls how spec.flavor changes are applied to existing workers.
 type RolloutPolicy struct {
 	// Strategy is Rolling (resize automatically) or Manual (only workers
-	// annotated infra.example.com/resize=allow are resized).
+	// annotated k8s-nodescale.github.io/resize=allow are resized).
 	// +kubebuilder:validation:Enum=Rolling;Manual
 	// +kubebuilder:default=Rolling
 	// +optional
@@ -210,14 +215,22 @@ type VCDRef struct {
 	OrgNetwork string `json:"orgNetwork"`
 	Catalog    string `json:"catalog,omitempty"`
 	CatalogOrg string `json:"catalogOrg,omitempty"`
+
+	// DVMOffset is the address offset of the deployment VM, the bootstrap
+	// host Terraform creates. The controller reserves that address so no
+	// worker is ever handed it. It lives here rather than in spec.ipPlan
+	// because only the vCD bootstrap has a DVM; the address plan itself is
+	// provider-neutral.
+	// +optional
+	DVMOffset int `json:"dvmOffset,omitempty"`
 }
 
-// IPPlan mirrors Terraform's ip_plan variable.
+// IPPlan mirrors Terraform's ip_plan variable. It carries only the
+// provider-neutral address plan.
 type IPPlan struct {
 	CIDR        string   `json:"cidr"`
 	MNodeOffset int      `json:"mNodeOffset,omitempty"`
 	WNodeOffset int      `json:"wNodeOffset,omitempty"`
-	DVMOffset   int      `json:"dvmOffset,omitempty"`
 	KubeAPILB   int      `json:"kubeapiLB,omitempty"`
 	IngressLB   int      `json:"ingressLB,omitempty"`
 	MasterCount int32    `json:"masterCount,omitempty"`
@@ -255,6 +268,12 @@ type IngressPool struct {
 
 // ScaleDownPolicy controls safe removal of workers.
 type ScaleDownPolicy struct {
+	// MinReplicas is the floor for the workers that can serve traffic. A
+	// removal that would take a serving worker out and leave fewer than this
+	// many is refused; writing off a slot whose VM is already gone takes
+	// nothing out of service and is never refused by the floor. It defaults to
+	// 1: emptying the pool has to be asked for with minReplicas: 0.
+	// +kubebuilder:default=1
 	// +kubebuilder:validation:Minimum=0
 	MinReplicas  int32           `json:"minReplicas,omitempty"`
 	DrainTimeout metav1.Duration `json:"drainTimeout,omitempty"`
@@ -272,16 +291,18 @@ type ScaleDownPolicy struct {
 	// Force skips the data-loss guard for node-local volumes (hostPath/local
 	// PVs that would become unreadable). It never skips PDBs or the detach
 	// check. The same can be requested per node with the annotation
-	// infra.example.com/force-delete=true.
+	// k8s-nodescale.github.io/force-delete=true.
 	// +optional
 	Force bool `json:"force,omitempty"`
 
 	// AllowLastWorker permits a request that would leave the pool with zero
 	// workers. Emptying the pool is a deliberate owner decision: every pod on
 	// the last worker is evicted (PDBs still decide whether it can finish) and
-	// the cluster keeps only the control plane. It requires minReplicas: 0.
-	// Two refusals survive the flag because they are not policy: the worker
-	// this controller itself runs on, and a worker holding node-local volumes.
+	// the cluster keeps only the control plane. It requires minReplicas: 0; a
+	// spec that sets this flag with a higher floor is rejected as InvalidSpec
+	// instead of accepting a flag that could never be honoured. Two refusals
+	// survive the flag because they are not policy: the worker this controller
+	// itself runs on, and a worker holding node-local volumes.
 	// +optional
 	AllowLastWorker bool `json:"allowLastWorker,omitempty"`
 }
@@ -312,9 +333,14 @@ type WorkerNodeStatus struct {
 	// detach wait, Node delete) must use this name: passing Name asks for an
 	// object that does not exist and the call silently does nothing.
 	// +optional
-	NodeName       string    `json:"nodeName,omitempty"`
-	IP             string    `json:"ip,omitempty"`
-	VMID           string    `json:"vmID,omitempty"`
+	NodeName string `json:"nodeName,omitempty"`
+	IP       string `json:"ip,omitempty"`
+	// ProviderID is the VM's identifier in the underlying platform, in the
+	// form that platform owns (today: the vCD VM id, urn:vcloud:vm:...).
+	// The controller only hands it back to the provider, so a second
+	// platform needs no change to this field.
+	// +optional
+	ProviderID     string    `json:"providerID,omitempty"`
 	Phase          NodePhase `json:"phase,omitempty"`
 	CPU            int32     `json:"cpu,omitempty"`
 	MemoryMB       int32     `json:"memoryMB,omitempty"`

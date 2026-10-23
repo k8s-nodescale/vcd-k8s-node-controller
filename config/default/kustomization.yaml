@@ -4,7 +4,7 @@ kind: Kustomization
 namespace: vcd-nodescale-system
 
 resources:
-  - ../crd/bases/infra.example.com_k8sworkerpools.yaml
+  - ../crd/bases/k8s-nodescale.github.io_k8sworkerpools.yaml
   - ../manager/namespace.yaml
   - ../rbac/service_account.yaml
   - ../rbac/role.yaml

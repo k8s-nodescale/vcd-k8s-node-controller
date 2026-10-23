@@ -27,11 +27,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	infrav1 "github.com/werton13/vcd-k8s-node-controller/api/v1alpha1"
-	"github.com/werton13/vcd-k8s-node-controller/internal/cloud"
-	"github.com/werton13/vcd-k8s-node-controller/internal/cloudinit"
-	"github.com/werton13/vcd-k8s-node-controller/internal/ipam"
-	"github.com/werton13/vcd-k8s-node-controller/internal/kube"
+	infrav1 "github.com/k8s-nodescale/vcd-k8s-node-controller/api/v1alpha1"
+	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/cloud"
+	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/cloudinit"
+	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/ipam"
+	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/kube"
 )
 
 const (
@@ -69,9 +69,9 @@ type WorkerPoolReconciler struct {
 	ownNode *string
 }
 
-// +kubebuilder:rbac:groups=infra.example.com,resources=k8sworkerpools,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=infra.example.com,resources=k8sworkerpools/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=infra.example.com,resources=k8sworkerpools/finalizers,verbs=update
+// +kubebuilder:rbac:groups=k8s-nodescale.github.io,resources=k8sworkerpools,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=k8s-nodescale.github.io,resources=k8sworkerpools/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=k8s-nodescale.github.io,resources=k8sworkerpools/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;delete
 // +kubebuilder:rbac:groups="",resources=pods/eviction,verbs=create
@@ -144,7 +144,7 @@ func (r *WorkerPoolReconciler) reconcile(ctx context.Context, pool *infrav1.K8sW
 	}
 	actual := ownedWorkerVMs(pool, all)
 
-	alloc, err := ipam.New(toIPAMPlan(pool.Spec.IPPlan), toIPAMLedger(pool.Status.Ledger))
+	alloc, err := ipam.New(toIPAMPlan(pool.Spec.IPPlan, pool.Spec.VCD), toIPAMLedger(pool.Status.Ledger))
 	if err != nil {
 		r.setCondition(pool, metav1.ConditionFalse, "InvalidIPPlan", err.Error())
 		return ctrl.Result{RequeueAfter: requeueInvalidSpec}, nil
@@ -314,7 +314,7 @@ func (r *WorkerPoolReconciler) refreshReadiness(ctx context.Context, pool *infra
 		if st.DeleteStartedAt != nil || st.Phase == infrav1.NodePhaseMissing || st.Resize != nil {
 			continue
 		}
-		if st.VMID == "" && st.Phase == infrav1.NodePhaseFailed {
+		if st.ProviderID == "" && st.Phase == infrav1.NodePhaseFailed {
 			continue
 		}
 		info, ok := byName[strings.ToLower(st.Name)]
@@ -324,7 +324,7 @@ func (r *WorkerPoolReconciler) refreshReadiness(ctx context.Context, pool *infra
 			st.NodeName = info.Name
 		}
 		switch {
-		case !ok && st.NodeName != "" && st.VMID != "":
+		case !ok && st.NodeName != "" && st.ProviderID != "":
 			// The VM is alive but its Node object is gone: kubelet lost its
 			// registration (stopped, certificates rotated away, or the Node was
 			// deleted by hand). Only a reboot repairs that; Notify reports it
@@ -539,6 +539,9 @@ func (r *WorkerPoolReconciler) validateSpec(pool *infrav1.K8sWorkerPool) string 
 	if r.VDC != "" && pool.Spec.VCD.VDC != "" && !strings.EqualFold(r.VDC, pool.Spec.VCD.VDC) {
 		return fmt.Sprintf("spec.vcd.vdc %q does not match the controller VDC %q (VCD_VDC)", pool.Spec.VCD.VDC, r.VDC)
 	}
+	if pool.Spec.ScaleDown.AllowLastWorker && pool.Spec.ScaleDown.MinReplicas > 0 {
+		return "spec.scaleDown.allowLastWorker requires spec.scaleDown.minReplicas: 0: the flag could never be honoured while the floor is higher"
+	}
 	for k, v := range pool.Spec.Join.Labels {
 		if errs := utilvalidation.IsQualifiedName(k); len(errs) > 0 {
 			return fmt.Sprintf("spec.join.labels key %q is invalid: %s", k, strings.Join(errs, "; "))
@@ -580,7 +583,7 @@ func mergeNodes(pool *infrav1.K8sWorkerPool, vms []cloud.VM, alloc *ipam.Allocat
 			}
 			node.IP = vm.IP
 		}
-		node.VMID = vm.ID
+		node.ProviderID = vm.ID
 		if node.Phase == "" {
 			node.Phase = infrav1.NodePhaseProvisioning
 		}
@@ -645,13 +648,13 @@ func (r *WorkerPoolReconciler) scaleUp(ctx context.Context, pool *infrav1.K8sWor
 			memMB = pool.Spec.Flavor.MemoryMB
 		}
 		pool.Status.Nodes = append(pool.Status.Nodes, infrav1.WorkerNodeStatus{
-			Name:     name,
-			IP:       ip,
-			VMID:     vm.ID,
-			Phase:    infrav1.NodePhaseProvisioning,
-			CPU:      cpu,
-			MemoryMB: memMB,
-			DiskGB:   vm.DiskGB,
+			Name:       name,
+			IP:         ip,
+			ProviderID: vm.ID,
+			Phase:      infrav1.NodePhaseProvisioning,
+			CPU:        cpu,
+			MemoryMB:   memMB,
+			DiskGB:     vm.DiskGB,
 			Flavor: &infrav1.FlavorStatus{
 				CPUs:     vm.CPU,
 				MemoryMB: vm.MemoryMB,
@@ -660,7 +663,7 @@ func (r *WorkerPoolReconciler) scaleUp(ctx context.Context, pool *infrav1.K8sWor
 		})
 		pool.Status.ObservedReplicas = int32(len(pool.Status.Nodes))
 		pool.Status.Ledger = toStatusLedger(alloc.Ledger())
-		logger.Info("created worker", "node", name, "ip", ip, "vmID", vm.ID)
+		logger.Info("created worker", "node", name, "ip", ip, "providerID", vm.ID)
 	}
 	return nil
 }
@@ -869,12 +872,12 @@ func buildJoinCommand(endpoint, token, caHash string) (string, error) {
 	return fmt.Sprintf("kubeadm join %s --token %s --discovery-token-ca-cert-hash %s", endpoint, token, caHash), nil
 }
 
-func toIPAMPlan(p infrav1.IPPlan) ipam.Plan {
+func toIPAMPlan(p infrav1.IPPlan, v infrav1.VCDRef) ipam.Plan {
 	return ipam.Plan{
 		CIDR:        p.CIDR,
 		MNodeOffset: p.MNodeOffset,
 		WNodeOffset: p.WNodeOffset,
-		DVMOffset:   p.DVMOffset,
+		DVMOffset:   v.DVMOffset,
 		KubeAPILB:   p.KubeAPILB,
 		IngressLB:   p.IngressLB,
 		MasterCount: p.MasterCount,

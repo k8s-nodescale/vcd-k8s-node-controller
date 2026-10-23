@@ -13,11 +13,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
-	infrav1 "github.com/werton13/vcd-k8s-node-controller/api/v1alpha1"
-	"github.com/werton13/vcd-k8s-node-controller/internal/cloud"
-	"github.com/werton13/vcd-k8s-node-controller/internal/cloudinit"
-	"github.com/werton13/vcd-k8s-node-controller/internal/ipam"
-	"github.com/werton13/vcd-k8s-node-controller/internal/kube"
+	infrav1 "github.com/k8s-nodescale/vcd-k8s-node-controller/api/v1alpha1"
+	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/cloud"
+	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/cloudinit"
+	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/ipam"
+	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/kube"
 )
 
 // newTestReconcilerWithFuncs is newTestReconciler plus client interceptors, so a
@@ -116,7 +116,7 @@ func TestReconcileRetriesStatusConflictQuietly(t *testing.T) {
 	fk := &fakeKube{nodes: readyNodes("pool-wrk-01", "pool-wrk-02")}
 	fc := &fakeCloud{}
 	conflict := apierrors.NewConflict(
-		schema.GroupResource{Group: "infra.example.com", Resource: "k8sworkerpools"},
+		schema.GroupResource{Group: "k8s-nodescale.github.io", Resource: "k8sworkerpools"},
 		pool.Name, errors.New("the object has been modified"))
 	funcs := interceptor.Funcs{
 		SubResourceUpdate: func(ctx context.Context, c client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
@@ -143,7 +143,7 @@ func TestMergeNodesKeepsNodeReportedResources(t *testing.T) {
 		Name: "pool-wrk-01", IP: "192.168.100.7", Phase: infrav1.NodePhaseReady,
 		CPU: 2, MemoryMB: 7841, K8sReady: true,
 	}}
-	alloc, err := ipam.New(toIPAMPlan(pool.Spec.IPPlan), toIPAMLedger(pool.Status.Ledger))
+	alloc, err := ipam.New(toIPAMPlan(pool.Spec.IPPlan, pool.Spec.VCD), toIPAMLedger(pool.Status.Ledger))
 	if err != nil {
 		t.Fatal(err)
 	}

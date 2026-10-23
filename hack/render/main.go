@@ -13,7 +13,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/werton13/vcd-k8s-node-controller/internal/cloudinit"
+	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/cloudinit"
 )
 
 type diskSpec struct {

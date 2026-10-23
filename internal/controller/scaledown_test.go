@@ -11,9 +11,9 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	infrav1 "github.com/werton13/vcd-k8s-node-controller/api/v1alpha1"
-	"github.com/werton13/vcd-k8s-node-controller/internal/cloud"
-	"github.com/werton13/vcd-k8s-node-controller/internal/kube"
+	infrav1 "github.com/k8s-nodescale/vcd-k8s-node-controller/api/v1alpha1"
+	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/cloud"
+	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/kube"
 )
 
 func workerVM(ordinal int, ip string) cloud.VM {

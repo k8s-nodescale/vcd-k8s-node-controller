@@ -11,7 +11,7 @@ import (
 	"github.com/vmware/go-vcloud-director/v2/govcd"
 	"github.com/vmware/go-vcloud-director/v2/types/v56"
 
-	"github.com/werton13/vcd-k8s-node-controller/internal/cloud"
+	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/cloud"
 )
 
 // Config holds vCD connection settings.

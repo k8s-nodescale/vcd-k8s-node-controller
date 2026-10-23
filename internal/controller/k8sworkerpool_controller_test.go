@@ -4,7 +4,7 @@ import (
 	"reflect"
 	"testing"
 
-	infrav1 "github.com/werton13/vcd-k8s-node-controller/api/v1alpha1"
+	infrav1 "github.com/k8s-nodescale/vcd-k8s-node-controller/api/v1alpha1"
 )
 
 func TestToCloudInitDisksOrdersByBusUnit(t *testing.T) {

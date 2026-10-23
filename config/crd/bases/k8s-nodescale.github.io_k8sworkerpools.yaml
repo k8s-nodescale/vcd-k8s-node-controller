@@ -4,9 +4,9 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.19.0
-  name: k8sworkerpools.infra.example.com
+  name: k8sworkerpools.k8s-nodescale.github.io
 spec:
-  group: infra.example.com
+  group: k8s-nodescale.github.io
   names:
     kind: K8sWorkerPool
     listKind: K8sWorkerPoolList
@@ -166,8 +166,6 @@ spec:
                 properties:
                   cidr:
                     type: string
-                  dvmOffset:
-                    type: integer
                   ingressLB:
                     type: integer
                   kubeapiLB:
@@ -281,7 +279,7 @@ spec:
                     default: Rolling
                     description: |-
                       Strategy is Rolling (resize automatically) or Manual (only workers
-                      annotated infra.example.com/resize=allow are resized).
+                      annotated k8s-nodescale.github.io/resize=allow are resized).
                     enum:
                     - Rolling
                     - Manual
@@ -295,9 +293,11 @@ spec:
                       AllowLastWorker permits a request that would leave the pool with zero
                       workers. Emptying the pool is a deliberate owner decision: every pod on
                       the last worker is evicted (PDBs still decide whether it can finish) and
-                      the cluster keeps only the control plane. It requires minReplicas: 0.
-                      Two refusals survive the flag because they are not policy: the worker
-                      this controller itself runs on, and a worker holding node-local volumes.
+                      the cluster keeps only the control plane. It requires minReplicas: 0; a
+                      spec that sets this flag with a higher floor is rejected as InvalidSpec
+                      instead of accepting a flag that could never be honoured. Two refusals
+                      survive the flag because they are not policy: the worker this controller
+                      itself runs on, and a worker holding node-local volumes.
                     type: boolean
                   deleteWorkers:
                     description: |-
@@ -318,9 +318,16 @@ spec:
                       Force skips the data-loss guard for node-local volumes (hostPath/local
                       PVs that would become unreadable). It never skips PDBs or the detach
                       check. The same can be requested per node with the annotation
-                      infra.example.com/force-delete=true.
+                      k8s-nodescale.github.io/force-delete=true.
                     type: boolean
                   minReplicas:
+                    default: 1
+                    description: |-
+                      MinReplicas is the floor for the workers that can serve traffic. A
+                      removal that would take a serving worker out and leave fewer than this
+                      many is refused; writing off a slot whose VM is already gone takes
+                      nothing out of service and is never refused by the floor. It defaults to
+                      1: emptying the pool has to be asked for with minReplicas: 0.
                     format: int32
                     minimum: 0
                     type: integer
@@ -332,6 +339,14 @@ spec:
                     type: string
                   catalogOrg:
                     type: string
+                  dvmOffset:
+                    description: |-
+                      DVMOffset is the address offset of the deployment VM, the bootstrap
+                      host Terraform creates. The controller reserves that address so no
+                      worker is ever handed it. It lives here rather than in spec.ipPlan
+                      because only the vCD bootstrap has a DVM; the address plan itself is
+                      provider-neutral.
+                    type: integer
                   org:
                     type: string
                   orgNetwork:
@@ -505,6 +520,13 @@ spec:
                       - Deleting
                       - Failed
                       type: string
+                    providerID:
+                      description: |-
+                        ProviderID is the VM's identifier in the underlying platform, in the
+                        form that platform owns (today: the vCD VM id, urn:vcloud:vm:...).
+                        The controller only hands it back to the provider, so a second
+                        platform needs no change to this field.
+                      type: string
                     resize:
                       description: Resize tracks the rollout of this worker, when
                         one is in progress.
@@ -520,8 +542,6 @@ spec:
                           format: date-time
                           type: string
                       type: object
-                    vmID:
-                      type: string
                   required:
                   - name
                   type: object

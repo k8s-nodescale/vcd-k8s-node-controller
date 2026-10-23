@@ -13,8 +13,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	infrav1 "github.com/werton13/vcd-k8s-node-controller/api/v1alpha1"
-	"github.com/werton13/vcd-k8s-node-controller/internal/ipam"
+	infrav1 "github.com/k8s-nodescale/vcd-k8s-node-controller/api/v1alpha1"
+	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/ipam"
 )
 
 const (
@@ -80,7 +80,7 @@ func (r *WorkerPoolReconciler) mergeMissingSlots(pool *infrav1.K8sWorkerPool, no
 		prev.Resize = nil
 		prev.Phase = infrav1.NodePhaseMissing
 		prev.K8sReady = false
-		prev.VMID = ""
+		prev.ProviderID = ""
 		prev.Message = fmt.Sprintf("VM is missing from vCD; slot %s (%s) stays reserved (reconciliation.policy=%s)",
 			prev.Name, prev.IP, policyFor(pool))
 		out = append(out, prev)
@@ -151,7 +151,7 @@ func (r *WorkerPoolReconciler) reconcileMissing(ctx context.Context, pool *infra
 				fmt.Sprintf("worker %s (%s): %v", n.Name, n.IP, err))
 			continue
 		}
-		n.VMID = vm.ID
+		n.ProviderID = vm.ID
 		n.Phase = infrav1.NodePhaseProvisioning
 		n.K8sReady = false
 		n.Message = ""
@@ -184,7 +184,7 @@ func (r *WorkerPoolReconciler) healLostNode(ctx context.Context, pool *infrav1.K
 		st.Message = "lost its Node registration; waiting for the AutoHeal backoff"
 		return
 	}
-	if err := r.Cloud.CycleVM(ctx, pool.Spec.VCD.VApp, st.VMID); err != nil {
+	if err := r.Cloud.CycleVM(ctx, pool.Spec.VCD.VApp, st.ProviderID); err != nil {
 		st.Message = "AutoHeal power-cycle failed: " + err.Error()
 		logger.Error(err, "AutoHeal power-cycle failed", "worker", st.Name)
 		r.eventf(pool, corev1.EventTypeWarning, "AutoHealFailed",
@@ -199,11 +199,54 @@ func (r *WorkerPoolReconciler) healLostNode(ctx context.Context, pool *infrav1.K
 		fmt.Sprintf("worker %s: VM power-cycled to re-register its Node object", st.Name))
 }
 
-// checkLastWorker returns a refusal reason when a request would empty the pool.
+// workerServes reports whether a slot can serve workloads now or once its
+// current step finishes. A Missing slot has no VM, a Failed slot is parked, and
+// a slot whose removal is under way is on its way out: none of them may be
+// counted when the policy asks how many workers the pool would keep.
+func workerServes(node *infrav1.WorkerNodeStatus) bool {
+	if node.DeleteStartedAt != nil {
+		return false
+	}
+	switch node.Phase {
+	case infrav1.NodePhaseMissing, infrav1.NodePhaseFailed,
+		infrav1.NodePhaseDraining, infrav1.NodePhaseDeleting:
+		return false
+	}
+	return true
+}
+
+// usableWorkers counts the slots that can serve workloads.
+func usableWorkers(nodes []infrav1.WorkerNodeStatus) int32 {
+	var n int32
+	for i := range nodes {
+		if workerServes(&nodes[i]) {
+			n++
+		}
+	}
+	return n
+}
+
+// removalGuard decides whether one worker may be removed.
+//
+// slotsAfter is the number of slots left once it is gone, so zero means the
+// request would empty the pool. removesUsable says the worker still counts as
+// able to serve, which is what makes its removal a real loss of capacity.
+//
+// minReplicas is a floor on workers able to serve, not on status rows: writing
+// off a slot whose VM is already gone takes nothing out of service, so the
+// floor never blocks that cleanup. Emptying the pool still needs the explicit
+// opt-in, because the pool would be left with nothing at all.
+//
 // Two refusals survive scaleDown.allowLastWorker because they are not policy:
-// the worker this controller runs on, and (elsewhere) node-local volumes.
-func (r *WorkerPoolReconciler) checkLastWorker(ctx context.Context, pool *infrav1.K8sWorkerPool, kubeName string, after int) (reason, msg string) {
-	if after > 0 {
+// the worker this controller runs on, and (checked by the caller) node-local
+// volumes that hold data.
+func (r *WorkerPoolReconciler) removalGuard(ctx context.Context, pool *infrav1.K8sWorkerPool, kubeName string, slotsAfter int, removesUsable bool, usableAfter int32) (reason, msg string) {
+	if minReplicas := pool.Spec.ScaleDown.MinReplicas; minReplicas > 0 && removesUsable && usableAfter < minReplicas {
+		return "MinReplicasProtected", fmt.Sprintf(
+			"refusing to delete %s: %d worker(s) able to serve would fall below scaleDown.minReplicas=%d",
+			kubeName, usableAfter, minReplicas)
+	}
+	if slotsAfter > 0 {
 		return "", ""
 	}
 	// The two explicit conditions: minReplicas: 0 and the flag.

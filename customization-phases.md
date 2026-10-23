@@ -210,7 +210,7 @@ Right now the only way to answer "which build baked this VM?" is `strings manage
    `# vcd-nodescale render=<version> hash=<12 hex> spec=<12 hex>`.
 3. VM metadata at creation (`scaleUp` 517-521): `render-hash`, `template-href`, `token-id`,
    `attempt`.
-4. Node label added by the controller after Ready: `infra.example.com/render-hash=<hash>`.
+4. Node label added by the controller after Ready: `k8s-nodescale.github.io/render-hash=<hash>`.
 5. `--render-only` flag (or `hack/render`) that prints user-data + initscript for a pool spec, with
    the generated output committed as golden files in `internal/cloudinit/testdata/`. Then a template
    change shows up as a reviewable diff, and `renderer_test.go` becomes a change-detector instead of

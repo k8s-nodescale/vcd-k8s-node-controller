@@ -15,23 +15,23 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	infrav1 "github.com/werton13/vcd-k8s-node-controller/api/v1alpha1"
-	"github.com/werton13/vcd-k8s-node-controller/internal/cloud"
-	"github.com/werton13/vcd-k8s-node-controller/internal/ipam"
-	"github.com/werton13/vcd-k8s-node-controller/internal/kube"
+	infrav1 "github.com/k8s-nodescale/vcd-k8s-node-controller/api/v1alpha1"
+	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/cloud"
+	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/ipam"
+	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/kube"
 )
 
 const (
 	// DeleteWorkerAnnotation marks a Node for removal on the next reconcile:
 	//
-	//	kubectl annotate node <worker> infra.example.com/delete-worker=true
+	//	kubectl annotate node <worker> k8s-nodescale.github.io/delete-worker=true
 	//
 	// The node is drained and its VM deleted; because spec.replicas is left
 	// alone, the pool then creates a replacement (rolling replacement).
 	// Use spec.scaleDown.deleteWorkers to remove a worker for good.
-	DeleteWorkerAnnotation = "infra.example.com/delete-worker"
+	DeleteWorkerAnnotation = infrav1.AnnotationDomain + "/delete-worker"
 	// ForceDeleteAnnotation skips the node-local volume guard for one node.
-	ForceDeleteAnnotation = "infra.example.com/force-delete"
+	ForceDeleteAnnotation = infrav1.AnnotationDomain + "/force-delete"
 
 	defaultDrainTimeout = 10 * time.Minute
 	deleteStepRequeue   = 5 * time.Second
@@ -156,6 +156,54 @@ func (r *WorkerPoolReconciler) deleteWorkerStep(ctx context.Context, pool *infra
 	logger := log.FromContext(ctx)
 	node := &pool.Status.Nodes[idx]
 
+	// Every Kubernetes call below uses kubeName, never node.Name: name is the
+	// vCD VM name (KION-WEB-DEV-wrk-03), while kubelet registers the Node
+	// object in lower case. With the VM name the API answers 404, Cordon and
+	// DeleteNode swallow it and Drain selects no pods, so the worker was
+	// deleted with its guest still running: no cordon, no drain, no PDB, and
+	// a NotReady Node object left behind forever.
+	kubeName, err := r.kubeNodeName(ctx, node)
+	if err != nil {
+		return false, ctrl.Result{}, err
+	}
+	guardName := kubeName
+	if guardName == "" {
+		guardName = node.Name
+	}
+
+	// The policy gate runs before every removal: before the write-off of a slot
+	// whose VM is already gone, before retrying a drain that timed out, and
+	// before a worker is cordoned. Nothing is touched while the request is
+	// refused. A worker that already reached Deleting is past the point of no
+	// return (its VM is being stopped), so it finishes instead of being
+	// stranded half-deleted.
+	removesUsable := workerServes(node)
+	usableAfter := usableWorkers(pool.Status.Nodes)
+	if removesUsable {
+		usableAfter--
+	}
+	if reason, msg := r.removalGuard(ctx, pool, guardName, len(pool.Status.Nodes)-1, removesUsable, usableAfter); reason != "" {
+		if node.Phase == infrav1.NodePhaseDeleting {
+			logger.Info("removal continues although the policy would refuse it: the VM is already being deleted",
+				"worker", node.Name)
+		} else {
+			if node.DeleteStartedAt != nil {
+				// The removal had already cordoned the worker. The policy no
+				// longer allows it, so put the worker back into service instead
+				// of leaving it Draining under a refusal.
+				if err := r.revertDeletion(ctx, pool, node, kubeName); err != nil {
+					msg += "; the worker stays cordoned: " + err.Error()
+				} else {
+					msg += "; the drain was reverted and the worker uncordoned"
+				}
+			}
+			node.Message = msg
+			r.setCondition(pool, metav1.ConditionFalse, reason, msg)
+			r.eventf(pool, corev1.EventTypeWarning, reason, msg)
+			return true, ctrl.Result{RequeueAfter: requeueConverged}, nil
+		}
+	}
+
 	// A slot whose VM is already gone needs no drain and no cloud call: the
 	// request is satisfied by writing the slot off and releasing its address.
 	// Without this a named deletion of a vanished worker would try to power off
@@ -180,17 +228,6 @@ func (r *WorkerPoolReconciler) deleteWorkerStep(ctx context.Context, pool *infra
 	// pipeline takes it from here and the rollout must stop tracking it.
 	node.Resize = nil
 
-	// Every Kubernetes call below uses kubeName, never node.Name: name is the
-	// vCD VM name (KION-WEB-DEV-wrk-03), while kubelet registers the Node
-	// object in lower case. With the VM name the API answers 404, Cordon and
-	// DeleteNode swallow it and Drain selects no pods, so the worker was
-	// deleted with its guest still running: no cordon, no drain, no PDB, and
-	// a NotReady Node object left behind forever.
-	kubeName, err := r.kubeNodeName(ctx, node)
-	if err != nil {
-		return false, ctrl.Result{}, err
-	}
-
 	if node.Phase == infrav1.NodePhaseFailed {
 		// The request is still standing, so the operator wants this worker gone:
 		// start a fresh drainTimeout budget. A PDB that never allows a
@@ -203,30 +240,6 @@ func (r *WorkerPoolReconciler) deleteWorkerStep(ctx context.Context, pool *infra
 		r.eventf(pool, corev1.EventTypeNormal, "WorkerDeletionRetried",
 			fmt.Sprintf("retrying drain of %s with drainTimeout=%s", node.Name, budgetFor(pool)))
 	}
-
-	after := int32(len(pool.Status.Nodes)) - 1
-	if minReplicas := pool.Spec.ScaleDown.MinReplicas; minReplicas > 0 && after < minReplicas {
-		msg := fmt.Sprintf("refusing to delete %s: %d worker(s) would fall below scaleDown.minReplicas=%d",
-			node.Name, after, minReplicas)
-		node.Message = msg
-		r.setCondition(pool, metav1.ConditionFalse, "MinReplicasProtected", msg)
-		r.eventf(pool, corev1.EventTypeWarning, "MinReplicasProtected", msg)
-		return true, ctrl.Result{RequeueAfter: requeueConverged}, nil
-	}
-	// Emptying the pool is a deliberate owner decision: both conditions must
-	// be explicit, and two refusals survive the flag (the worker this pass runs
-	// on, and node-local volumes, checked below).
-	guardName := kubeName
-	if guardName == "" {
-		guardName = node.Name
-	}
-	if reason, msg := r.checkLastWorker(ctx, pool, guardName, int(after)); reason != "" {
-		node.Message = msg
-		r.setCondition(pool, metav1.ConditionFalse, reason, msg)
-		r.eventf(pool, corev1.EventTypeWarning, reason, msg)
-		return true, ctrl.Result{RequeueAfter: requeueConverged}, nil
-	}
-
 	budget := budgetFor(pool)
 
 	if node.DeleteStartedAt == nil {
@@ -315,7 +328,7 @@ func (r *WorkerPoolReconciler) deleteWorkerStep(ctx context.Context, pool *infra
 		// while kubelet still runs is re-registered within seconds, so the
 		// worker comes back as a NotReady corpse that nothing owns and whose
 		// pods are never garbage collected.
-		if err := r.Cloud.PowerOffVM(ctx, pool.Spec.VCD.VApp, node.VMID); err != nil {
+		if err := r.Cloud.PowerOffVM(ctx, pool.Spec.VCD.VApp, node.ProviderID); err != nil {
 			node.Message = "VM power-off failed: " + err.Error()
 			return false, ctrl.Result{}, err
 		}
@@ -325,7 +338,7 @@ func (r *WorkerPoolReconciler) deleteWorkerStep(ctx context.Context, pool *infra
 				return false, ctrl.Result{}, err
 			}
 		}
-		if err := r.Cloud.DeleteVM(ctx, pool.Spec.VCD.VApp, node.VMID); err != nil {
+		if err := r.Cloud.DeleteVM(ctx, pool.Spec.VCD.VApp, node.ProviderID); err != nil {
 			node.Message = "VM deletion failed: " + err.Error()
 			return false, ctrl.Result{}, err
 		}
@@ -372,12 +385,23 @@ func (r *WorkerPoolReconciler) scaleDown(ctx context.Context, pool *infrav1.K8sW
 	// to delete, only the ledger entry and the status row. Doing this first is
 	// what keeps a count-based scale-in from removing a live worker while the
 	// corpse of a vanished one still holds an address.
+	//
+	// A write-off takes nothing out of service, so the floor does not apply to
+	// it. It is still a removal, though: it may not empty the pool without the
+	// explicit allowLastWorker opt-in.
 	remaining := n
+	guard := false
 	for i := 0; i < len(pool.Status.Nodes) && remaining > 0; {
 		node := pool.Status.Nodes[i]
 		if node.Phase != infrav1.NodePhaseMissing {
 			i++
 			continue
+		}
+		if reason, msg := r.removalGuard(ctx, pool, strings.ToLower(node.Name), len(pool.Status.Nodes)-1, false, usableWorkers(pool.Status.Nodes)); reason != "" {
+			r.setCondition(pool, metav1.ConditionFalse, reason, msg)
+			r.eventf(pool, corev1.EventTypeWarning, reason, msg)
+			guard = true
+			break
 		}
 		if node.IP != "" {
 			_ = alloc.Free(node.IP)
@@ -389,6 +413,11 @@ func (r *WorkerPoolReconciler) scaleDown(ctx context.Context, pool *infrav1.K8sW
 		r.eventf(pool, corev1.EventTypeNormal, "WorkerWrittenOff",
 			fmt.Sprintf("missing worker %s (%s) written off; address released", node.Name, node.IP))
 		remaining--
+	}
+	if guard {
+		// A policy refused the write-off and its condition must not be
+		// overwritten by the readiness pass in this same reconcile.
+		return true, ctrl.Result{RequeueAfter: requeueConverged}, nil
 	}
 	if remaining == 0 {
 		return true, ctrl.Result{RequeueAfter: deleteStepRequeue}, nil
@@ -424,22 +453,19 @@ func (r *WorkerPoolReconciler) scaleDown(ctx context.Context, pool *infrav1.K8sW
 		return true, ctrl.Result{RequeueAfter: requeueConverged}, nil
 	}
 
-	minReplicas := pool.Spec.ScaleDown.MinReplicas
-	guard := false
+	// Each candidate still serves, so taking one out is a real reduction: the
+	// floor is on workers able to serve, and the empty-pool rule still needs the
+	// explicit opt-in. Both are evaluated per request, so a partially refused
+	// scale-down removes what the policy allows and stops at the rest.
+	usable := usableWorkers(pool.Status.Nodes)
 	var requests []deletionRequest
 	for _, node := range candidates {
 		if int32(len(requests)) >= remaining {
 			break
 		}
-		left := int32(len(pool.Status.Nodes) - len(requests) - 1)
-		if minReplicas > 0 && left < minReplicas {
-			msg := fmt.Sprintf("scale-down stopped at %d worker(s): scaleDown.minReplicas=%d", left+1, minReplicas)
-			r.setCondition(pool, metav1.ConditionFalse, "MinReplicasProtected", msg)
-			r.eventf(pool, corev1.EventTypeWarning, "MinReplicasProtected", msg)
-			guard = true
-			break
-		}
-		if reason, msg := r.checkLastWorker(ctx, pool, strings.ToLower(node.Name), int(left)); reason != "" {
+		slotsAfter := len(pool.Status.Nodes) - len(requests) - 1
+		usableAfter := usable - int32(len(requests)) - 1
+		if reason, msg := r.removalGuard(ctx, pool, strings.ToLower(node.Name), slotsAfter, true, usableAfter); reason != "" {
 			r.setCondition(pool, metav1.ConditionFalse, reason, msg)
 			r.eventf(pool, corev1.EventTypeWarning, reason, msg)
 			guard = true
@@ -458,6 +484,28 @@ func (r *WorkerPoolReconciler) scaleDown(ctx context.Context, pool *infrav1.K8sW
 		return false, ctrl.Result{}, nil
 	}
 	return r.runDeletions(ctx, pool, alloc, requests)
+}
+
+// revertDeletion undoes a removal the policy no longer allows. It is reached
+// only while the worker is Draining or parked in Failed: the VM still runs and
+// its Node object still exists, so uncordoning puts the worker back into
+// service. A worker in Deleting is never reverted, because its VM is already
+// being stopped and stopping halfway would leave something nothing owns.
+func (r *WorkerPoolReconciler) revertDeletion(ctx context.Context, pool *infrav1.K8sWorkerPool, node *infrav1.WorkerNodeStatus, kubeName string) error {
+	if kubeName != "" {
+		if err := r.Kube.Uncordon(ctx, kubeName); err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+	}
+	node.DeleteStartedAt = nil
+	if node.K8sReady {
+		node.Phase = infrav1.NodePhaseReady
+	} else {
+		node.Phase = infrav1.NodePhaseJoining
+	}
+	r.eventf(pool, corev1.EventTypeNormal, "WorkerDeletionReverted",
+		fmt.Sprintf("worker %s: the removal was refused by policy, the cordon was reverted", node.Name))
+	return nil
 }
 
 // budgetFor returns the drain budget the pool actually uses.

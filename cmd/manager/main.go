@@ -12,11 +12,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
-	infrav1 "github.com/werton13/vcd-k8s-node-controller/api/v1alpha1"
-	"github.com/werton13/vcd-k8s-node-controller/internal/cloud/vcd"
-	"github.com/werton13/vcd-k8s-node-controller/internal/cloudinit"
-	"github.com/werton13/vcd-k8s-node-controller/internal/controller"
-	"github.com/werton13/vcd-k8s-node-controller/internal/kube"
+	infrav1 "github.com/k8s-nodescale/vcd-k8s-node-controller/api/v1alpha1"
+	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/cloud/vcd"
+	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/cloudinit"
+	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/controller"
+	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/kube"
 )
 
 var scheme = runtime.NewScheme()
@@ -50,7 +50,7 @@ func main() {
 		Metrics:                metricsserver.Options{BindAddress: metricsAddr},
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
-		LeaderElectionID:       "vcd-nodescale.infra.example.com",
+		LeaderElectionID:       "vcd-nodescale.k8s-nodescale.github.io",
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to create manager")

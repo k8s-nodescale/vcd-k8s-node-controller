@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/werton13/vcd-k8s-node-controller/internal/cloud"
+	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/cloud"
 )
 
 func TestNormalizeURL(t *testing.T) {

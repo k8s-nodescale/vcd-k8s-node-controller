@@ -1,4 +1,4 @@
-module github.com/werton13/vcd-k8s-node-controller
+module github.com/k8s-nodescale/vcd-k8s-node-controller
 
 go 1.27.1
 

@@ -15,10 +15,10 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	infrav1 "github.com/werton13/vcd-k8s-node-controller/api/v1alpha1"
-	"github.com/werton13/vcd-k8s-node-controller/internal/cloud"
-	"github.com/werton13/vcd-k8s-node-controller/internal/cloudinit"
-	"github.com/werton13/vcd-k8s-node-controller/internal/kube"
+	infrav1 "github.com/k8s-nodescale/vcd-k8s-node-controller/api/v1alpha1"
+	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/cloud"
+	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/cloudinit"
+	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/kube"
 )
 
 type fakeCloud struct {
@@ -140,6 +140,7 @@ type fakeKube struct {
 	labels        map[string]map[string]string
 	revokedTokens []string
 	cordoned      []string
+	uncordoned    []string
 	drained       []string
 	deletedNodes  []string
 	localVolumes  map[string][]string
@@ -165,6 +166,7 @@ func (f *fakeKube) Cordon(ctx context.Context, name string) error {
 	return nil
 }
 func (f *fakeKube) Uncordon(ctx context.Context, name string) error {
+	f.uncordoned = append(f.uncordoned, name)
 	if f.events != nil {
 		*f.events = append(*f.events, "kube:uncordon "+name)
 	}
@@ -243,11 +245,11 @@ func testPool(replicas int32) *infrav1.K8sWorkerPool {
 			},
 			VCD: infrav1.VCDRef{
 				Org: "myorg", VDC: "My-VDC", VApp: "vapp",
-				OrgNetwork: "net", Catalog: "Templates",
+				OrgNetwork: "net", Catalog: "Templates", DVMOffset: -3,
 			},
 			IPPlan: infrav1.IPPlan{
 				CIDR: "192.168.100.0/24", MNodeOffset: 4, WNodeOffset: 7,
-				DVMOffset: -3, KubeAPILB: 2, IngressLB: 3, MasterCount: 3,
+				KubeAPILB: 2, IngressLB: 3, MasterCount: 3,
 			},
 			Join: infrav1.JoinConfig{
 				Endpoint: "192.168.100.2:6443",

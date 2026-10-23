@@ -1,4 +1,4 @@
-apiVersion: infra.example.com/v1alpha1
+apiVersion: k8s-nodescale.github.io/v1alpha1
 kind: K8sWorkerPool
 metadata:
   name: default
@@ -37,11 +37,11 @@ spec:
     vapp: mts-k8s-lab
     orgNetwork: routed-k8s-net
     catalog: Templates
+    dvmOffset: -3
   ipPlan:
     cidr: 192.168.100.0/24
     mNodeOffset: 4
     wNodeOffset: 7
-    dvmOffset: -3
     kubeapiLB: 2
     ingressLB: 3
     masterCount: 3

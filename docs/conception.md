@@ -189,7 +189,7 @@ Ansible.
 │  CRD: K8sWorkerPool (singleton "default")                         │
 │    spec:   replicas, node flavor (cpu/mem/disk), vCD refs,        │
 │            ip plan (cidr + offsets + reserved), join settings      │
-│    status: nodes[] {name, ip, vmID, cpu, mem, diskGB, phase,       │
+│    status: nodes[] {name, ip, providerID, cpu, mem, diskGB,       │
 │                     k8sReady}, ledger {nextIndex, used, free},     │
 │            conditions[]                                           │
 │                                                                   │
@@ -210,7 +210,7 @@ Ansible.
 ### 4.1 CRD sketch (illustrative — not applied)
 
 ```yaml
-apiVersion: infra.example.com/v1alpha1
+apiVersion: k8s-nodescale.github.io/v1alpha1
 kind: K8sWorkerPool
 metadata:
   name: default
@@ -229,11 +229,11 @@ spec:
     vapp:   mts-k8s-lab
     orgNetwork: routed-k8s-net
     catalog: Templates
+    dvmOffset:       -3            # deployment VM slot, vCD bootstrap only
   ipPlan:                        # mirrors Terraform var.ip_plan
     cidr:            192.168.100.0/24
     mNodeOffset:     4
     wNodeOffset:     7
-    dvmOffset:       -3
     kubeapiLB:       2
     ingressLB:       3
     reserved:        [192.168.100.1, 192.168.100.2, 192.168.100.3]
@@ -252,7 +252,7 @@ status:
   nodes:
     - name: myorg-k8s-cluster-prod-wrk-03
       ip: 192.168.100.9
-      vmID: urn:vcloud:vm:...
+      providerID: urn:vcloud:vm:...
       phase: Ready            # Pending|Provisioning|Joining|Ready|Draining|Deleting|Failed
       cpu: 4
       memoryMB: 8192
@@ -484,6 +484,16 @@ the pool is refused with `LastWorkerProtected` and the worker is left alone. Wit
 it, the removal proceeds through the normal pipeline, which means the PDBs still
 decide whether it can finish.
 
+`minReplicas` is a floor on workers able to serve, not on rows in status: a
+`Missing` slot has no VM and a `Failed` slot is parked, so neither counts.
+Writing off a `Missing` slot takes nothing out of service and is therefore never
+refused by the floor, but it is still a removal and cannot empty the pool
+without the flag. The CRD defaults `minReplicas` to 1, so a manifest that omits
+it is protected; `allowLastWorker` with a higher floor is rejected as
+`InvalidSpec`. A refusal that arrives while a drain is already under way reverts
+the cordon instead of leaving the worker `Draining`; a worker already in
+`Deleting` is past the point of no return and finishes.
+
 Being explicit about the blast radius is part of the design, and it is documented
 in the README rather than buried here: the last drain evicts every pod on that
 worker (ingress, any CoreDNS replica that landed there, metrics-server, CSI node
@@ -585,7 +595,7 @@ status:
 ```
 
 `strategy: Manual` rolls nothing until the owner marks one worker with
-`infra.example.com/resize=allow` - for environments where the window matters more
+`k8s-nodescale.github.io/resize=allow` - for environments where the window matters more
 than the API.
 
 **Later.** A template change or a shrink is a recreate: drain, power off, delete

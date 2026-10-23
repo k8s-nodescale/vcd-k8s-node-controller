@@ -16,7 +16,7 @@ to the cluster and reports it Ready - about five minutes per worker.
 
 Implemented:
 
-- `K8sWorkerPool` CRD (`infra.example.com/v1alpha1`) + generated deepcopy/CRD.
+- `K8sWorkerPool` CRD (`k8s-nodescale.github.io/v1alpha1`) + generated deepcopy/CRD.
 - `ipam` allocator aware of Terraform's `ip_plan` (gateway, VIPs, masters, DVM,
   explicit reservations). Worker names are derived from the address ordinal and
   existing VMs are adopted into the ledger on every pass, so a lost status can
@@ -27,11 +27,13 @@ Implemented:
   cloud-init payload. `DeleteVM` powers the VM off and removes it together with
   its disks; it is idempotent.
 - Scale-in: lowering `spec.replicas` removes the highest-ordinal worker, while
-  `spec.scaleDown.deleteWorkers` and the `infra.example.com/delete-worker`
+  `spec.scaleDown.deleteWorkers` and the `k8s-nodescale.github.io/delete-worker`
   annotation remove a worker **by name**. Every removal is cordon -> ingress-pool
   removal -> PDB-aware drain (eviction API) -> volume-detach wait -> Node delete
   -> VM delete -> address release, bounded by `scaleDown.drainTimeout` and
-  guarded by `minReplicas` and a node-local volume check. See
+  guarded by `minReplicas` (a floor on workers able to serve, so a `Missing`
+  slot cannot make the pool look bigger than it is) and a node-local volume
+  check. See
   [Scale in](#scale-in--removing-a-worker).
 - Ingress pool membership: workers are added to the NSX-V edge pool once Ready
   and removed before the drain starts (`ingressPool.type/name/port/edge`).
@@ -118,20 +120,21 @@ One `K8sWorkerPool` describes the worker set of a single cluster. You own
 | `flavor.disks[]` | no | Data disks: `sizeGB`, `mount` (`/var`, `/var/lib`), `busType`, `busNumber`, `unitNumber`, `storageProfile`. Mirrors Terraform `diskw1` / `diskw2`. |
 | `vcd.org` / `vcd.vdc` / `vcd.vapp` / `vcd.orgNetwork` | yes | Placement of the VM. |
 | `vcd.catalog` / `vcd.catalogOrg` | no | Catalog holding the template (defaults to the controller org). |
-| `ipPlan` | yes | Mirrors Terraform's `ip_plan`: `cidr`, `mNodeOffset`, `wNodeOffset`, `dvmOffset`, `kubeapiLB`, `ingressLB`, `masterCount`, `reserved[]`. Workers are allocated from `wNodeOffset` upwards. |
+| `vcd.dvmOffset` | no | Address offset of the deployment VM in Terraform's `ip_plan`; the controller reserves it so no worker gets that address. Only the vCD bootstrap has a DVM. |
+| `ipPlan` | yes | Mirrors Terraform's `ip_plan`: `cidr`, `mNodeOffset`, `wNodeOffset`, `kubeapiLB`, `ingressLB`, `masterCount`, `reserved[]`. Workers are allocated from `wNodeOffset` upwards. |
 | `join.endpoint` | no | Control-plane address, `host:port` of the API VIP. |
 | `join.tokenTTL` | no | Lifetime of the per-VM bootstrap token (default `1h`). |
 | `join.labels` / `join.taints` | no | Pool-wide, applied to every Ready worker (`taints` in `key[=value]:Effect` form). |
 | `ingressPool` | no | `type` (`nsxv`/`nsxt`), `name`, `port`, `edge`. `port` is the **node port** the pool forwards to, not the virtual-server port; `edge` is the NSX-V edge that owns the pool. Workers are added on Ready and removed before a drain. |
-| `scaleDown.minReplicas` | no | Floor for both scale-down paths. `0` disables the floor. |
+| `scaleDown.minReplicas` | no | Floor for the workers that can serve traffic (default `1`). A removal that would leave fewer is refused. Writing off a `Missing` slot takes nothing out of service, so the floor never blocks that cleanup. `0` disables the floor. |
 | `scaleDown.drainTimeout` | no | Budget for cordon+drain of one worker (default `10m`). When it expires the worker is `Failed` and its VM is kept. |
 | `scaleDown.deleteWorkers[]` | no | Worker names to remove regardless of their position. Each entry is drained and deleted, then removed from this list and `spec.replicas` is decremented so the worker is **not** recreated. |
-| `scaleDown.force` | no | Skip the node-local volume guard. Per-node override: annotation `infra.example.com/force-delete=true`. Never skips PDBs or the detach wait. |
-| `scaleDown.allowLastWorker` | no | Permit a request that leaves the pool with zero workers. Needs `scaleDown.minReplicas: 0`. Refused anyway on the worker the controller runs on and on node-local volumes. |
+| `scaleDown.force` | no | Skip the node-local volume guard. Per-node override: annotation `k8s-nodescale.github.io/force-delete=true`. Never skips PDBs or the detach wait. |
+| `scaleDown.allowLastWorker` | no | Permit a request that leaves the pool with zero workers. Needs `scaleDown.minReplicas: 0`; a higher floor is rejected as `InvalidSpec` instead of accepting a flag that could never be honoured. Refused anyway on the worker the controller runs on and on node-local volumes. |
 | `reconciliation.policy` | no | `Notify` (default) or `AutoHeal`. What happens when a worker's VM disappears outside the controller. |
 | `reconciliation.autoHealRetries` | no | Recreations AutoHeal attempts for one slot before parking it as `Failed` (default `3`). |
 | `reconciliation.autoHealBackoff` | no | Minimum time between two AutoHeal attempts for the same slot (default `2m`). |
-| `rollout.strategy` | no | `Rolling` (default) applies `spec.flavor` automatically; `Manual` only to workers annotated `infra.example.com/resize=allow`. |
+| `rollout.strategy` | no | `Rolling` (default) applies `spec.flavor` automatically; `Manual` only to workers annotated `k8s-nodescale.github.io/resize=allow`. |
 | `rollout.maxUnavailable` | no | How many workers may be out of service at once during a roll (int or percentage, default `1`). PDBs are the real brake. |
 | `rollout.order` | no | `Descending` (default, highest ordinal first) or `Ascending`. |
 | `rollout.pauseOnFailure` | no | Stop the roll when a worker does not come back (default `true`). |
@@ -143,7 +146,7 @@ One `K8sWorkerPool` describes the worker set of a single cluster. You own
 | --- | --- |
 | `observedReplicas` | Worker **slots** the controller knows about: VMs that exist plus slots whose VM disappeared and stay reserved (`Missing` / parked `Failed`). |
 | `ledger.nextIndex` / `used[]` / `free[]` | Address book. `used` holds every allocated worker IP; addresses of deleted VMs are never released automatically. |
-| `nodes[]` | Per worker: `name` (the vCD VM name), `nodeName` (the Kubernetes Node object name, lower case - the only name the controller passes to the Kubernetes API), `ip`, `vmID`, `phase`, `cpu`, `memoryMB`, `diskGB`, `k8sReady`, `kubeletVersion`, `message`, `deleteStartedAt`, `flavor` (what the VM actually runs with, read back from vCD), `healAttempts` / `healLastAttempt` (the AutoHeal budget), `resize` (the per-worker rollout step). `message` is where a blocked removal explains itself (the PDB, the attached volume, the local PV). |
+| `nodes[]` | Per worker: `name` (the vCD VM name), `nodeName` (the Kubernetes Node object name, lower case - the only name the controller passes to the Kubernetes API), `ip`, `providerID` (the VM id in the platform, today `urn:vcloud:vm:...`), `phase`, `cpu`, `memoryMB`, `diskGB`, `k8sReady`, `kubeletVersion`, `message`, `deleteStartedAt`, `flavor` (what the VM actually runs with, read back from vCD), `healAttempts` / `healLastAttempt` (the AutoHeal budget), `resize` (the per-worker rollout step). `message` is where a blocked removal explains itself (the PDB, the attached volume, the local PV). |
 | `rollout` | `phase` (`Idle`, `Progressing`, `Paused`), `targetFlavor`, `workersTotal`, `workersDone`, `currentWorker`, `lastError`, `startedAt`. |
 | `conditions[]` | `Ready`, with reason `Converged` (`3/3 workers Ready`), `Progressing` while a worker is not Ready yet, `WorkerMissing` when a slot lost its VM, `LastWorkerProtected` / `WorkerHostsController` on a refused emptying, `RolloutInProgress` while a roll holds the pool, `UnsupportedChange` for a shrink, plus `ScaleUpFailed`, `ScaleDownFailed`, `RolloutFailed` and `InvalidSpec` on errors. |
 
@@ -157,7 +160,7 @@ hit `drainTimeout` (VM kept) or AutoHeal exhausted its attempts.
 Example (placeholder org, network and template; nothing cluster-specific):
 
 ```yaml
-apiVersion: infra.example.com/v1alpha1
+apiVersion: k8s-nodescale.github.io/v1alpha1
 kind: K8sWorkerPool
 metadata:
   name: demo-cluster
@@ -195,11 +198,11 @@ spec:
     vapp: demo-cluster
     orgNetwork: demo-cluster-net
     catalog: Templates
+    dvmOffset: -3
   ipPlan:
     cidr: 10.10.0.0/24
     mNodeOffset: 4
     wNodeOffset: 7
-    dvmOffset: -3
     kubeapiLB: 2
     ingressLB: 3
     masterCount: 3
@@ -292,7 +295,7 @@ shows up in `status.nodes[].phase`. Both directions are supported:
 | more workers | raise `spec.replicas` | creates the missing workers |
 | fewer workers | lower `spec.replicas` | removes the highest-ordinal worker, never below `scaleDown.minReplicas` |
 | one specific worker gone | `spec.scaleDown.deleteWorkers: ["<worker>"]` | removes that worker and decrements `replicas`; no replacement |
-| one specific worker replaced | `kubectl annotate node <worker> infra.example.com/delete-worker=true` | removes it and creates a replacement (`replicas` untouched) |
+| one specific worker replaced | `kubectl annotate node <worker> k8s-nodescale.github.io/delete-worker=true` | removes it and creates a replacement (`replicas` untouched) |
 
 The scale-out path is described next, the removal path under **Scale in /
 removing a worker**. What the pool counts as its own is in **Ownership**, and
@@ -379,15 +382,46 @@ Three ways to ask, one implementation:
 | --- | --- | --- |
 | `spec.replicas: 2` (was 3) | the highest-ordinal worker (the one at the end of the pool) | no |
 | `spec.scaleDown.deleteWorkers: ["demo-cluster-wrk-02"]` | exactly that worker; the entry is pruned and `replicas` is decremented when it is gone | no |
-| `kubectl annotate node demo-cluster-wrk-03 infra.example.com/delete-worker=true` | exactly that worker, with `replicas` untouched | yes, a replacement is created (rolling replacement) |
+| `kubectl annotate node demo-cluster-wrk-03 k8s-nodescale.github.io/delete-worker=true` | exactly that worker, with `replicas` untouched | yes, a replacement is created (rolling replacement) |
+
+The annotation is the **rolling replacement** request: it marks one Node object
+instead of naming a worker in the spec. Because `spec.replicas` is untouched,
+the pool creates a replacement in a fresh slot once the old worker is gone. Use
+it to replace a worker whose guest is in a bad state, or to move it to a new
+address, without changing the size of the pool.
+
+```bash
+kubectl annotate node demo-cluster-wrk-03 k8s-nodescale.github.io/delete-worker=true
+```
+
+Only the value `true` (case-insensitive) counts; any other value is ignored. The
+annotation lives on the Node object, so it disappears with it - there is nothing
+to clean up afterwards. The pool only creates the replacement while
+`spec.replicas` still asks for it: if something lowered `replicas` to 2 in the
+meantime, the pool stays at 2.
+
+The request can be withdrawn while nothing has started, by removing the
+annotation:
+
+```bash
+kubectl annotate node demo-cluster-wrk-03 k8s-nodescale.github.io/delete-worker-
+```
+
+Once the worker is `Draining` in `status.nodes[].phase` (with
+`deleteStartedAt` set), the removal is in flight and withdrawing the
+annotation no longer stops it; only a policy change does (see **The last worker
+is a deliberate choice**). A request that a guard refuses stays in place and is
+re-evaluated every minute - remove the annotation to stop the refusals.
 
 A removal is one step per reconcile pass, visible in `status.nodes[].phase`:
 
-1. **Guards.** Refuse to go below `scaleDown.minReplicas`. Refuse when Bound
+1. **Guards.** Refuse to go below `scaleDown.minReplicas`, which counts workers
+   able to serve: `Missing` and `Failed` slots do not count, so a pool with
+   one `Ready` and one `Missing` worker is a one-worker pool. Refuse when Bound
    `hostPath` PVs used by the node or PVs pinned to it by `nodeAffinity`
    (local volumes) would lose their data - the message names the PVs and the
    override (`scaleDown.force: true` or the node annotation
-   `infra.example.com/force-delete=true`).
+   `k8s-nodescale.github.io/force-delete=true`).
 2. **Cordon + ingress pool.** Patch `spec.unschedulable`, then remove the
    address from `ingressPool` so no new request is sent to a dying node. A pool
    removal that cannot be performed (NSX-T, missing `edge`, pool not found)
@@ -493,7 +527,7 @@ it is a recreate, not a resize: the pool reports `Ready=False` with reason
 a worker at the smaller shape.
 
 `strategy: Manual` disables automatic rolls: only workers annotated
-`infra.example.com/resize=allow` are resized, which suits environments where
+`k8s-nodescale.github.io/resize=allow` are resized, which suits environments where
 the maintenance window matters more than the API.
 
 ## Ownership
@@ -659,10 +693,38 @@ host cannot write `status` or create the replacement - move the controller off
 the pool instead), and a worker whose `hostPath`/`local` PVs would be destroyed
 (`scaleDown.force` overrides only the PV check, never a PDB).
 
+The floor and the flag are evaluated against what the pool can actually serve:
+
+- `minReplicas` counts workers able to serve, not rows in `status`. A `Missing`
+  slot (its VM is gone) and a `Failed` slot (a drain timed out) are not
+  capacity, so a pool with one `Ready` and one `Missing` worker is treated as a
+  one-worker pool.
+- Writing off a `Missing` slot is the one removal that takes nothing out of
+  service, so the floor never blocks it. It still may not empty the pool: the
+  write-off of the last slot needs `allowLastWorker: true` like any other
+  removal.
+- `minReplicas` defaults to `1` in the CRD. A manifest that omits it is still
+  protected; emptying the pool always needs `minReplicas: 0` written out.
+- Setting `allowLastWorker: true` with a higher floor is contradictory and the
+  pool reports `InvalidSpec` rather than quietly refusing every removal.
+- If the policy changes while a drain is already under way, the removal is
+  refused and the cordon is reverted: the worker is uncordoned, clears
+  `deleteStartedAt` and goes back to `Ready` instead of staying `Draining`
+  under a refusal. Once the phase is `Deleting` the VM is already being
+  stopped, so the removal finishes rather than leaving a half-deleted worker.
+
+| Situation | Result |
+| --- | --- |
+| `replicas: 3`, `minReplicas: 1`, remove one | allowed, 2 serving workers remain |
+| 1 `Ready` + 1 `Missing`, `minReplicas: 1`, remove the `Ready` one | refused (`MinReplicasProtected`) |
+| 1 `Missing` slot, `minReplicas: 1`, `deleteWorkers: [<that slot>]` | refused (`LastWorkerProtected`), address stays reserved |
+| same, with `minReplicas: 0` + `allowLastWorker: true` | written off, pool becomes empty |
+| `allowLastWorker: true`, `minReplicas: 1` | `InvalidSpec`, nothing reconciled |
+
 ## Terraform integration contract
 
 - The Terraform module installs this chart behind a `node_controller.enabled`
-  toggle and pins `chart_version` / `image_tag` (currently `0.5.1`).
+  toggle and pins `chart_version` / `image_tag` (currently `0.6.0`).
 - **Once the controller is enabled, do not use Terraform to manage worker count
   or worker LB pool membership.** Use the CRD instead. The Terraform module's
   README must state this explicitly.
@@ -693,7 +755,7 @@ Build locally (the Dockerfile uses `golang:1.27.1-alpine` and
 `gcr.io/distroless/static:nonroot`):
 
 ```
-docker build -t docker.io/werton13/vcd-k8s-node-controller:0.5.1 .
+docker build -t docker.io/werton13/vcd-k8s-node-controller:0.6.0 .
 ```
 
 Public module defaults are used inside the build. On a restricted network,
@@ -703,14 +765,14 @@ override them:
 docker build \
   --build-arg GOPROXY=https://nexus.example.com/repository/golang/ \
   --build-arg GOSUMDB=off \
-  -t docker.io/werton13/vcd-k8s-node-controller:0.5.1 .
+  -t docker.io/werton13/vcd-k8s-node-controller:0.6.0 .
 ```
 
 Push (or use `make image-push`):
 
 ```
 docker login docker.io
-docker push docker.io/werton13/vcd-k8s-node-controller:0.5.1
+docker push docker.io/werton13/vcd-k8s-node-controller:0.6.0
 docker push docker.io/werton13/vcd-k8s-node-controller:latest
 ```
 

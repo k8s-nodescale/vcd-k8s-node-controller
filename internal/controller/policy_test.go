@@ -7,7 +7,7 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	infrav1 "github.com/werton13/vcd-k8s-node-controller/api/v1alpha1"
+	infrav1 "github.com/k8s-nodescale/vcd-k8s-node-controller/api/v1alpha1"
 )
 
 func reconcileOnce(t *testing.T, r *WorkerPoolReconciler, pool *infrav1.K8sWorkerPool) {
