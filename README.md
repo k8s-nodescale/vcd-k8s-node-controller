@@ -284,9 +284,17 @@ helm install vcd-nodescale charts/vcd-nodescale \
 The chart installs the CRD, the controller and the RBAC it needs, including
 `configmaps` `get`/`update` in `kube-public` for the JWS publication.
 
-**Upgrading.** Helm installs `crds/` on install only: `helm upgrade` never touches
-the CRD. Apply it first, otherwise the API server prunes the newer status
-fields and the new subresources are missing:
+**Upgrading.** Helm applies `crds/` on install only: `helm upgrade` never touches a
+CRD. An older CRD prunes the newer `status` fields and drops new subresources
+(such as `scale`), so the CRDs of the *new* chart have to be applied before the
+release is upgraded.
+
+The Ansible playbook does that for you: the `k8s_addons_node_controller` role pulls
+the pinned chart, applies every file from its `crds/` directory and installs the
+release from that directory, on every run. A deploy through the playbook needs
+no manual CRD step.
+
+Upgrading by hand:
 
 ```
 kubectl apply -f charts/vcd-nodescale/crds/k8s-nodescale.github.io_k8sworkerpools.yaml
@@ -294,8 +302,13 @@ helm upgrade vcd-nodescale charts/vcd-nodescale -n vcd-nodescale-system \
   --reuse-values --set image.tag=<version>
 ```
 
-The `scale` subresource lives in the CRD, so `kubectl scale` works only after
-that apply.
+These are also the manual steps for an environment whose release was installed
+by an older playbook, or by `helm install` straight from the repository: the
+playbook does not migrate such a release, it only applies the CRDs of the
+version it pins. Apply the new CRDs first, then upgrade the release, otherwise
+the API server prunes the newer status fields and the new subresources are
+missing. `kubectl scale` works only after the CRD that carries the subresource
+is applied.
 
 3. Apply a `K8sWorkerPool` (see `config/samples/` and the resource reference
    above), then use it as described in **How to use**.
