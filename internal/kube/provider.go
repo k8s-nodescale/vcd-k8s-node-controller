@@ -30,6 +30,13 @@ type Provider interface {
 	// called when a create fails after the token was minted, so a failed attempt
 	// does not leave a usable credential behind.
 	RevokeBootstrapToken(ctx context.Context, token string) error
+	// RevokeBootstrapTokenID is RevokeBootstrapToken for a token id kept in
+	// status, where the secret half never appears.
+	RevokeBootstrapTokenID(ctx context.Context, id string) error
+	// RenewBootstrapTokenID extends a live token's expiration so a guest that
+	// is slow to reach kubeadm join does not find it expired. It is a no-op
+	// when the token is gone or still has more than half its ttl left.
+	RenewBootstrapTokenID(ctx context.Context, id string, ttl time.Duration) error
 	CAHash(ctx context.Context) (string, error)
 	ListNodes(ctx context.Context) ([]NodeInfo, error)
 	WaitReady(ctx context.Context, name string, timeout time.Duration) error

@@ -336,6 +336,32 @@ func (r *WorkerPoolReconciler) refreshReadiness(ctx context.Context, pool *infra
 				r.healLostNode(ctx, pool, st)
 			}
 		case !ok:
+			// The VM exists but no Node has registered yet. The clock starts
+			// on the first pass that sees this state, so a stuck cloud-init is
+			// bounded by spec.provisioning.timeout instead of waiting forever.
+			if st.ProvisioningStartedAt == nil {
+				now := metav1.Now()
+				st.ProvisioningStartedAt = &now
+			}
+			if st.Phase == infrav1.NodePhaseFailed {
+				// Already parked by the watchdog: keep the report and the VM.
+				// A late registration is still picked up by the ok branches.
+				st.K8sReady = false
+				break
+			}
+			// A slow guest must not find its token expired by the time it
+			// reaches kubeadm join.
+			r.renewBootstrapToken(ctx, pool, st)
+			elapsed := time.Since(st.ProvisioningStartedAt.Time)
+			if budget := provisioningTimeout(pool); elapsed >= budget {
+				st.Phase = infrav1.NodePhaseFailed
+				st.K8sReady = false
+				st.Message = fmt.Sprintf("VM has run for %s without a Kubernetes Node (spec.provisioning.timeout=%s); the VM is kept for inspection",
+					elapsed.Round(time.Minute), budget)
+				r.eventf(pool, corev1.EventTypeWarning, "WorkerProvisioningTimeout",
+					fmt.Sprintf("worker %s (%s): %s", st.Name, st.IP, st.Message))
+				break
+			}
 			st.Phase = infrav1.NodePhaseProvisioning
 			st.K8sReady = false
 			st.Message = "waiting for the node to register"
@@ -348,6 +374,10 @@ func (r *WorkerPoolReconciler) refreshReadiness(ctx context.Context, pool *infra
 			// budget starts over.
 			st.HealAttempts = 0
 			st.HealLastAttempt = nil
+			st.ProvisioningStartedAt = nil
+			// The guest has joined: its token is a live credential for a node
+			// that no longer needs one.
+			r.revokeBootstrapToken(ctx, st)
 			if info.KubeletVersion != "" {
 				st.KubeletVersion = info.KubeletVersion
 			}
@@ -358,6 +388,8 @@ func (r *WorkerPoolReconciler) refreshReadiness(ctx context.Context, pool *infra
 			st.Phase = infrav1.NodePhaseJoining
 			st.K8sReady = false
 			st.Message = "node registered, waiting for Ready"
+			st.ProvisioningStartedAt = nil
+			r.renewBootstrapToken(ctx, pool, st)
 		}
 		if !ok {
 			continue
@@ -380,13 +412,15 @@ func (r *WorkerPoolReconciler) refreshReadiness(ctx context.Context, pool *infra
 func evaluatePoolCondition(pool *infrav1.K8sWorkerPool) (metav1.ConditionStatus, string, string) {
 	desired := pool.Spec.Replicas
 	var ready int32
-	var missing []string
+	var missing, failed []string
 	for _, n := range pool.Status.Nodes {
 		switch n.Phase {
 		case infrav1.NodePhaseReady:
 			ready++
 		case infrav1.NodePhaseMissing:
 			missing = append(missing, fmt.Sprintf("%s (%s)", n.Name, n.IP))
+		case infrav1.NodePhaseFailed:
+			failed = append(failed, fmt.Sprintf("%s (%s)", n.Name, n.IP))
 		}
 	}
 	switch {
@@ -395,6 +429,11 @@ func evaluatePoolCondition(pool *infrav1.K8sWorkerPool) (metav1.ConditionStatus,
 		// gone, so an operator can recreate or write it off.
 		return metav1.ConditionFalse, "WorkerMissing",
 			fmt.Sprintf("%d worker(s) missing from vCD: %s", len(missing), strings.Join(missing, ", "))
+	case len(failed) > 0:
+		// A parked worker is not "still converging": name it so the operator
+		// sees the slot that needs a decision.
+		return metav1.ConditionFalse, "WorkerFailed",
+			fmt.Sprintf("%d worker(s) parked as Failed: %s", len(failed), strings.Join(failed, ", "))
 	case pool.Status.ObservedReplicas != desired:
 		return metav1.ConditionFalse, "Scaling",
 			fmt.Sprintf("desired=%d observed=%d ready=%d", desired, pool.Status.ObservedReplicas, ready)
@@ -635,7 +674,7 @@ func (r *WorkerPoolReconciler) scaleUp(ctx context.Context, pool *infrav1.K8sWor
 		}
 		name := workerName(pool.Spec.NamePrefix, ordinal)
 
-		vm, err := r.createWorker(ctx, pool, alloc, name, ip)
+		vm, tokID, err := r.createWorker(ctx, pool, alloc, name, ip)
 		if err != nil {
 			return err
 		}
@@ -647,19 +686,22 @@ func (r *WorkerPoolReconciler) scaleUp(ctx context.Context, pool *infrav1.K8sWor
 		if memMB == 0 {
 			memMB = pool.Spec.Flavor.MemoryMB
 		}
+		now := metav1.Now()
 		pool.Status.Nodes = append(pool.Status.Nodes, infrav1.WorkerNodeStatus{
-			Name:       name,
-			IP:         ip,
-			ProviderID: vm.ID,
-			Phase:      infrav1.NodePhaseProvisioning,
-			CPU:        cpu,
-			MemoryMB:   memMB,
-			DiskGB:     vm.DiskGB,
+			Name:                  name,
+			IP:                    ip,
+			ProviderID:            vm.ID,
+			Phase:                 infrav1.NodePhaseProvisioning,
+			ProvisioningStartedAt: &now,
+			CPU:                   cpu,
+			MemoryMB:              memMB,
+			DiskGB:                vm.DiskGB,
 			Flavor: &infrav1.FlavorStatus{
 				CPUs:     vm.CPU,
 				MemoryMB: vm.MemoryMB,
 				OSDiskGB: vm.OSDiskGB,
 			},
+			BootstrapTokenID: tokID,
 		})
 		pool.Status.ObservedReplicas = int32(len(pool.Status.Nodes))
 		pool.Status.Ledger = toStatusLedger(alloc.Ledger())
@@ -674,7 +716,7 @@ func (r *WorkerPoolReconciler) scaleUp(ctx context.Context, pool *infrav1.K8sWor
 // because a token that outlives a failed create is a live credential for a node
 // that will never exist (customization-phases.md §5.4: 21 leaked tokens in one
 // afternoon).
-func (r *WorkerPoolReconciler) createWorker(ctx context.Context, pool *infrav1.K8sWorkerPool, alloc *ipam.Allocator, name, ip string) (cloud.VM, error) {
+func (r *WorkerPoolReconciler) createWorker(ctx context.Context, pool *infrav1.K8sWorkerPool, alloc *ipam.Allocator, name, ip string) (cloud.VM, string, error) {
 	logger := log.FromContext(ctx)
 
 	ttl := pool.Spec.Join.TokenTTL.Duration
@@ -683,15 +725,15 @@ func (r *WorkerPoolReconciler) createWorker(ctx context.Context, pool *infrav1.K
 	}
 	dnsJSON, err := json.Marshal(pool.Spec.Bootstrap.DNS)
 	if err != nil {
-		return cloud.VM{}, fmt.Errorf("encode DNS servers: %w", err)
+		return cloud.VM{}, "", fmt.Errorf("encode DNS servers: %w", err)
 	}
 	cloudInitDisks, err := toCloudInitDisks(pool.Spec.Flavor.Disks)
 	if err != nil {
-		return cloud.VM{}, err
+		return cloud.VM{}, "", err
 	}
 
 	var token string
-	release := func(cause error) (cloud.VM, error) {
+	release := func(cause error) (cloud.VM, string, error) {
 		_ = alloc.Free(ip)
 		pool.Status.Ledger = toStatusLedger(alloc.Ledger())
 		if token != "" {
@@ -699,7 +741,7 @@ func (r *WorkerPoolReconciler) createWorker(ctx context.Context, pool *infrav1.K
 				logger.Error(err, "revoke bootstrap token", "node", name, "token", tokenID(token))
 			}
 		}
-		return cloud.VM{}, cause
+		return cloud.VM{}, "", cause
 	}
 
 	token, err = r.Kube.CreateBootstrapToken(ctx, ttl)
@@ -764,9 +806,9 @@ func (r *WorkerPoolReconciler) createWorker(ctx context.Context, pool *infrav1.K
 	if err != nil {
 		cause := fmt.Errorf("create worker %s: %w", name, err)
 		_ = r.reserveUnlessGone(ctx, pool, alloc, ip, name, cause)
-		return cloud.VM{}, cause
+		return cloud.VM{}, "", cause
 	}
-	return vm, nil
+	return vm, tokenID(token), nil
 }
 
 // ownedWorkerVMs keeps the VMs that belong to the pool. Ownership is decided by
@@ -843,6 +885,34 @@ func (r *WorkerPoolReconciler) mapNodeToPools(ctx context.Context, obj client.Ob
 func tokenID(token string) string {
 	id, _, _ := strings.Cut(strings.TrimSpace(token), ".")
 	return id
+}
+
+// renewBootstrapToken keeps a worker's token alive while it installs. The
+// secret half never enters status; the id is enough to extend the expiration.
+func (r *WorkerPoolReconciler) renewBootstrapToken(ctx context.Context, pool *infrav1.K8sWorkerPool, st *infrav1.WorkerNodeStatus) {
+	if st.BootstrapTokenID == "" {
+		return
+	}
+	ttl := pool.Spec.Join.TokenTTL.Duration
+	if ttl <= 0 {
+		ttl = time.Hour
+	}
+	if err := r.Kube.RenewBootstrapTokenID(ctx, st.BootstrapTokenID, ttl); err != nil {
+		log.FromContext(ctx).Error(err, "renew bootstrap token", "worker", st.Name, "token", st.BootstrapTokenID)
+	}
+}
+
+// revokeBootstrapToken removes the credential once the node is Ready. A failed
+// revoke stays in status and is retried on the next pass.
+func (r *WorkerPoolReconciler) revokeBootstrapToken(ctx context.Context, st *infrav1.WorkerNodeStatus) {
+	if st.BootstrapTokenID == "" {
+		return
+	}
+	if err := r.Kube.RevokeBootstrapTokenID(ctx, st.BootstrapTokenID); err != nil {
+		log.FromContext(ctx).Error(err, "revoke bootstrap token", "worker", st.Name, "token", st.BootstrapTokenID)
+		return
+	}
+	st.BootstrapTokenID = ""
 }
 
 func workerName(prefix string, ordinal int) string {

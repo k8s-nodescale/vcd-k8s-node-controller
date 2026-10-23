@@ -134,17 +134,19 @@ func (f *fakeCloud) RemovePoolMember(ctx context.Context, pool cloud.PoolRef, ip
 }
 
 type fakeKube struct {
-	nodes         []kube.NodeInfo
-	events        *[]string
-	taints        map[string][]corev1.Taint
-	labels        map[string]map[string]string
-	revokedTokens []string
-	cordoned      []string
-	uncordoned    []string
-	drained       []string
-	deletedNodes  []string
-	localVolumes  map[string][]string
-	drainErr      error
+	nodes           []kube.NodeInfo
+	events          *[]string
+	taints          map[string][]corev1.Taint
+	labels          map[string]map[string]string
+	revokedTokens   []string
+	revokedTokenIDs []string
+	renewedTokenIDs []string
+	cordoned        []string
+	uncordoned      []string
+	drained         []string
+	deletedNodes    []string
+	localVolumes    map[string][]string
+	drainErr        error
 }
 
 func (f *fakeKube) CreateBootstrapToken(ctx context.Context, ttl time.Duration) (string, error) {
@@ -152,6 +154,14 @@ func (f *fakeKube) CreateBootstrapToken(ctx context.Context, ttl time.Duration) 
 }
 func (f *fakeKube) RevokeBootstrapToken(ctx context.Context, token string) error {
 	f.revokedTokens = append(f.revokedTokens, token)
+	return nil
+}
+func (f *fakeKube) RevokeBootstrapTokenID(ctx context.Context, id string) error {
+	f.revokedTokenIDs = append(f.revokedTokenIDs, id)
+	return nil
+}
+func (f *fakeKube) RenewBootstrapTokenID(ctx context.Context, id string, ttl time.Duration) error {
+	f.renewedTokenIDs = append(f.renewedTokenIDs, id)
 	return nil
 }
 func (f *fakeKube) CAHash(ctx context.Context) (string, error) { return "sha256:0011", nil }

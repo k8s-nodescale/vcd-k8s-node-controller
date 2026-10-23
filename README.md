@@ -139,6 +139,7 @@ One `K8sWorkerPool` describes the worker set of a single cluster. You own
 | `rollout.order` | no | `Descending` (default, highest ordinal first) or `Ascending`. |
 | `rollout.pauseOnFailure` | no | Stop the roll when a worker does not come back (default `true`). |
 | `rollout.readyTimeout` | no | How long a resized worker may take to become Ready (default `10m`). |
+| `provisioning.timeout` | no | How long a VM may run without its Kubernetes Node before the worker is parked as `Failed` (default `15m`). The VM is kept for inspection and the pool reports `Ready=False`/`WorkerFailed`; a registration that arrives later still promotes the worker to `Ready`. |
 
 `status`:
 
@@ -146,16 +147,17 @@ One `K8sWorkerPool` describes the worker set of a single cluster. You own
 | --- | --- |
 | `observedReplicas` | Worker **slots** the controller knows about: VMs that exist plus slots whose VM disappeared and stay reserved (`Missing` / parked `Failed`). |
 | `ledger.nextIndex` / `used[]` / `free[]` | Address book. `used` holds every allocated worker IP; addresses of deleted VMs are never released automatically. |
-| `nodes[]` | Per worker: `name` (the vCD VM name), `nodeName` (the Kubernetes Node object name, lower case - the only name the controller passes to the Kubernetes API), `ip`, `providerID` (the VM id in the platform, today `urn:vcloud:vm:...`), `phase`, `cpu`, `memoryMB`, `diskGB`, `k8sReady`, `kubeletVersion`, `message`, `deleteStartedAt`, `flavor` (what the VM actually runs with, read back from vCD), `healAttempts` / `healLastAttempt` (the AutoHeal budget), `resize` (the per-worker rollout step). `message` is where a blocked removal explains itself (the PDB, the attached volume, the local PV). |
+| `nodes[]` | Per worker: `name` (the vCD VM name), `nodeName` (the Kubernetes Node object name, lower case - the only name the controller passes to the Kubernetes API), `ip`, `providerID` (the VM id in the platform, today `urn:vcloud:vm:...`), `phase`, `cpu`, `memoryMB`, `diskGB`, `k8sReady`, `kubeletVersion`, `message`, `deleteStartedAt`, `flavor` (what the VM actually runs with, read back from vCD), `healAttempts` / `healLastAttempt` (the AutoHeal budget), `resize` (the per-worker rollout step), `provisioningStartedAt` (when the watchdog clock started for a VM that has no Node yet), `bootstrapTokenID` (the token kept alive until the join, then revoked; never the secret half). `message` is where a blocked removal explains itself (the PDB, the attached volume, the local PV). |
 | `rollout` | `phase` (`Idle`, `Progressing`, `Paused`), `targetFlavor`, `workersTotal`, `workersDone`, `currentWorker`, `lastError`, `startedAt`. |
-| `conditions[]` | `Ready`, with reason `Converged` (`3/3 workers Ready`), `Progressing` while a worker is not Ready yet, `WorkerMissing` when a slot lost its VM, `LastWorkerProtected` / `WorkerHostsController` on a refused emptying, `RolloutInProgress` while a roll holds the pool, `UnsupportedChange` for a shrink, plus `ScaleUpFailed`, `ScaleDownFailed`, `RolloutFailed` and `InvalidSpec` on errors. |
+| `conditions[]` | `Ready`, with reason `Converged` (`3/3 workers Ready`), `Progressing` while a worker is not Ready yet, `WorkerMissing` when a slot lost its VM, `WorkerFailed` when a worker is parked (drain timeout, exhausted AutoHeal, or no Node within `provisioning.timeout`), `LastWorkerProtected` / `WorkerHostsController` on a refused emptying, `RolloutInProgress` while a roll holds the pool, `UnsupportedChange` for a shrink, plus `ScaleUpFailed`, `ScaleDownFailed`, `RolloutFailed` and `InvalidSpec` on errors. |
 
 Phases: `Provisioning` (VM created, Node not registered yet) -> `Joining` (Node
 registered, not Ready) -> `Ready`. Removal uses `Draining` (cordon, pool
 removal, pod eviction) -> `Deleting` (detach wait, Node and VM deletion).
 `Resizing` marks a worker inside a rollout. `Missing` means the VM disappeared
-outside the controller and its slot is reserved; `Failed` means either the drain
-hit `drainTimeout` (VM kept) or AutoHeal exhausted its attempts.
+outside the controller and its slot is reserved; `Failed` means the drain hit
+`drainTimeout` (VM kept), AutoHeal exhausted its attempts, or no Node appeared
+within `provisioning.timeout` (VM kept).
 
 Example (placeholder org, network and template; nothing cluster-specific):
 
@@ -310,8 +312,11 @@ Raise `spec.replicas` on the pool, one replica at a time:
 kubectl -n default patch k8sworkerpool demo-cluster --type merge -p '{"spec":{"replicas":3}}'
 ```
 
-`kubectl -n default edit k8sworkerpool demo-cluster` works as well.
-`kubectl scale` does not: the CRD only exposes the `status` subresource.
+`kubectl -n default edit k8sworkerpool demo-cluster` works as well, and so does
+`kubectl -n default scale k8sworkerpool demo-cluster --replicas=3`: the CRD
+exposes the `scale` subresource (`spec.replicas` / `status.observedReplicas`),
+which also keeps `replicas` out of the alphabetically ordered YAML an editor
+shows.
 
 The next reconcile then does the whole job in one pass:
 
@@ -328,6 +333,13 @@ The next reconcile then does the whole job in one pass:
 5. as soon as the Node object exists the phase moves `Provisioning` ->
    `Joining` -> `Ready`, and `join.labels` / `join.taints` are applied.
 
+The token is a live credential with a ttl (`join.tokenTTL`, `1h` by default).
+While the worker is `Provisioning` or `Joining` the controller renews it
+whenever less than half the ttl remains, so a guest that is slow to reach
+`kubeadm join` does not find it expired. Once the Node is `Ready`, the token and
+its `cluster-info` JWS entry are deleted: only the id is kept, in
+`status.nodes[].bootstrapTokenID`, and never the secret half.
+
 A new worker gets `flavor.osDiskGB` on its system disk (bus 0/unit 0), applied
 to the clone before the first power-on. The knob does not resize anything: a
 worker that already exists keeps the disk it was created with. A template whose
@@ -337,6 +349,24 @@ shrink.
 Budget about five minutes per worker: ~2 min vCD clone and power-on, ~1 min
 first boot with the disk move, ~1 min guest bootstrap and join, the rest waiting
 for kubelet to report Ready.
+
+#### When a worker never registers
+
+A VM that boots but never registers a Node (a broken cloud-init, an apt mirror
+that does not answer, a full data disk) would otherwise sit in `Provisioning`
+forever. `spec.provisioning.timeout` bounds that window:
+
+```
+$ kubectl -n default get k8sworkerpool demo-cluster -o jsonpath='{range .status.nodes[*]}{.name} {.phase} {.message}{"\n"}{end}'
+demo-cluster-wrk-03 Failed VM has run for 16m0s without a Kubernetes Node (spec.provisioning.timeout=15m0s); the VM is kept for inspection
+```
+
+The watchdog reports, it does not repair: it emits `WorkerProvisioningTimeout`,
+parks the worker as `Failed` so the pool condition becomes
+`Ready=False`/`WorkerFailed` instead of a permanent `Progressing`, and leaves
+the VM running as evidence. If kubelet registers after all, the next pass
+promotes the worker to `Ready` and clears the clock. Raise the timeout for a
+slow template; do not remove the check.
 
 Watch it:
 
@@ -724,7 +754,7 @@ The floor and the flag are evaluated against what the pool can actually serve:
 ## Terraform integration contract
 
 - The Terraform module installs this chart behind a `node_controller.enabled`
-  toggle and pins `chart_version` / `image_tag` (currently `0.6.0`).
+  toggle and pins `chart_version` / `image_tag` (currently `0.7.0`).
 - **Once the controller is enabled, do not use Terraform to manage worker count
   or worker LB pool membership.** Use the CRD instead. The Terraform module's
   README must state this explicitly.
@@ -755,7 +785,7 @@ Build locally (the Dockerfile uses `golang:1.27.1-alpine` and
 `gcr.io/distroless/static:nonroot`):
 
 ```
-docker build -t docker.io/werton13/vcd-k8s-node-controller:0.6.0 .
+docker build -t docker.io/werton13/vcd-k8s-node-controller:0.7.0 .
 ```
 
 Public module defaults are used inside the build. On a restricted network,
@@ -765,14 +795,14 @@ override them:
 docker build \
   --build-arg GOPROXY=https://nexus.example.com/repository/golang/ \
   --build-arg GOSUMDB=off \
-  -t docker.io/werton13/vcd-k8s-node-controller:0.6.0 .
+  -t docker.io/werton13/vcd-k8s-node-controller:0.7.0 .
 ```
 
 Push (or use `make image-push`):
 
 ```
 docker login docker.io
-docker push docker.io/werton13/vcd-k8s-node-controller:0.6.0
+docker push docker.io/werton13/vcd-k8s-node-controller:0.7.0
 docker push docker.io/werton13/vcd-k8s-node-controller:latest
 ```
 

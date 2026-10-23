@@ -20,6 +20,10 @@ import (
 const (
 	defaultHealRetries = 3
 	defaultHealBackoff = 2 * time.Minute
+
+	// defaultProvisioningTimeout matches the CRD default of
+	// spec.provisioning.timeout.
+	defaultProvisioningTimeout = 15 * time.Minute
 )
 
 // policyFor returns the effective reconciliation policy. The CRD default is
@@ -45,6 +49,16 @@ func healBackoff(pool *infrav1.K8sWorkerPool) time.Duration {
 		return d
 	}
 	return defaultHealBackoff
+}
+
+// provisioningTimeout is how long a VM may run without its Node before the
+// watchdog parks the worker. The CRD defaults spec.provisioning.timeout to
+// 15m; the fallback also covers an object written before the field existed.
+func provisioningTimeout(pool *infrav1.K8sWorkerPool) time.Duration {
+	if d := pool.Spec.Provisioning.Timeout.Duration; d > 0 {
+		return d
+	}
+	return defaultProvisioningTimeout
 }
 
 // mergeMissingSlots keeps a worker whose VM disappeared outside the loop. The
@@ -81,6 +95,7 @@ func (r *WorkerPoolReconciler) mergeMissingSlots(pool *infrav1.K8sWorkerPool, no
 		prev.Phase = infrav1.NodePhaseMissing
 		prev.K8sReady = false
 		prev.ProviderID = ""
+		prev.ProvisioningStartedAt = nil
 		prev.Message = fmt.Sprintf("VM is missing from vCD; slot %s (%s) stays reserved (reconciliation.policy=%s)",
 			prev.Name, prev.IP, policyFor(pool))
 		out = append(out, prev)
@@ -139,7 +154,7 @@ func (r *WorkerPoolReconciler) reconcileMissing(ctx context.Context, pool *infra
 			}
 		}
 
-		vm, err := r.createWorker(ctx, pool, alloc, n.Name, n.IP)
+		vm, tokID, err := r.createWorker(ctx, pool, alloc, n.Name, n.IP)
 		now := metav1.Now()
 		n.HealAttempts++
 		n.HealLastAttempt = &now
@@ -155,6 +170,8 @@ func (r *WorkerPoolReconciler) reconcileMissing(ctx context.Context, pool *infra
 		n.Phase = infrav1.NodePhaseProvisioning
 		n.K8sReady = false
 		n.Message = ""
+		n.ProvisioningStartedAt = &now
+		n.BootstrapTokenID = tokID
 		r.eventf(pool, corev1.EventTypeNormal, "WorkerHealed",
 			fmt.Sprintf("recreated worker %s (%s) in its reserved slot (attempt %d/%d)", n.Name, n.IP, n.HealAttempts, retries))
 	}

@@ -106,7 +106,7 @@ func (c *Client) CAHash(ctx context.Context) (string, error) {
 }
 
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;update;delete,namespace=kube-public
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;delete,namespace=kube-system
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;update;delete,namespace=kube-system
 
 // CreateBootstrapToken creates a short-lived kubeadm bootstrap token via the API
 // and publishes the JWS signature kubeadm needs for token-based discovery.
@@ -225,6 +225,15 @@ func (c *Client) RevokeBootstrapToken(ctx context.Context, token string) error {
 	if !ok || id == "" {
 		return nil
 	}
+	return c.RevokeBootstrapTokenID(ctx, id)
+}
+
+// RevokeBootstrapTokenID removes a token by id. The id is safe to keep in
+// status; the secret half never leaves the guest.
+func (c *Client) RevokeBootstrapTokenID(ctx context.Context, id string) error {
+	if id == "" {
+		return nil
+	}
 	var errs []error
 	if err := c.cs.CoreV1().Secrets("kube-system").Delete(ctx, "bootstrap-token-"+id, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
 		errs = append(errs, err)
@@ -245,6 +254,39 @@ func (c *Client) RevokeBootstrapToken(ctx context.Context, token string) error {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
+}
+
+// RenewBootstrapTokenID pushes a token's expiration out by one ttl when less
+// than half of it is left. The guest already holds the token string, so
+// extending the Secret is all a slow install needs; the half-ttl threshold
+// makes renewal idempotent instead of a write on every reconcile pass.
+func (c *Client) RenewBootstrapTokenID(ctx context.Context, id string, ttl time.Duration) error {
+	if id == "" {
+		return nil
+	}
+	if ttl <= 0 {
+		ttl = time.Hour
+	}
+	secrets := c.cs.CoreV1().Secrets("kube-system")
+	secret, err := secrets.Get(ctx, "bootstrap-token-"+id, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	if raw := secret.Data["expiration"]; len(raw) > 0 {
+		if exp, err := time.Parse(time.RFC3339, string(raw)); err == nil && exp.Sub(now) > ttl/2 {
+			return nil
+		}
+	}
+	if secret.Data == nil {
+		secret.Data = map[string][]byte{}
+	}
+	secret.Data["expiration"] = []byte(now.Add(ttl).Format(time.RFC3339))
+	_, err = secrets.Update(ctx, secret, metav1.UpdateOptions{})
+	return err
 }
 
 // WaitReady polls until the named Node reports Ready.

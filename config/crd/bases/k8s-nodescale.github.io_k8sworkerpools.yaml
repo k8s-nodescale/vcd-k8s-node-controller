@@ -209,6 +209,22 @@ spec:
                 description: NamePrefix is the DNS-safe prefix used to build worker
                   names (e.g. myorg-cluster-prod).
                 type: string
+              provisioning:
+                description: |-
+                  Provisioning bounds the window between "the VM exists" and "kubelet has
+                  registered a Node". A worker that stays in that window longer is parked
+                  as Failed so the pool reports it instead of waiting forever.
+                properties:
+                  timeout:
+                    default: 15m
+                    description: |-
+                      Timeout is how long a worker may sit in Provisioning with a VM but no
+                      Kubernetes Node object. When it elapses the worker's phase becomes
+                      Failed and the pool reports Ready=False/WorkerFailed; the VM is left
+                      running for inspection, and a late registration still promotes the
+                      worker to Ready. The default is 15m; a zero value means the default.
+                    type: string
+                type: object
               reconciliation:
                 description: |-
                   Reconciliation controls what happens when a worker's VM disappears
@@ -445,6 +461,13 @@ spec:
                 items:
                   description: WorkerNodeStatus describes a single managed worker.
                   properties:
+                    bootstrapTokenID:
+                      description: |-
+                        BootstrapTokenID is the id of the bootstrap token this worker's guest was
+                        given at create time: the half of "id.secret" that is not a credential by
+                        itself. It lets the controller renew a slow install and revoke the token
+                        once the Node is Ready without keeping the secret half in status.
+                      type: string
                     cpu:
                       format: int32
                       type: integer
@@ -527,6 +550,14 @@ spec:
                         The controller only hands it back to the provider, so a second
                         platform needs no change to this field.
                       type: string
+                    provisioningStartedAt:
+                      description: |-
+                        ProvisioningStartedAt is when this worker entered Provisioning, i.e.
+                        when the controller began waiting for kubelet to register a Node for an
+                        existing VM. It anchors spec.provisioning.timeout and is cleared once
+                        the Node exists. A worker adopted with a registered Node never gets it.
+                      format: date-time
+                      type: string
                     resize:
                       description: Resize tracks the rollout of this worker, when
                         one is in progress.
@@ -590,4 +621,7 @@ spec:
     served: true
     storage: true
     subresources:
+      scale:
+        specReplicasPath: .spec.replicas
+        statusReplicasPath: .status.observedReplicas
       status: {}

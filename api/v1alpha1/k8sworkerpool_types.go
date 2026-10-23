@@ -105,6 +105,24 @@ type K8sWorkerPoolSpec struct {
 	// zero value means a Rolling rollout, one worker at a time.
 	// +optional
 	Rollout RolloutPolicy `json:"rollout,omitempty"`
+
+	// Provisioning bounds the window between "the VM exists" and "kubelet has
+	// registered a Node". A worker that stays in that window longer is parked
+	// as Failed so the pool reports it instead of waiting forever.
+	// +optional
+	Provisioning ProvisioningPolicy `json:"provisioning,omitempty"`
+}
+
+// ProvisioningPolicy bounds how long a created VM may run without its Node.
+type ProvisioningPolicy struct {
+	// Timeout is how long a worker may sit in Provisioning with a VM but no
+	// Kubernetes Node object. When it elapses the worker's phase becomes
+	// Failed and the pool reports Ready=False/WorkerFailed; the VM is left
+	// running for inspection, and a late registration still promotes the
+	// worker to Ready. The default is 15m; a zero value means the default.
+	// +kubebuilder:default="15m"
+	// +optional
+	Timeout metav1.Duration `json:"timeout,omitempty"`
 }
 
 // ReconciliationPolicy decides what the controller does with a worker whose VM
@@ -371,6 +389,20 @@ type WorkerNodeStatus struct {
 	// Resize tracks the rollout of this worker, when one is in progress.
 	// +optional
 	Resize *ResizeStatus `json:"resize,omitempty"`
+
+	// BootstrapTokenID is the id of the bootstrap token this worker's guest was
+	// given at create time: the half of "id.secret" that is not a credential by
+	// itself. It lets the controller renew a slow install and revoke the token
+	// once the Node is Ready without keeping the secret half in status.
+	// +optional
+	BootstrapTokenID string `json:"bootstrapTokenID,omitempty"`
+
+	// ProvisioningStartedAt is when this worker entered Provisioning, i.e.
+	// when the controller began waiting for kubelet to register a Node for an
+	// existing VM. It anchors spec.provisioning.timeout and is cleared once
+	// the Node exists. A worker adopted with a registered Node never gets it.
+	// +optional
+	ProvisioningStartedAt *metav1.Time `json:"provisioningStartedAt,omitempty"`
 }
 
 // FlavorStatus is the compute shape a VM runs with, as reported by vCD.
@@ -403,6 +435,7 @@ type RolloutStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:subresource:scale:specpath=.spec.replicas,statuspath=.status.observedReplicas
 // +kubebuilder:resource:shortName=k8swp,scope=Namespaced
 // +kubebuilder:printcolumn:name="Desired",type=integer,JSONPath=`.spec.replicas`
 // +kubebuilder:printcolumn:name="Observed",type=integer,JSONPath=`.status.observedReplicas`
