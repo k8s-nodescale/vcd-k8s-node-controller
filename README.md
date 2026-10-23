@@ -284,6 +284,19 @@ helm install vcd-nodescale charts/vcd-nodescale \
 The chart installs the CRD, the controller and the RBAC it needs, including
 `configmaps` `get`/`update` in `kube-public` for the JWS publication.
 
+**Upgrading.** Helm installs `crds/` on install only: `helm upgrade` never touches
+the CRD. Apply it first, otherwise the API server prunes the newer status
+fields and the new subresources are missing:
+
+```
+kubectl apply -f charts/vcd-nodescale/crds/k8s-nodescale.github.io_k8sworkerpools.yaml
+helm upgrade vcd-nodescale charts/vcd-nodescale -n vcd-nodescale-system \
+  --reuse-values --set image.tag=<version>
+```
+
+The `scale` subresource lives in the CRD, so `kubectl scale` works only after
+that apply.
+
 3. Apply a `K8sWorkerPool` (see `config/samples/` and the resource reference
    above), then use it as described in **How to use**.
 
