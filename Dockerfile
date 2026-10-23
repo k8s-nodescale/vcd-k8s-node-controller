@@ -26,7 +26,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 FROM gcr.io/distroless/static:nonroot
 LABEL org.opencontainers.image.title="vcd-k8s-node-controller" \
       org.opencontainers.image.description="Kubernetes worker-node scaling controller for VMware Cloud Director" \
-      org.opencontainers.image.source="https://github.com/werton13/vcd-k8s-node-controller" \
+      org.opencontainers.image.source="https://github.com/k8s-nodescale/vcd-k8s-node-controller" \
       org.opencontainers.image.licenses="Apache-2.0"
 COPY --from=build /out/manager /manager
 USER 65532:65532

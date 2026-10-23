@@ -266,7 +266,7 @@ make manifests
 2. Install the chart from the published repository:
 
 ```
-helm repo add vcd-nodescale https://werton13.github.io/vcd-k8s-node-controller
+helm repo add vcd-nodescale https://k8s-nodescale.github.io/vcd-k8s-node-controller
 helm repo update
 helm install vcd-nodescale vcd-nodescale/vcd-nodescale \
   --namespace vcd-nodescale-system --create-namespace
@@ -633,7 +633,7 @@ affinity:
 
 ```
 helm upgrade vcd-nodescale vcd-nodescale -n vcd-nodescale-system \
-  --repo https://werton13.github.io/vcd-k8s-node-controller \
+  --repo https://k8s-nodescale.github.io/vcd-k8s-node-controller \
   -f values-control-plane.yaml
 ```
 
@@ -792,9 +792,9 @@ chart, the image and the Terraform pin drift apart (`0.1.1` in tfvars while
    `DOCKERHUB_TOKEN` and fails without them.
 3. **Chart on GitHub Pages** - `helm package charts/vcd-nodescale`, copy the
    `.tgz` into a `gh-pages` checkout, `helm repo index . --url
-   https://werton13.github.io/vcd-k8s-node-controller/`, commit and push. The
+   https://k8s-nodescale.github.io/vcd-k8s-node-controller/`, commit and push. The
    Pages deploy job can sit `queued` for 10+ minutes; verify
-   `https://werton13.github.io/vcd-k8s-node-controller/vcd-nodescale-<tag>.tgz`
+   `https://k8s-nodescale.github.io/vcd-k8s-node-controller/vcd-nodescale-<tag>.tgz`
    returns 200 before calling it done.
 4. **Pins in the consumers** - the same version in all three:
    - `tf-vcloud-k8s` `variables.tf` (`node_controller.chart_version` /
