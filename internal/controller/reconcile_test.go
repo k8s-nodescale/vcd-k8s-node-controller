@@ -147,6 +147,10 @@ type fakeKube struct {
 	deletedNodes    []string
 	localVolumes    map[string][]string
 	drainErr        error
+	forcedEvictions []string
+	forceEvictErr   error
+	forceEvictPods  []string
+	forceEvictPDBs  []string
 }
 
 func (f *fakeKube) CreateBootstrapToken(ctx context.Context, ttl time.Duration) (string, error) {
@@ -189,6 +193,17 @@ func (f *fakeKube) Drain(ctx context.Context, name string, timeout time.Duration
 	}
 	f.drained = append(f.drained, name)
 	return nil
+}
+func (f *fakeKube) ForceEvict(ctx context.Context, name string) (kube.EvictionReport, error) {
+	if f.forceEvictErr != nil {
+		return kube.EvictionReport{}, f.forceEvictErr
+	}
+	f.forcedEvictions = append(f.forcedEvictions, name)
+	report := kube.EvictionReport{Pods: f.forceEvictPods, Budgets: f.forceEvictPDBs}
+	if report.Pods == nil {
+		report.Pods = []string{"default/web-0"}
+	}
+	return report, nil
 }
 func (f *fakeKube) WaitVolumesDetached(ctx context.Context, name string, timeout time.Duration) error {
 	return nil

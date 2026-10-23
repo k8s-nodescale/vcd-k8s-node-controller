@@ -29,7 +29,8 @@ Implemented:
 - Scale-in: lowering `spec.replicas` removes the highest-ordinal worker, while
   `spec.scaleDown.deleteWorkers` and the `k8s-nodescale.github.io/delete-worker`
   annotation remove a worker **by name**. Every removal is cordon -> ingress-pool
-  removal -> PDB-aware drain (eviction API) -> volume-detach wait -> Node delete
+  removal -> PDB-aware drain (eviction API, escalating past a stuck budget once
+  `drainTimeout` is spent) -> volume-detach wait -> Node delete
   -> VM delete -> address release, bounded by `scaleDown.drainTimeout` and
   guarded by `minReplicas` (a floor on workers able to serve, so a `Missing`
   slot cannot make the pool look bigger than it is) and a node-local volume
@@ -127,9 +128,10 @@ One `K8sWorkerPool` describes the worker set of a single cluster. You own
 | `join.labels` / `join.taints` | no | Pool-wide, applied to every Ready worker (`taints` in `key[=value]:Effect` form). |
 | `ingressPool` | no | `type` (`nsxv`/`nsxt`), `name`, `port`, `edge`. `port` is the **node port** the pool forwards to, not the virtual-server port; `edge` is the NSX-V edge that owns the pool. Workers are added on Ready and removed before a drain. |
 | `scaleDown.minReplicas` | no | Floor for the workers that can serve traffic (default `1`). A removal that would leave fewer is refused. Writing off a `Missing` slot takes nothing out of service, so the floor never blocks that cleanup. `0` disables the floor. |
-| `scaleDown.drainTimeout` | no | Budget for cordon+drain of one worker (default `10m`). When it expires the worker is `Failed` and its VM is kept. |
+| `scaleDown.drainTimeout` | no | Budget for cordon+drain of one worker (default `10m`). When it expires the removal escalates past a blocking PodDisruptionBudget: the pods left on the node are deleted, the budget is named in `status`, and the removal continues with a fresh budget. |
+| `scaleDown.waitForPDB` | no | Refuse to bypass a PodDisruptionBudget (default `false`). With `true` a drain that cannot finish within `drainTimeout` parks the worker `Failed` and keeps its VM for a human instead of escalating. |
 | `scaleDown.deleteWorkers[]` | no | Worker names to remove regardless of their position. Each entry is drained and deleted, then removed from this list and `spec.replicas` is decremented so the worker is **not** recreated. |
-| `scaleDown.force` | no | Skip the node-local volume guard. Per-node override: annotation `k8s-nodescale.github.io/force-delete=true`. Never skips PDBs or the detach wait. |
+| `scaleDown.force` | no | Skip the node-local volume guard. Per-node override: annotation `k8s-nodescale.github.io/force-delete=true`. Never bypasses a PodDisruptionBudget on its own and never skips the detach wait. |
 | `scaleDown.allowLastWorker` | no | Permit a request that leaves the pool with zero workers. Needs `scaleDown.minReplicas: 0`; a higher floor is rejected as `InvalidSpec` instead of accepting a flag that could never be honoured. Refused anyway on the worker the controller runs on and on node-local volumes. |
 | `reconciliation.policy` | no | `Notify` (default) or `AutoHeal`. What happens when a worker's VM disappears outside the controller. |
 | `reconciliation.autoHealRetries` | no | Recreations AutoHeal attempts for one slot before parking it as `Failed` (default `3`). |
@@ -484,10 +486,16 @@ A removal is one step per reconcile pass, visible in `status.nodes[].phase`:
    raises a `IngressPoolMemberNotRemoved` event instead of silently pretending.
 3. **Drain through the eviction API.** DaemonSet and mirror pods are skipped;
    every other pod is evicted with the eviction subresource, so a
-   PodDisruptionBudget blocks the eviction instead of being bypassed. While a
-   budget has no disruptions left the worker stays `Draining` and the message
-   names the budget. The whole step is bounded by `scaleDown.drainTimeout`; when
-   it expires the phase becomes `Failed` and the VM is kept.
+   PodDisruptionBudget is honoured instead of being bypassed. While a budget has
+   no disruptions left the worker stays `Draining` and the message names the
+   budget. The step is bounded by `scaleDown.drainTimeout`; when it expires the
+   removal **escalates**: the pods still on the node are deleted through the
+   API (not the eviction API), which is the only way past a budget that can
+   never allow a disruption (`minAvailable` equal to the replica count, one
+   replica with nowhere to move). The status message and a `DrainEscalated`
+   warning list every budget that was bypassed, the budget clock restarts and
+   the removal continues. `scaleDown.waitForPDB: true` turns the escalation
+   off: the phase becomes `Failed` and the VM is kept.
 4. **Volume gate.** Wait until no `VolumeAttachment` references the node.
    Destroying a VM with an attached volume strands the volume in the storage
    backend and can leave the PV bound forever.
@@ -501,6 +509,25 @@ A removal is one step per reconcile pass, visible in `status.nodes[].phase`:
    included), the address goes back to `status.ledger.free` and the worker
    leaves `status.nodes`. Pods of the deleted Node are reaped by the pod
    garbage collector.
+
+#### What can hold a removal, and what the controller does about it
+
+A drain has to get past everything that can keep a pod on a node. None of it is
+allowed to strand a worker the pool was told to remove:
+
+| Blocker | Handling |
+| --- | --- |
+| `PodDisruptionBudget` with no disruptions allowed | Honoured for `scaleDown.drainTimeout`. When the budget is spent the pods left on the node are deleted through the API - the only way past `minAvailable` equal to the replica count - and the status message and the `DrainEscalated` event name the budget. |
+| Pod without a controller (bare pod) | Evicted like any other: removing the node is the point, and there is nowhere else for it to go. |
+| DaemonSet and mirror (static) pods | Skipped by design: they belong to the node, and deleting the Node object is what reaps them. |
+| Pod that tolerates `node.kubernetes.io/unschedulable` | Left to go with the node (`tigera-operator` is the classic case). Evicting it is a loop: it is rescheduled onto the cordoned node it was evicted from. |
+| `VolumeAttachment` still pointing at the node | The removal waits for it and never skips it; destroying the VM first strands the volume in the storage backend. |
+| `hostPath` / `local` PV on the node | Refused with `VolumeDataAtRisk` unless `scaleDown.force` or the per-node `force-delete` annotation accepts the data loss. |
+| Pod with a long `terminationGracePeriodSeconds` | The escalation deletes it with its own grace period; the next pass moves on once it is gone. |
+
+`scaleDown.waitForPDB: true` replaces the escalation in the first row with a
+refusal: the worker is parked `Failed`, the VM is kept and the request is
+retried with a fresh budget. Use it where a budget must always win.
 
 #### What "deleting a Kubernetes node" means here
 
@@ -522,11 +549,12 @@ Notes:
 - Pods using `emptyDir` are evicted and their data goes with them - that is the
   point of deleting a node.
 - A `Failed` removal keeps retrying while the request stands: one pass reports
-  `Failed` with the reason (the PDB, the attached volume), the next one starts a
-  fresh `drainTimeout` budget and goes back to `Draining`. A count-based
-  scale-down refuses to start while any worker is `Failed`, so one stuck removal
-  never cascades into a second one. Prune the request (`deleteWorkers` entry or
-  the node annotation) to stop it.
+  `Failed` with the reason (a budget when `waitForPDB: true`, an attached
+  volume, a refusal), the next one starts a fresh `drainTimeout` budget and goes
+  back to `Draining`. A count-based scale-down refuses to start while any worker
+  is `Failed`, so one stuck removal never cascades into a second one. Prune the
+  request (`deleteWorkers` entry or the node annotation) to stop it; a request
+  that is withdrawn is undone instead: the worker is uncordoned and serves again.
 - Nothing is removed from the vApp except the VM: its disks are part of the VM,
   the data-disk VMDKs included.
 - The removal is resumable. Every step is persisted in `status` before it is
@@ -730,10 +758,12 @@ the cluster** - set the flag only when you mean it, and read the following first
 - Every pod on that worker is evicted: ingress-nginx, any CoreDNS replica that
   landed there, metrics-server, the CSI node plugins, the calico-node DaemonSet.
   A PodDisruptionBudget whose `minAvailable` equals its current replica count
-  (the classic `minAvailable: 1` on a single-replica workload) blocks the drain
-  forever. That block is the correct answer: the workload has nowhere else to go.
-  Draining the last worker therefore fails with `Failed` and the VM is kept -
-  which is the controller telling you the pool is load-bearing, not a bug.
+  (the classic `minAvailable: 1` on a single-replica workload) is honoured
+  until `drainTimeout` and then bypassed, with the budget named in `status`
+  and in a `DrainEscalated` warning: on the last worker the workload has
+  nowhere else to go, so waiting can never end differently. The pod is deleted
+  and comes back when the pool does. Set `scaleDown.waitForPDB: true` to stop
+  at `Failed` with the VM kept instead.
 - What remains is the control plane, CoreDNS when it can run on a master, the
   controller and the vCD API. Nothing else can be scheduled, so every workload
   with a PDB, a `hostPort` or a `local`/`hostPath` PV is down until the pool is
@@ -747,7 +777,8 @@ Two cases are refused regardless of the flag, because they are physics rather
 than policy: the node the controller itself runs on (a pass that deletes its own
 host cannot write `status` or create the replacement - move the controller off
 the pool instead), and a worker whose `hostPath`/`local` PVs would be destroyed
-(`scaleDown.force` overrides only the PV check, never a PDB).
+(`scaleDown.force` overrides only the PV check; a PDB is bypassed only by
+the escalation after `drainTimeout`).
 
 The floor and the flag are evaluated against what the pool can actually serve:
 

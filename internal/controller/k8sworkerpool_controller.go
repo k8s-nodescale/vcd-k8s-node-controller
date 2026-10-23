@@ -199,6 +199,19 @@ func (r *WorkerPoolReconciler) reconcile(ctx context.Context, pool *infrav1.K8sW
 		}
 	}
 
+	// A removal the operator no longer asks for is reverted before the deletion
+	// pass: appendInFlightDeletions keeps a Draining worker alive
+	// unconditionally, which would otherwise finish a removal that
+	// spec.replicas has already taken back.
+	if handled, res, err := r.reconcileWithdrawnDeletions(ctx, pool); handled {
+		if err != nil {
+			logger.Error(err, "could not revert a withdrawn removal", "pool", pool.Name)
+			r.setCondition(pool, metav1.ConditionFalse, "ScaleDownFailed", err.Error())
+			return res, err
+		}
+		return res, nil
+	}
+
 	// Named deletions (spec.scaleDown.deleteWorkers and the per-node
 	// annotation) run before the replica arithmetic: deleting a specific
 	// worker must not be read as a scale-up.

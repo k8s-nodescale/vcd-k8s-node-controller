@@ -121,6 +121,73 @@ func appendInFlightDeletions(pool *infrav1.K8sWorkerPool, requests []deletionReq
 	return requests
 }
 
+// reconcileWithdrawnDeletions returns a cordoned worker to service when the
+// request that cordoned it is gone.
+//
+// A count-based removal is recomputed from spec.replicas on every pass, so
+// raising spec.replicas again withdraws it; a named one is withdrawn by taking
+// the name out of scaleDown.deleteWorkers. Without this the worker stayed
+// cordoned with deleteStartedAt set: the pool counted a slot it could not use,
+// provisioned a replacement next to the worker it should have brought back and
+// reported Ready=False for good. Seen on the dev cluster after a drain blocked
+// by a PodDisruptionBudget timed out and the operator scaled back up.
+//
+// A removal that is still wanted stays with reconcileDeletions: a shrinking
+// pool keeps draining, and a name still listed in the spec keeps its request
+// (a Failed drain then retries with a fresh budget).
+func (r *WorkerPoolReconciler) reconcileWithdrawnDeletions(ctx context.Context, pool *infrav1.K8sWorkerPool) (bool, ctrl.Result, error) {
+	pending := false
+	for _, node := range pool.Status.Nodes {
+		if node.DeleteStartedAt != nil &&
+			(node.Phase == infrav1.NodePhaseDraining || node.Phase == infrav1.NodePhaseFailed) {
+			pending = true
+			break
+		}
+	}
+	if !pending {
+		return false, ctrl.Result{}, nil
+	}
+	// While the pool still has to shrink, a count-based removal is in progress
+	// rather than withdrawn.
+	if int32(len(pool.Status.Nodes)) > pool.Spec.Replicas {
+		return false, ctrl.Result{}, nil
+	}
+	requests, err := r.deletionRequests(ctx, pool)
+	if err != nil {
+		return false, ctrl.Result{}, err
+	}
+	named := make(map[string]bool, len(requests))
+	for _, req := range requests {
+		named[strings.ToLower(req.name)] = true
+	}
+
+	for i := range pool.Status.Nodes {
+		node := &pool.Status.Nodes[i]
+		if node.DeleteStartedAt == nil {
+			continue
+		}
+		if node.Phase != infrav1.NodePhaseDraining && node.Phase != infrav1.NodePhaseFailed {
+			continue
+		}
+		if named[strings.ToLower(node.Name)] {
+			continue
+		}
+		kubeName, err := r.kubeNodeName(ctx, node)
+		if err != nil {
+			return false, ctrl.Result{}, err
+		}
+		if err := r.revertDeletion(ctx, pool, node, kubeName, "the removal request was withdrawn"); err != nil {
+			node.Message = "the removal was withdrawn but the cordon could not be reverted: " + err.Error()
+			return true, ctrl.Result{RequeueAfter: requeueProgressing}, err
+		}
+		node.Message = "the removal request was withdrawn; the worker is back in service"
+		r.eventf(pool, corev1.EventTypeNormal, "WorkerDeletionWithdrawn",
+			fmt.Sprintf("worker %s: the removal request was withdrawn, the cordon was reverted", node.Name))
+		return true, ctrl.Result{RequeueAfter: deleteStepRequeue}, nil
+	}
+	return false, ctrl.Result{}, nil
+}
+
 // runDeletions advances each requested worker by at most one step and then
 // returns. Draining is a minutes-long operation; one step per pass keeps the
 // work queue free and makes progress visible in status.
@@ -191,7 +258,7 @@ func (r *WorkerPoolReconciler) deleteWorkerStep(ctx context.Context, pool *infra
 				// The removal had already cordoned the worker. The policy no
 				// longer allows it, so put the worker back into service instead
 				// of leaving it Draining under a refusal.
-				if err := r.revertDeletion(ctx, pool, node, kubeName); err != nil {
+				if err := r.revertDeletion(ctx, pool, node, kubeName, "the removal was refused by policy"); err != nil {
 					msg += "; the worker stays cordoned: " + err.Error()
 				} else {
 					msg += "; the drain was reverted and the worker uncordoned"
@@ -285,20 +352,51 @@ func (r *WorkerPoolReconciler) deleteWorkerStep(ctx context.Context, pool *infra
 	deadline := node.DeleteStartedAt.Add(budget)
 	switch node.Phase {
 	case infrav1.NodePhaseDraining:
-		if time.Now().After(deadline) {
-			node.Phase = infrav1.NodePhaseFailed
-			msg := fmt.Sprintf("drain did not finish within %s: %s", budget, node.Message)
-			node.Message = msg
-			r.setCondition(pool, metav1.ConditionFalse, "ScaleDownFailed", msg)
-			r.eventf(pool, corev1.EventTypeWarning, "ScaleDownFailed", msg)
-			return true, ctrl.Result{RequeueAfter: requeueProgressing}, nil
-		}
 		if kubeName == "" {
 			// No Node object: the worker never joined, or its registration is
 			// gone already. Nothing to drain, go straight to the deletion.
 			node.Phase = infrav1.NodePhaseDeleting
 			node.Message = "no Node object to drain; waiting for volumes to detach"
 			return false, ctrl.Result{RequeueAfter: deleteStepRequeue}, nil
+		}
+		if time.Now().After(deadline) {
+			// The budget is spent. A PodDisruptionBudget is the usual reason a
+			// drain cannot finish: minAvailable equal to the replica count, or a
+			// single replica with nowhere to move. Waiting changes nothing and
+			// the pool owner asked for the worker to go, so the removal
+			// escalates: the pods left behind are deleted through the API
+			// instead of the eviction API, which bypasses the budget.
+			// scaleDown.waitForPDB turns this into the old refusal for
+			// clusters where a budget must win and a human decides.
+			if pool.Spec.ScaleDown.WaitForPDB {
+				node.Phase = infrav1.NodePhaseFailed
+				msg := fmt.Sprintf("drain did not finish within %s: %s", budget, node.Message)
+				node.Message = msg
+				r.setCondition(pool, metav1.ConditionFalse, "ScaleDownFailed", msg)
+				r.eventf(pool, corev1.EventTypeWarning, "ScaleDownFailed", msg)
+				return true, ctrl.Result{RequeueAfter: requeueProgressing}, nil
+			}
+			report, err := r.Kube.ForceEvict(ctx, kubeName)
+			if err != nil {
+				node.Message = "the drain budget is spent and the pods left behind could not be removed: " + err.Error()
+				return false, ctrl.Result{}, err
+			}
+			if len(report.Pods) > 0 {
+				// A fresh budget: the deletion request now needs the pass to
+				// observe the pods actually leaving before it can finish.
+				now := metav1.Now()
+				node.DeleteStartedAt = &now
+				msg := fmt.Sprintf("drain budget spent after %s: deleted %d pod(s) to free %s",
+					budget, len(report.Pods), node.Name)
+				if len(report.Budgets) > 0 {
+					msg += "; bypassed PodDisruptionBudget(s): " + strings.Join(report.Budgets, ", ")
+				}
+				node.Message = msg
+				r.eventf(pool, corev1.EventTypeWarning, "DrainEscalated", msg)
+				return false, ctrl.Result{RequeueAfter: deleteStepRequeue}, nil
+			}
+			// Nothing was left to force out (the pods are already terminating):
+			// fall through to the regular drain so this pass can move on.
 		}
 		err := r.Kube.Drain(ctx, kubeName, time.Until(deadline))
 		switch {
@@ -439,18 +537,21 @@ func (r *WorkerPoolReconciler) scaleDown(ctx context.Context, pool *infrav1.K8sW
 		return workerOrdinal(candidates[i].Name) > workerOrdinal(candidates[j].Name)
 	})
 
-	// A worker left in Failed still occupies an address and counts as observed.
-	// Deleting a healthy worker to satisfy the count would hide it, so the pool
-	// stops until the failed worker is resolved or its request is withdrawn.
+	// A worker left in Failed still occupies an address and counts as observed,
+	// so deleting a healthy worker to satisfy the count would hide it. The
+	// standing count is also a standing request, though: the parked worker is
+	// the one to remove, and it gets a fresh drain budget here. A PDB that
+	// keeps refusing a disruption then costs one retry per budget (and the
+	// message keeps saying why) instead of parking the pool until someone
+	// withdraws the request by hand.
 	for _, node := range pool.Status.Nodes {
 		if node.Phase != infrav1.NodePhaseFailed {
 			continue
 		}
-		msg := fmt.Sprintf("scale-down paused: %s is Failed (%s); retry or withdraw its deletion request first",
-			node.Name, node.Message)
-		r.setCondition(pool, metav1.ConditionFalse, "ScaleDownFailed", msg)
-		r.eventf(pool, corev1.EventTypeWarning, "ScaleDownFailed", msg)
-		return true, ctrl.Result{RequeueAfter: requeueConverged}, nil
+		if skip[strings.ToLower(node.Name)] {
+			continue
+		}
+		return r.runDeletions(ctx, pool, alloc, []deletionRequest{{name: node.Name}})
 	}
 
 	// Each candidate still serves, so taking one out is a real reduction: the
@@ -491,7 +592,7 @@ func (r *WorkerPoolReconciler) scaleDown(ctx context.Context, pool *infrav1.K8sW
 // its Node object still exists, so uncordoning puts the worker back into
 // service. A worker in Deleting is never reverted, because its VM is already
 // being stopped and stopping halfway would leave something nothing owns.
-func (r *WorkerPoolReconciler) revertDeletion(ctx context.Context, pool *infrav1.K8sWorkerPool, node *infrav1.WorkerNodeStatus, kubeName string) error {
+func (r *WorkerPoolReconciler) revertDeletion(ctx context.Context, pool *infrav1.K8sWorkerPool, node *infrav1.WorkerNodeStatus, kubeName, why string) error {
 	if kubeName != "" {
 		if err := r.Kube.Uncordon(ctx, kubeName); err != nil && !apierrors.IsNotFound(err) {
 			return err
@@ -504,7 +605,7 @@ func (r *WorkerPoolReconciler) revertDeletion(ctx context.Context, pool *infrav1
 		node.Phase = infrav1.NodePhaseJoining
 	}
 	r.eventf(pool, corev1.EventTypeNormal, "WorkerDeletionReverted",
-		fmt.Sprintf("worker %s: the removal was refused by policy, the cordon was reverted", node.Name))
+		fmt.Sprintf("worker %s: %s, the cordon was reverted", node.Name, why))
 	return nil
 }
 

@@ -135,6 +135,56 @@ func (c *Client) Drain(ctx context.Context, name string, timeout time.Duration) 
 	}
 }
 
+// EvictionReport records what ForceEvict did: the pods it deleted and the
+// PodDisruptionBudgets it had to bypass to do it.
+type EvictionReport struct {
+	Pods    []string
+	Budgets []string
+}
+
+// ForceEvict deletes the pods left on a node instead of asking the API server
+// to evict them, which bypasses the PodDisruptionBudgets behind them.
+//
+// It is the escalation after scaleDown.drainTimeout: the pool owner asked for
+// the worker to go, and a budget that can never allow a disruption
+// (minAvailable equal to the replica count, one replica with nowhere to move)
+// would otherwise pin it forever. Pods keep their termination grace period,
+// and DaemonSet, mirror and unschedulable-tolerating pods are left alone
+// exactly as in Drain.
+func (c *Client) ForceEvict(ctx context.Context, name string) (EvictionReport, error) {
+	var report EvictionReport
+	pods, err := c.podsToEvict(ctx, name)
+	if err != nil {
+		return report, err
+	}
+	seen := map[string]bool{}
+	for i := range pods {
+		pod := &pods[i]
+		if pod.DeletionTimestamp != nil {
+			continue
+		}
+		for _, budget := range c.blockingPDBs(ctx, pod) {
+			if seen[budget] {
+				continue
+			}
+			seen[budget] = true
+			report.Budgets = append(report.Budgets, budget)
+		}
+		grace := int64(30)
+		if pod.Spec.TerminationGracePeriodSeconds != nil {
+			grace = *pod.Spec.TerminationGracePeriodSeconds
+		}
+		err := c.cs.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name,
+			metav1.DeleteOptions{GracePeriodSeconds: &grace})
+		if err != nil && !apierrors.IsNotFound(err) {
+			return report, fmt.Errorf("delete pod %s/%s behind its disruption budget: %w", pod.Namespace, pod.Name, err)
+		}
+		report.Pods = append(report.Pods, pod.Namespace+"/"+pod.Name)
+	}
+	report.Budgets = uniqueStrings(report.Budgets)
+	return report, nil
+}
+
 // evictPod asks the API server to evict one pod.
 func (c *Client) evictPod(ctx context.Context, pod *corev1.Pod) error {
 	grace := int64(30)

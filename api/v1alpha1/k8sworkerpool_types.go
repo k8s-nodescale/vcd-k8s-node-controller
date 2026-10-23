@@ -308,19 +308,32 @@ type ScaleDownPolicy struct {
 
 	// Force skips the data-loss guard for node-local volumes (hostPath/local
 	// PVs that would become unreadable). It never skips PDBs or the detach
-	// check. The same can be requested per node with the annotation
+	// check; a budget is bypassed only by the escalation described on
+	// WaitForPDB. The same can be requested per node with the annotation
 	// k8s-nodescale.github.io/force-delete=true.
 	// +optional
 	Force bool `json:"force,omitempty"`
 
+	// WaitForPDB keeps the worker in Failed when drainTimeout is spent and a
+	// PodDisruptionBudget still allows no disruption. By default the removal
+	// escalates instead: the pods that are left are deleted through the API
+	// (not the eviction API), so a single-replica workload whose
+	// minAvailable equals its replica count cannot pin a worker the pool has
+	// to remove. The event and the status message name every budget that was
+	// bypassed. Set this where a PDB must never be overridden and a human
+	// should decide.
+	// +optional
+	WaitForPDB bool `json:"waitForPDB,omitempty"`
+
 	// AllowLastWorker permits a request that would leave the pool with zero
 	// workers. Emptying the pool is a deliberate owner decision: every pod on
-	// the last worker is evicted (PDBs still decide whether it can finish) and
-	// the cluster keeps only the control plane. It requires minReplicas: 0; a
-	// spec that sets this flag with a higher floor is rejected as InvalidSpec
-	// instead of accepting a flag that could never be honoured. Two refusals
-	// survive the flag because they are not policy: the worker this controller
-	// itself runs on, and a worker holding node-local volumes.
+	// the last worker is evicted, and a budget that blocks the drain is
+	// bypassed after drainTimeout unless waitForPDB asks for a human. It
+	// requires minReplicas: 0; a spec that sets this flag with a higher floor
+	// is rejected as InvalidSpec instead of accepting a flag that could never
+	// be honoured. Two refusals survive the flag because they are not policy:
+	// the worker this controller itself runs on, and a worker holding
+	// node-local volumes.
 	// +optional
 	AllowLastWorker bool `json:"allowLastWorker,omitempty"`
 }

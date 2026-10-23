@@ -50,6 +50,11 @@ type Provider interface {
 	// retries until its own drainTimeout runs out. DaemonSet and mirror pods
 	// are skipped.
 	Drain(ctx context.Context, name string, timeout time.Duration) error
+	// ForceEvict deletes the pods left on a node, bypassing the eviction API
+	// and the PodDisruptionBudgets behind it. It is used once
+	// scaleDown.drainTimeout is spent and the pool still wants the worker
+	// gone.
+	ForceEvict(ctx context.Context, name string) (EvictionReport, error)
 	// WaitVolumesDetached blocks until no VolumeAttachment references the node,
 	// so the VM is never destroyed while a volume is still attached to it.
 	WaitVolumesDetached(ctx context.Context, name string, timeout time.Duration) error

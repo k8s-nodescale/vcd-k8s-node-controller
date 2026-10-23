@@ -241,3 +241,47 @@ func TestNodeLocalVolumesFindsHostPathAndPinnedVolumes(t *testing.T) {
 		}
 	}
 }
+
+func TestForceEvictDeletesPodsBehindABlockingBudget(t *testing.T) {
+	workload := pod("web-0", "wrk-03", "default")
+	workload.Labels = map[string]string{"app": "web"}
+	budget := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "web-pdb", Namespace: "default"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}},
+		},
+		Status: policyv1.PodDisruptionBudgetStatus{DisruptionsAllowed: 0},
+	}
+	cs := testClient(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "wrk-03"}}, workload, budget)
+
+	report, err := NewClient(cs).ForceEvict(context.Background(), "wrk-03")
+	if err != nil {
+		t.Fatalf("force evict: %v", err)
+	}
+	if len(report.Pods) != 1 || report.Pods[0] != "default/web-0" {
+		t.Fatalf("pods = %v, want [default/web-0]", report.Pods)
+	}
+	if len(report.Budgets) != 1 || report.Budgets[0] != "web-pdb" {
+		t.Fatalf("budgets = %v, want [web-pdb]", report.Budgets)
+	}
+	if _, err := cs.CoreV1().Pods("default").Get(context.Background(), "web-0", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("pod survived the escalation: %v", err)
+	}
+}
+
+func TestForceEvictLeavesDaemonSetPodsAlone(t *testing.T) {
+	daemon := pod("kube-proxy-x", "wrk-03", "kube-system")
+	daemon.OwnerReferences = []metav1.OwnerReference{{Kind: "DaemonSet", Name: "kube-proxy"}}
+	cs := testClient(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "wrk-03"}}, daemon)
+
+	report, err := NewClient(cs).ForceEvict(context.Background(), "wrk-03")
+	if err != nil {
+		t.Fatalf("force evict: %v", err)
+	}
+	if len(report.Pods) != 0 {
+		t.Fatalf("pods = %v, want none", report.Pods)
+	}
+	if _, err := cs.CoreV1().Pods("kube-system").Get(context.Background(), "kube-proxy-x", metav1.GetOptions{}); err != nil {
+		t.Fatalf("daemon pod was deleted: %v", err)
+	}
+}
