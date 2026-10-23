@@ -3,7 +3,11 @@ package vcd
 import (
 	"context"
 	"errors"
+	"net/url"
 	"testing"
+	"time"
+
+	"github.com/vmware/go-vcloud-director/v2/govcd"
 
 	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/cloud"
 )
@@ -123,5 +127,31 @@ func TestPoolMemberNameIsNSXVCompatible(t *testing.T) {
 				t.Fatalf("member name %q carries %q", name, r)
 			}
 		}
+	}
+}
+
+func TestHTTPTimeoutDefault(t *testing.T) {
+	if got := httpTimeout(Config{}); got != defaultHTTPTimeout {
+		t.Fatalf("httpTimeout(Config{}) = %v, want %v", got, defaultHTTPTimeout)
+	}
+	if got := httpTimeout(Config{Timeout: -time.Second}); got != defaultHTTPTimeout {
+		t.Fatalf("httpTimeout(negative) = %v, want %v", got, defaultHTTPTimeout)
+	}
+}
+
+func TestHTTPTimeoutCustom(t *testing.T) {
+	if got := httpTimeout(Config{Timeout: 5 * time.Second}); got != 5*time.Second {
+		t.Fatalf("httpTimeout(5s) = %v, want 5s", got)
+	}
+}
+
+// TestNewBoundsEveryRequest guards the bug that stalled a scale-out: the SDK
+// client must carry a timeout, otherwise a dropped connection blocks the only
+// reconcile worker forever.
+func TestNewBoundsEveryRequest(t *testing.T) {
+	client := govcd.NewVCDClient(url.URL{Scheme: "https", Host: "vcd.example.com", Path: "/api"}, true)
+	client.Client.Http.Timeout = httpTimeout(Config{Timeout: 7 * time.Second})
+	if got := client.Client.Http.Timeout; got != 7*time.Second {
+		t.Fatalf("client timeout = %v, want 7s", got)
 	}
 }

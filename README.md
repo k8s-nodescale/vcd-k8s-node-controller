@@ -780,7 +780,7 @@ The floor and the flag are evaluated against what the pool can actually serve:
 ## Terraform integration contract
 
 - The Terraform module installs this chart behind a `node_controller.enabled`
-  toggle and pins `chart_version` / `image_tag` (currently `0.7.0`).
+  toggle and pins `chart_version` / `image_tag` (currently `0.7.1`).
 - **Once the controller is enabled, do not use Terraform to manage worker count
   or worker LB pool membership.** Use the CRD instead. The Terraform module's
   README must state this explicitly.
@@ -811,7 +811,7 @@ Build locally (the Dockerfile uses `golang:1.27.1-alpine` and
 `gcr.io/distroless/static:nonroot`):
 
 ```
-docker build -t docker.io/werton13/vcd-k8s-node-controller:0.7.0 .
+docker build -t docker.io/werton13/vcd-k8s-node-controller:0.7.1 .
 ```
 
 Public module defaults are used inside the build. On a restricted network,
@@ -821,14 +821,14 @@ override them:
 docker build \
   --build-arg GOPROXY=https://nexus.example.com/repository/golang/ \
   --build-arg GOSUMDB=off \
-  -t docker.io/werton13/vcd-k8s-node-controller:0.7.0 .
+  -t docker.io/werton13/vcd-k8s-node-controller:0.7.1 .
 ```
 
 Push (or use `make image-push`):
 
 ```
 docker login docker.io
-docker push docker.io/werton13/vcd-k8s-node-controller:0.7.0
+docker push docker.io/werton13/vcd-k8s-node-controller:0.7.1
 docker push docker.io/werton13/vcd-k8s-node-controller:latest
 ```
 

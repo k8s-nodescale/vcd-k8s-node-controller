@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/vmware/go-vcloud-director/v2/govcd"
 	"github.com/vmware/go-vcloud-director/v2/types/v56"
@@ -22,6 +23,27 @@ type Config struct {
 	Org      string
 	VDC      string
 	Insecure bool
+
+	// Timeout bounds every request the SDK makes to vCD. Zero selects
+	// defaultHTTPTimeout.
+	Timeout time.Duration
+}
+
+// defaultHTTPTimeout bounds every vCD API call.
+//
+// The SDK's http.Client has no timeout by default, so a connection that the
+// platform silently drops leaves the call waiting forever. The controller runs
+// a single reconcile worker: one such call stopped the pool from converging
+// until the pod was restarted (observed on a dev tenant, stuck in GetVMByName
+// for minutes while a scale-out was pending).
+const defaultHTTPTimeout = 60 * time.Second
+
+// httpTimeout returns the effective per-request timeout.
+func httpTimeout(cfg Config) time.Duration {
+	if cfg.Timeout > 0 {
+		return cfg.Timeout
+	}
+	return defaultHTTPTimeout
 }
 
 // Provider is a govcd-backed cloud.Provider.
@@ -43,6 +65,8 @@ func New(cfg Config) (*Provider, error) {
 		return nil, err
 	}
 	client := govcd.NewVCDClient(*u, cfg.Insecure)
+	// Bound every call, including the ones the SDK issues on its own behalf.
+	client.Client.Http.Timeout = httpTimeout(cfg)
 	if err := client.Authenticate(cfg.User, cfg.Password, cfg.Org); err != nil {
 		return nil, err
 	}
