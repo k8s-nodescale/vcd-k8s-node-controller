@@ -305,6 +305,7 @@ spec:
                 description: ScaleDown controls safe removal of workers.
                 properties:
                   allowLastWorker:
+                    default: false
                     description: |-
                       AllowLastWorker permits a request that would leave the pool with zero
                       workers. Emptying the pool is a deliberate owner decision: every pod on
@@ -331,6 +332,7 @@ spec:
                   drainTimeout:
                     type: string
                   force:
+                    default: false
                     description: |-
                       Force skips the data-loss guard for node-local volumes (hostPath/local
                       PVs that would become unreadable). It never skips PDBs or the detach
@@ -350,6 +352,7 @@ spec:
                     minimum: 0
                     type: integer
                   waitForPDB:
+                    default: false
                     description: |-
                       WaitForPDB keeps the worker in Failed when drainTimeout is spent and a
                       PodDisruptionBudget still allows no disruption. By default the removal

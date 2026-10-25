@@ -226,7 +226,7 @@ spec:
   vcd:
     org:    myorg
     vdc:    My-VDC-Name
-    vapp:   mts-k8s-lab
+    vapp:   k8s-lab-vapp
     orgNetwork: routed-k8s-net
     catalog: Templates
     dvmOffset:       -3            # deployment VM slot, vCD bootstrap only

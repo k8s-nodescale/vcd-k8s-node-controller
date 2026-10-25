@@ -34,7 +34,7 @@ spec:
   vcd:
     org: myorg
     vdc: My-VDC-Name
-    vapp: mts-k8s-lab
+    vapp: k8s-lab-vapp
     orgNetwork: routed-k8s-net
     catalog: Templates
     dvmOffset: -3
@@ -61,3 +61,10 @@ spec:
   scaleDown:
     minReplicas: 2
     drainTimeout: 10m
+    # Emptying the pool needs minReplicas: 0 *and* allowLastWorker: true.
+    # Both flags are written into every object by the CRD defaults, so they
+    # are visible in `kubectl get -o yaml` even when left unset here.
+    allowLastWorker: false
+    # false: a drain the PDB blocks is escalated after drainTimeout.
+    # true: the worker is parked in Failed and a human decides.
+    waitForPDB: false

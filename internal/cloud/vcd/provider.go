@@ -76,9 +76,9 @@ func New(cfg Config) (*Provider, error) {
 // normalizeURL returns the vCD API endpoint expected by govcd: a single
 // http(s) scheme, a non-empty host, and a path ending in /api.
 //
-// It tolerates common misconfigurations such as "iaas.cloud.mts.ru",
-// "https://iaas.cloud.mts.ru" and the doubly-prefixed
-// "https://https://iaas.cloud.mts.ru/api/api".
+// It tolerates common misconfigurations such as "vcd.example.com",
+// "https://vcd.example.com" and the doubly-prefixed
+// "https://https://vcd.example.com/api/api".
 func normalizeURL(raw string) (string, error) {
 	s := strings.TrimSpace(raw)
 	if s == "" {

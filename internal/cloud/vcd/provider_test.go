@@ -21,43 +21,43 @@ func TestNormalizeURL(t *testing.T) {
 	}{
 		{
 			name: "already api endpoint",
-			in:   "https://iaas.cloud.mts.ru/api",
-			want: "https://iaas.cloud.mts.ru/api",
+			in:   "https://vcd.example.com/api",
+			want: "https://vcd.example.com/api",
 		},
 		{
 			name: "trailing slash",
-			in:   "https://iaas.cloud.mts.ru/api/",
-			want: "https://iaas.cloud.mts.ru/api",
+			in:   "https://vcd.example.com/api/",
+			want: "https://vcd.example.com/api",
 		},
 		{
 			name: "no scheme",
-			in:   "iaas.cloud.mts.ru",
-			want: "https://iaas.cloud.mts.ru/api",
+			in:   "vcd.example.com",
+			want: "https://vcd.example.com/api",
 		},
 		{
 			name: "host only with scheme",
-			in:   "https://iaas.cloud.mts.ru",
-			want: "https://iaas.cloud.mts.ru/api",
+			in:   "https://vcd.example.com",
+			want: "https://vcd.example.com/api",
 		},
 		{
 			name: "http preserved",
-			in:   "http://iaas.cloud.mts.ru/api",
-			want: "http://iaas.cloud.mts.ru/api",
+			in:   "http://vcd.example.com/api",
+			want: "http://vcd.example.com/api",
 		},
 		{
 			name: "double scheme and api",
-			in:   "https://https://iaas.cloud.mts.ru/api/api",
-			want: "https://iaas.cloud.mts.ru/api",
+			in:   "https://https://vcd.example.com/api/api",
+			want: "https://vcd.example.com/api",
 		},
 		{
 			name: "triple scheme",
-			in:   "https://https://https://iaas.cloud.mts.ru/api/api",
-			want: "https://iaas.cloud.mts.ru/api",
+			in:   "https://https://https://vcd.example.com/api/api",
+			want: "https://vcd.example.com/api",
 		},
 		{
 			name: "repeated api",
-			in:   "https://iaas.cloud.mts.ru/api/api/",
-			want: "https://iaas.cloud.mts.ru/api",
+			in:   "https://vcd.example.com/api/api/",
+			want: "https://vcd.example.com/api",
 		},
 		{
 			name:    "empty",
@@ -66,7 +66,7 @@ func TestNormalizeURL(t *testing.T) {
 		},
 		{
 			name:    "unsupported scheme",
-			in:      "ftp://iaas.cloud.mts.ru/api",
+			in:      "ftp://vcd.example.com/api",
 			wantErr: true,
 		},
 	}

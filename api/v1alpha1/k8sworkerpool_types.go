@@ -318,6 +318,7 @@ type ScaleDownPolicy struct {
 	// WaitForPDB. The same can be requested per node with the annotation
 	// k8s-nodescale.github.io/force-delete=true.
 	// +optional
+	// +kubebuilder:default=false
 	Force bool `json:"force,omitempty"`
 
 	// WaitForPDB keeps the worker in Failed when drainTimeout is spent and a
@@ -329,6 +330,7 @@ type ScaleDownPolicy struct {
 	// bypassed. Set this where a PDB must never be overridden and a human
 	// should decide.
 	// +optional
+	// +kubebuilder:default=false
 	WaitForPDB bool `json:"waitForPDB,omitempty"`
 
 	// AllowLastWorker permits a request that would leave the pool with zero
@@ -341,6 +343,7 @@ type ScaleDownPolicy struct {
 	// the worker this controller itself runs on, and a worker holding
 	// node-local volumes.
 	// +optional
+	// +kubebuilder:default=false
 	AllowLastWorker bool `json:"allowLastWorker,omitempty"`
 }
 
