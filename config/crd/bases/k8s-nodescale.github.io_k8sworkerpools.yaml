@@ -78,6 +78,29 @@ spec:
                   sshAuthorizedKey:
                     type: string
                 type: object
+              capacity:
+                description: |-
+                  Capacity controls the pre-flight check against the vDC's free capacity.
+                  The zero value keeps the check on.
+                properties:
+                  cpuMhzPerCore:
+                    default: 2000
+                    description: |-
+                      CPUMHzPerCore converts a vCPU into the MHz the vDC rates CPU capacity
+                      in. It is used only when the vDC does not report its own speed to the
+                      controller account (the tenant view does not carry it, the admin view
+                      does). The default, 2000, is the usual 2 GHz per vCPU.
+                    format: int64
+                    minimum: 100
+                    type: integer
+                  preflight:
+                    default: true
+                    description: |-
+                      Preflight refuses to start a create or a resize that cannot fit in the
+                      vDC's free capacity. The default is on. Turn it off only on a tenant
+                      whose reported capacity does not match what vCD enforces.
+                    type: boolean
+                type: object
               flavor:
                 description: |-
                   Flavor describes the compute and disk shape of a worker. It is the
@@ -555,6 +578,7 @@ spec:
                       - Ready
                       - Missing
                       - Resizing
+                      - Queued
                       - Draining
                       - Deleting
                       - Failed
@@ -603,8 +627,13 @@ spec:
                     type: string
                   lastError:
                     type: string
+                  message:
+                    description: |-
+                      Message explains a roll that is not making progress, e.g. the capacity
+                      it is waiting for.
+                    type: string
                   phase:
-                    description: Phase is Idle, Progressing, Paused or Failed.
+                    description: Phase is Idle, Progressing, Paused, Queued or Failed.
                     type: string
                   startedAt:
                     format: date-time

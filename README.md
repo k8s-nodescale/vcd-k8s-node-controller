@@ -76,6 +76,11 @@ Implemented:
   exposes `replicaCount`, `nodeSelector`, `tolerations`, `affinity`,
   `priorityClassName` and `dnsPolicy` so the controller can live on the control
   plane.
+- Capacity pre-flight: before a create or a resize the controller reads the
+  vDC's free CPU, memory and storage and parks work that cannot fit as `Queued`
+  with reason `NoResourceAvailable`, retrying as capacity appears instead of
+  letting vCD fail a create halfway. See
+  [When the vDC is full](#when-the-vdc-is-full).
 - Rolling compute-spec changes: `spec.flavor` is the desired shape and
   `status.nodes[].flavor` the observed one; a mismatch drives the worker through
   cordon -> pool out -> drain -> power off -> resize -> power on -> Ready ->
@@ -88,9 +93,9 @@ Not implemented yet:
 - NSX-T ingress pools (`ingressPool.type: nsxt` is rejected with a clear event;
   the node is still drained and deleted, but its pool member must be removed by
   hand).
-- Finalizers and a failed-provisioning watchdog: a VM that boots but never joins
-  is counted in `observedReplicas` and is not replaced automatically. A drain
-  that hits its timeout is marked `Failed` and kept, it is not retried for you.
+- Automatic repair of a worker that is `Failed` or `Queued`: both are reported
+  and kept, and a `Failed` drain is not retried for you. A VM that boots but
+  never joins is parked by `spec.provisioning.timeout` with the VM kept.
 - Token renewal for joins that outlive `join.tokenTTL`; the token of a finished
   join is left to expire on its own, and its JWS entry with it. A failed create
   now revokes its token (the earlier leak left one usable credential per failed
@@ -142,24 +147,28 @@ One `K8sWorkerPool` describes the worker set of a single cluster. You own
 | `rollout.pauseOnFailure` | no | Stop the roll when a worker does not come back (default `true`). |
 | `rollout.readyTimeout` | no | How long a resized worker may take to become Ready (default `10m`). |
 | `provisioning.timeout` | no | How long a VM may run without its Kubernetes Node before the worker is parked as `Failed` (default `15m`). The VM is kept for inspection and the pool reports `Ready=False`/`WorkerFailed`; a registration that arrives later still promotes the worker to `Ready`. |
+| `capacity.preflight` | no | Read the vDC's free capacity before a create or a resize and park work that cannot fit (default `true`). See [When the vDC is full](#when-the-vdc-is-full). |
+| `capacity.cpuMhzPerCore` | no | MHz per vCPU used for the CPU estimate when the vDC does not report its own speed to the controller account (default `2000`). The admin view of the vDC is read once; a tenant account that cannot read it falls back to this number. |
 
 `status`:
 
 | Field | Meaning |
 | --- | --- |
-| `observedReplicas` | Worker **slots** the controller knows about: VMs that exist plus slots whose VM disappeared and stay reserved (`Missing` / parked `Failed`). |
+| `observedReplicas` | Worker **slots** the controller knows about: VMs that exist, slots whose VM disappeared and stay reserved (`Missing` / parked `Failed`), and slots waiting for capacity (`Queued`). |
 | `ledger.nextIndex` / `used[]` / `free[]` | Address book. `used` holds every allocated worker IP; addresses of deleted VMs are never released automatically. |
 | `nodes[]` | Per worker: `name` (the vCD VM name), `nodeName` (the Kubernetes Node object name, lower case - the only name the controller passes to the Kubernetes API), `ip`, `providerID` (the VM id in the platform, today `urn:vcloud:vm:...`), `phase`, `cpu`, `memoryMB`, `diskGB`, `k8sReady`, `kubeletVersion`, `message`, `deleteStartedAt`, `flavor` (what the VM actually runs with, read back from vCD), `healAttempts` / `healLastAttempt` (the AutoHeal budget), `resize` (the per-worker rollout step), `provisioningStartedAt` (when the watchdog clock started for a VM that has no Node yet), `bootstrapTokenID` (the token kept alive until the join, then revoked; never the secret half). `message` is where a blocked removal explains itself (the PDB, the attached volume, the local PV). |
-| `rollout` | `phase` (`Idle`, `Progressing`, `Paused`), `targetFlavor`, `workersTotal`, `workersDone`, `currentWorker`, `lastError`, `startedAt`. |
-| `conditions[]` | `Ready`, with reason `Converged` (`3/3 workers Ready`), `Progressing` while a worker is not Ready yet, `WorkerMissing` when a slot lost its VM, `WorkerFailed` when a worker is parked (drain timeout, exhausted AutoHeal, or no Node within `provisioning.timeout`), `LastWorkerProtected` / `WorkerHostsController` on a refused emptying, `RolloutInProgress` while a roll holds the pool, `UnsupportedChange` for a shrink, plus `ScaleUpFailed`, `ScaleDownFailed`, `RolloutFailed` and `InvalidSpec` on errors. |
+| `rollout` | `phase` (`Idle`, `Progressing`, `Paused`, `Queued`), `message` (why a roll is waiting, e.g. the capacity it needs), `targetFlavor`, `workersTotal`, `workersDone`, `currentWorker`, `lastError`, `startedAt`. |
+| `conditions[]` | `Ready`, with reason `Converged` (`3/3 workers Ready`), `Progressing` while a worker is not Ready yet, `WorkerMissing` when a slot lost its VM, `WorkerFailed` when a worker is parked (drain timeout, exhausted AutoHeal, or no Node within `provisioning.timeout`), `LastWorkerProtected` / `WorkerHostsController` on a refused emptying, `RolloutInProgress` while a roll holds the pool, `UnsupportedChange` for a shrink, `NoResourceAvailable` when workers are queued for vDC capacity, plus `ScaleUpFailed`, `ScaleDownFailed`, `RolloutFailed` and `InvalidSpec` on errors. |
 
 Phases: `Provisioning` (VM created, Node not registered yet) -> `Joining` (Node
 registered, not Ready) -> `Ready`. Removal uses `Draining` (cordon, pool
 removal, pod eviction) -> `Deleting` (detach wait, Node and VM deletion).
-`Resizing` marks a worker inside a rollout. `Missing` means the VM disappeared
-outside the controller and its slot is reserved; `Failed` means the drain hit
-`drainTimeout` (VM kept), AutoHeal exhausted its attempts, or no Node appeared
-within `provisioning.timeout` (VM kept).
+`Resizing` marks a worker inside a rollout. `Queued` means the slot is reserved
+but the vDC has no room for the VM yet: no VM, no Node, no token, retried every
+pass. `Missing` means the VM disappeared outside the controller and its slot is
+reserved; `Failed` means the drain hit `drainTimeout` (VM kept), AutoHeal
+exhausted its attempts, or no Node appeared within `provisioning.timeout` (VM
+kept).
 
 Example (placeholder org, network and template; nothing cluster-specific):
 
@@ -377,6 +386,40 @@ shrink.
 Budget about five minutes per worker: ~2 min vCD clone and power-on, ~1 min
 first boot with the disk move, ~1 min guest bootstrap and join, the rest waiting
 for kubelet to report Ready.
+
+#### When the vDC is full
+
+`capacity.preflight` (default on) reads the vDC's free compute and storage
+capacity before a create or a resize. vCD rates a vCPU at the speed configured on
+the vDC (its admin view carries `VCpuInMhz2`; the controller reads it once and
+falls back to `capacity.cpuMhzPerCore` when the account cannot), memory in MB,
+and disks against the storage profile the request names - the default profile for
+the system disk and for a data disk without `storageProfile`. A category the
+vDC's allocation model does not cap is reported with no limit and is skipped.
+
+When a request does not fit, the controller does not attempt it: the slot is
+parked as `Queued`, its name and address stay reserved, and the pool reports
+
+    Ready=False  reason=NoResourceAvailable
+      "2 worker(s) queued for vDC capacity: demo-cluster-wrk-04 (10.10.0.10), ...
+       (waiting for vDC capacity: memory: need 8192 MB, 4096 MB free)"
+
+`status.observedReplicas` counts the queued slots, so a scale-out is accepted and
+visible instead of being retried as a failing create. Every pass retries the
+queue: as soon as the vDC has room, the VM is created under the same name and
+address. A `Queued` slot costs nothing to remove - a scale-in or
+`deleteWorkers` drops it and releases the address (`WorkerDropped`), and it
+never counts as a serving worker for `scaleDown.minReplicas`.
+
+A capacity read that fails never blocks the pool: the controller logs it at
+verbosity 1 and attempts the create, which is the behaviour without the
+pre-flight. The check is an estimate in vCD's own units - vCD remains the
+authority, and a create it still refuses is reported as before.
+
+The system disk of a new worker is `spec.flavor.osDiskGB`. When that is unset the
+clone keeps the template size, which the controller cannot read here, so it uses
+an existing worker's `status.nodes[].flavor.osDiskGB` as the estimate (0 until
+the pool has one).
 
 #### When a worker never registers
 
@@ -611,6 +654,13 @@ lets a batch be out of service together; PDBs remain the real brake, and a batch
 whose drain cannot finish keeps retrying with the reason in
 `status.nodes[].resize.message`. `rollout.order: Ascending` rolls `wrk-01`
 first instead of last.
+
+A roll checks capacity too, before it takes anyone out of service: the delta the
+resize adds (CPU, memory, system disk) has to fit, not the whole target flavor.
+When it does not, `status.rollout.phase` is `Queued` with the shortfall in
+`status.rollout.message`, the condition is `Ready=False`/`NoResourceAvailable`,
+and no worker is cordoned; workers already in flight finish their step. See
+[When the vDC is full](#when-the-vdc-is-full).
 
 Every step is persisted before it is attempted, so a controller restart in the
 middle of a roll resumes at the same worker instead of starting over - the same

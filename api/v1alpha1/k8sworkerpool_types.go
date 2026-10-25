@@ -6,7 +6,7 @@ import (
 )
 
 // NodePhase describes the lifecycle phase of a managed worker node.
-// +kubebuilder:validation:Enum=Pending;Provisioning;Joining;Ready;Missing;Resizing;Draining;Deleting;Failed
+// +kubebuilder:validation:Enum=Pending;Provisioning;Joining;Ready;Missing;Resizing;Queued;Draining;Deleting;Failed
 type NodePhase string
 
 const (
@@ -24,6 +24,11 @@ const (
 	// NodePhaseResizing marks a worker the rollout is taking through
 	// cordon -> drain -> power off -> resize -> power on -> Ready.
 	NodePhaseResizing NodePhase = "Resizing"
+	// NodePhaseQueued marks a slot the capacity pre-flight refused to start:
+	// the vDC has no room for the worker's CPU, memory or storage, so no VM
+	// exists yet. The address and the name stay reserved and the slot is
+	// retried on every pass until the vDC has room again.
+	NodePhaseQueued NodePhase = "Queued"
 )
 
 // Reconciliation policies.
@@ -66,6 +71,10 @@ const (
 	RolloutPhaseProgressing = "Progressing"
 	RolloutPhasePaused      = "Paused"
 	RolloutPhaseFailed      = "Failed"
+	// RolloutPhaseQueued means the rollout is waiting for vDC capacity: no
+	// worker has been taken out of service, and the roll starts as soon as the
+	// requested shape fits.
+	RolloutPhaseQueued = "Queued"
 )
 
 // K8sWorkerPoolSpec defines the desired worker pool.
@@ -117,6 +126,36 @@ type K8sWorkerPoolSpec struct {
 	// as Failed so the pool reports it instead of waiting forever.
 	// +optional
 	Provisioning ProvisioningPolicy `json:"provisioning,omitempty"`
+
+	// Capacity controls the pre-flight check against the vDC's free capacity.
+	// The zero value keeps the check on.
+	// +optional
+	Capacity CapacityPolicy `json:"capacity,omitempty"`
+}
+
+// CapacityPolicy controls the pre-flight check against the vDC's capacity.
+//
+// Before a create or a resize the controller reads what the vDC has free and
+// refuses to start work that cannot fit, parking the worker as Queued with
+// reason NoResourceAvailable instead of letting vCD fail it halfway through a
+// clone. The check is an estimate in the units vCD itself uses; vCD remains the
+// authority, and a request it still refuses is reported as a create failure.
+type CapacityPolicy struct {
+	// Preflight refuses to start a create or a resize that cannot fit in the
+	// vDC's free capacity. The default is on. Turn it off only on a tenant
+	// whose reported capacity does not match what vCD enforces.
+	// +kubebuilder:default=true
+	// +optional
+	Preflight *bool `json:"preflight,omitempty"`
+
+	// CPUMHzPerCore converts a vCPU into the MHz the vDC rates CPU capacity
+	// in. It is used only when the vDC does not report its own speed to the
+	// controller account (the tenant view does not carry it, the admin view
+	// does). The default, 2000, is the usual 2 GHz per vCPU.
+	// +kubebuilder:validation:Minimum=100
+	// +kubebuilder:default=2000
+	// +optional
+	CPUMHzPerCore int64 `json:"cpuMhzPerCore,omitempty"`
 }
 
 // ProvisioningPolicy bounds how long a created VM may run without its Node.
@@ -445,8 +484,11 @@ type ResizeStatus struct {
 
 // RolloutStatus is the pool-wide rollout state.
 type RolloutStatus struct {
-	// Phase is Idle, Progressing, Paused or Failed.
-	Phase         string        `json:"phase,omitempty"`
+	// Phase is Idle, Progressing, Paused, Queued or Failed.
+	Phase string `json:"phase,omitempty"`
+	// Message explains a roll that is not making progress, e.g. the capacity
+	// it is waiting for.
+	Message       string        `json:"message,omitempty"`
 	TargetFlavor  *FlavorStatus `json:"targetFlavor,omitempty"`
 	WorkersTotal  int32         `json:"workersTotal,omitempty"`
 	WorkersDone   int32         `json:"workersDone,omitempty"`

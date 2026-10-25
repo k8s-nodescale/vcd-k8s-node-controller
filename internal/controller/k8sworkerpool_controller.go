@@ -278,6 +278,17 @@ func (r *WorkerPoolReconciler) reconcile(ctx context.Context, before, pool *infr
 		return ctrl.Result{RequeueAfter: requeueProgressing}, nil
 	}
 
+	// A slot the capacity pre-flight parked is retried here, before the replica
+	// arithmetic reads the queue as a shortfall.
+	if handled, err := r.resumeQueuedCreates(ctx, before, pool, alloc); handled {
+		if err != nil {
+			logger.Error(err, "could not start a queued worker", "pool", pool.Name)
+			r.setCondition(pool, metav1.ConditionFalse, "ScaleUpFailed", err.Error())
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: requeueProgressing}, nil
+	}
+
 	desired := pool.Spec.Replicas
 	switch {
 	case desired > pool.Status.ObservedReplicas:
@@ -369,7 +380,8 @@ func (r *WorkerPoolReconciler) refreshReadiness(ctx context.Context, pool *infra
 		// A worker that is being deleted keeps its phase: overwriting it with
 		// Ready would restart the drain on every pass. A Missing or a parked
 		// Failed slot has no VM to ask, and its phase is the report itself.
-		if st.DeleteStartedAt != nil || st.Phase == infrav1.NodePhaseMissing || st.Resize != nil {
+		if st.DeleteStartedAt != nil || st.Phase == infrav1.NodePhaseMissing ||
+			st.Phase == infrav1.NodePhaseQueued || st.Resize != nil {
 			continue
 		}
 		if st.ProviderID == "" && st.Phase == infrav1.NodePhaseFailed {
@@ -470,7 +482,8 @@ func (r *WorkerPoolReconciler) refreshReadiness(ctx context.Context, pool *infra
 func evaluatePoolCondition(pool *infrav1.K8sWorkerPool) (metav1.ConditionStatus, string, string) {
 	desired := pool.Spec.Replicas
 	var ready int32
-	var missing, failed []string
+	var missing, failed, queued []string
+	queuedMessage := ""
 	for _, n := range pool.Status.Nodes {
 		switch n.Phase {
 		case infrav1.NodePhaseReady:
@@ -479,6 +492,11 @@ func evaluatePoolCondition(pool *infrav1.K8sWorkerPool) (metav1.ConditionStatus,
 			missing = append(missing, fmt.Sprintf("%s (%s)", n.Name, n.IP))
 		case infrav1.NodePhaseFailed:
 			failed = append(failed, fmt.Sprintf("%s (%s)", n.Name, n.IP))
+		case infrav1.NodePhaseQueued:
+			queued = append(queued, fmt.Sprintf("%s (%s)", n.Name, n.IP))
+			if queuedMessage == "" {
+				queuedMessage = n.Message
+			}
 		}
 	}
 	switch {
@@ -492,6 +510,15 @@ func evaluatePoolCondition(pool *infrav1.K8sWorkerPool) (metav1.ConditionStatus,
 		// sees the slot that needs a decision.
 		return metav1.ConditionFalse, "WorkerFailed",
 			fmt.Sprintf("%d worker(s) parked as Failed: %s", len(failed), strings.Join(failed, ", "))
+	case len(queued) > 0:
+		// The request is accepted but the vDC has no room for it. The slots
+		// are reserved and retried; the reason carries the numbers so an
+		// operator knows what to grow.
+		msg := fmt.Sprintf("%d worker(s) queued for vDC capacity: %s", len(queued), strings.Join(queued, ", "))
+		if queuedMessage != "" {
+			msg += " (" + queuedMessage + ")"
+		}
+		return metav1.ConditionFalse, "NoResourceAvailable", msg
 	case pool.Status.ObservedReplicas != desired:
 		return metav1.ConditionFalse, "Scaling",
 			fmt.Sprintf("desired=%d observed=%d ready=%d", desired, pool.Status.ObservedReplicas, ready)
@@ -721,6 +748,20 @@ func (r *WorkerPoolReconciler) scaleUp(ctx context.Context, before, pool *infrav
 	logger := log.FromContext(ctx)
 
 	for i := int32(0); i < n; i++ {
+		// A create that cannot fit fails in vCD halfway through (after the
+		// clone, on a disk grow or on the power-on) and is retried every
+		// pass. Park the rest of the request instead: the slots keep their
+		// name and address and resumeQueuedCreates starts them once the vDC
+		// has room.
+		if ok, why := r.capacityAllows(ctx, pool, workerCapacityRequest(pool, pool.Status.Nodes)); !ok {
+			if err := r.queueSlots(ctx, pool, alloc, n-i, why); err != nil {
+				return err
+			}
+			r.eventf(pool, corev1.EventTypeWarning, "WorkerQueued",
+				fmt.Sprintf("%d worker(s) are queued: %s", n-i, why))
+			return nil
+		}
+
 		ip, err := alloc.Allocate()
 		if err != nil {
 			return err

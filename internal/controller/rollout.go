@@ -212,12 +212,46 @@ func (r *WorkerPoolReconciler) reconcileRollout(ctx context.Context, pool *infra
 		}
 	}
 
+	wasPhase := pool.Status.Rollout.Phase
 	maxUnavailable := rolloutMaxUnavailable(pool, len(pool.Status.Nodes))
 	now := metav1.Now()
-	for _, i := range pending {
-		if inFlight >= maxUnavailable {
-			break
+
+	// Capacity pre-flight: a resize consumes vDC capacity the same way a new
+	// worker does, so a roll that cannot fit must not drain a worker first and
+	// find out on the power-on that it cannot be resized. The check covers the
+	// batch this pass would start; workers already in flight are past it.
+	start := pending
+	// maxUnavailable can shrink under a roll that is already wider than the new
+	// limit, so room may be negative: start nothing, keep the rest pending.
+	if room := maxUnavailable - inFlight; room <= 0 {
+		start = nil
+	} else if len(start) > room {
+		start = start[:room]
+	}
+	queuedWhy := ""
+	if len(start) > 0 && capacityPreflightEnabled(pool) {
+		capacity, err := r.Cloud.Capacity(ctx)
+		switch {
+		case err != nil:
+			logger.V(1).Info("capacity pre-flight skipped: the vDC capacity could not be read",
+				"pool", pool.Name, "error", err)
+		default:
+			mhz := cpuMHzPerCore(pool, capacity)
+			var need cloud.CapacityRequest
+			var fits []int
+			for _, i := range start {
+				next := addCapacityRequest(need, resizeCapacityRequest(pool.Status.Nodes[i].Flavor, target))
+				if ok, short := capacity.Fits(next, mhz); !ok {
+					queuedWhy = strings.Join(short, "; ")
+					break
+				}
+				need = next
+				fits = append(fits, i)
+			}
+			start = fits
 		}
+	}
+	for _, i := range start {
 		n := &pool.Status.Nodes[i]
 		n.Resize = &infrav1.ResizeStatus{Phase: resizePhaseCordoned, StartedAt: &now}
 		n.Phase = infrav1.NodePhaseResizing
@@ -264,8 +298,16 @@ func (r *WorkerPoolReconciler) reconcileRollout(ctx context.Context, pool *infra
 	}
 
 	phase := infrav1.RolloutPhaseProgressing
-	if failed {
+	switch {
+	case failed:
 		phase = infrav1.RolloutPhasePaused
+	case queuedWhy != "" && inFlight == 0:
+		// Nothing has been taken out of service: the roll waits for capacity.
+		phase = infrav1.RolloutPhaseQueued
+	}
+	message := ""
+	if queuedWhy != "" {
+		message = "waiting for vDC capacity: " + queuedWhy
 	}
 	current := ""
 	done := 0
@@ -281,6 +323,7 @@ func (r *WorkerPoolReconciler) reconcileRollout(ctx context.Context, pool *infra
 	}
 	pool.Status.Rollout = infrav1.RolloutStatus{
 		Phase:         phase,
+		Message:       message,
 		TargetFlavor:  target,
 		WorkersTotal:  int32(done + inFlight),
 		WorkersDone:   int32(done),
@@ -289,6 +332,13 @@ func (r *WorkerPoolReconciler) reconcileRollout(ctx context.Context, pool *infra
 	}
 	if failed {
 		pool.Status.Rollout.LastError = "a worker failed its rollout step; see the RolloutFailed event"
+	}
+	if phase == infrav1.RolloutPhaseQueued {
+		msg := fmt.Sprintf("%d worker(s) still need the target shape; %s", len(pending), message)
+		r.setCondition(pool, metav1.ConditionFalse, "NoResourceAvailable", msg)
+		if wasPhase != infrav1.RolloutPhaseQueued {
+			r.eventf(pool, corev1.EventTypeWarning, "RolloutQueued", msg)
+		}
 	}
 	return true, ctrl.Result{RequeueAfter: requeueProgressing}, nil
 }

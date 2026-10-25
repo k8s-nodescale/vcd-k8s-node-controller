@@ -89,6 +89,13 @@ func (r *WorkerPoolReconciler) mergeMissingSlots(pool *infrav1.K8sWorkerPool, no
 			present[key] = true
 			continue
 		}
+		if prev.Phase == infrav1.NodePhaseQueued {
+			// A queued slot never had a VM: it is waiting for capacity, not
+			// missing. Keep it and its reserved address as they are.
+			out = append(out, prev)
+			present[key] = true
+			continue
+		}
 		first := prev.Phase != infrav1.NodePhaseMissing
 		// Its rollout state describes a VM that no longer exists.
 		prev.Resize = nil
@@ -226,7 +233,7 @@ func workerServes(node *infrav1.WorkerNodeStatus) bool {
 	}
 	switch node.Phase {
 	case infrav1.NodePhaseMissing, infrav1.NodePhaseFailed,
-		infrav1.NodePhaseDraining, infrav1.NodePhaseDeleting:
+		infrav1.NodePhaseQueued, infrav1.NodePhaseDraining, infrav1.NodePhaseDeleting:
 		return false
 	}
 	return true

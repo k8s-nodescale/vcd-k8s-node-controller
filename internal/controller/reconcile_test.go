@@ -24,6 +24,9 @@ import (
 
 type fakeCloud struct {
 	vms             []cloud.VM
+	capacity        cloud.VDCCapacity
+	capacityErr     error
+	capacityCalls   int
 	created         []cloud.CreateVMSpec
 	deleted         []string
 	poweredOff      []string
@@ -89,7 +92,43 @@ func (f *fakeCloud) CreateVM(ctx context.Context, spec cloud.CreateVMSpec) (clou
 	}
 	f.vms = append(f.vms, vm)
 	f.created = append(f.created, spec)
+	f.consume(spec)
 	return vm, nil
+}
+
+// Capacity mirrors the provider. A zero limit means the vDC does not cap the
+// category, so a test that does not care about capacity gets an unlimited one.
+func (f *fakeCloud) Capacity(ctx context.Context) (cloud.VDCCapacity, error) {
+	f.capacityCalls++
+	if f.capacityErr != nil {
+		return cloud.VDCCapacity{}, f.capacityErr
+	}
+	return f.capacity, nil
+}
+
+// consume books a created VM against the fake capacity, so a test can watch a
+// pool queue and then drain as the vDC fills up.
+func (f *fakeCloud) consume(spec cloud.CreateVMSpec) {
+	if f.capacity.MemoryMB.Limit > 0 {
+		f.capacity.MemoryMB.Used += int64(spec.MemoryMB)
+	}
+	if f.capacity.CPU.Limit > 0 {
+		speed := f.capacity.CPUMHzPerCore
+		if speed == 0 {
+			speed = defaultCPUMHzPerCore
+		}
+		f.capacity.CPU.Used += int64(spec.CPUs) * speed
+	}
+	diskMB := int64(spec.OSDiskGB) * 1024
+	for _, d := range spec.Disks {
+		diskMB += int64(d.SizeGB) * 1024
+	}
+	for i := range f.capacity.Storage {
+		if f.capacity.Storage[i].Default && f.capacity.Storage[i].LimitMB > 0 {
+			f.capacity.Storage[i].UsedMB += diskMB
+			break
+		}
+	}
 }
 
 // GetVM mirrors the provider contract: a VM that is gone is ErrVMNotFound.

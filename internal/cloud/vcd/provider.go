@@ -6,11 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/vmware/go-vcloud-director/v2/govcd"
 	"github.com/vmware/go-vcloud-director/v2/types/v56"
+
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/cloud"
 )
@@ -47,9 +51,16 @@ func httpTimeout(cfg Config) time.Duration {
 }
 
 // Provider is a govcd-backed cloud.Provider.
+
 type Provider struct {
 	cfg    Config
 	client *govcd.VCDClient
+
+	// cpuOnce guards the single admin read of the vDC's CPU speed. The speed is
+	// a property of the vDC, not of the pass, and an account that cannot read
+	// the admin view must not pay for a failing call on every reconcile.
+	cpuOnce sync.Once
+	cpuMHz  int64
 }
 
 var _ cloud.Provider = (*Provider)(nil)
@@ -118,6 +129,101 @@ func normalizeURL(raw string) (string, error) {
 		u.Path += "/api"
 	}
 	return u.String(), nil
+}
+
+// Capacity reads what the configured vDC still has free: compute capacity and
+// the storage profiles a worker can be placed on. The numbers are the ones vCD
+// itself rates a new VM against.
+//
+// The compute capacity is reported by vCD in MHz (CPU) and MB (memory). A vDC
+// whose allocation model does not cap a category reports Limit 0, which the
+// caller reads as "unbounded".
+func (p *Provider) Capacity(ctx context.Context) (cloud.VDCCapacity, error) {
+	if err := ctx.Err(); err != nil {
+		return cloud.VDCCapacity{}, err
+	}
+	vdc, err := p.vdc()
+	if err != nil {
+		return cloud.VDCCapacity{}, err
+	}
+
+	out := cloud.VDCCapacity{
+		AllocationModel: vdc.Vdc.AllocationModel,
+		CPUMHzPerCore:   p.cpuMHzPerCore(ctx),
+	}
+	if len(vdc.Vdc.ComputeCapacity) > 0 && vdc.Vdc.ComputeCapacity[0] != nil {
+		cc := vdc.Vdc.ComputeCapacity[0]
+		if cc.CPU != nil {
+			out.CPU = cloud.ResourceCapacity{Limit: cc.CPU.Limit, Used: cc.CPU.Used}
+		}
+		if cc.Memory != nil {
+			out.MemoryMB = cloud.ResourceCapacity{Limit: cc.Memory.Limit, Used: cc.Memory.Used}
+		}
+	}
+
+	if profiles := vdc.Vdc.VdcStorageProfiles; profiles != nil {
+		for _, ref := range profiles.VdcStorageProfile {
+			if ref == nil || ref.HREF == "" {
+				continue
+			}
+			sp, err := p.client.GetStorageProfileByHref(ref.HREF)
+			if err != nil {
+				// One unreadable profile must not cost the CPU and memory
+				// check: the profile is left out and the caller skips it.
+				log.FromContext(ctx).V(1).Info("storage profile capacity is not readable",
+					"profile", ref.Name, "error", err)
+				continue
+			}
+			out.Storage = append(out.Storage, cloud.StorageProfileCapacity{
+				Name:    sp.Name,
+				Default: sp.Default,
+				LimitMB: storageLimitMB(sp),
+				UsedMB:  sp.StorageUsedMB,
+			})
+		}
+	}
+	sort.Slice(out.Storage, func(i, j int) bool { return out.Storage[i].Name < out.Storage[j].Name })
+	return out, nil
+}
+
+// storageLimitMB converts a storage profile limit to MB. vCD reports the limit
+// in the profile's units (MB in practice) and the usage always in MB, so a GB
+// limit has to be converted before the two can be compared.
+func storageLimitMB(sp *types.VdcStorageProfile) int64 {
+	if strings.EqualFold(strings.TrimSpace(sp.Units), "GB") {
+		return sp.Limit * 1024
+	}
+	return sp.Limit
+}
+
+// cpuMHzPerCore is the speed the vDC rates one vCPU at, in MHz. It is read once
+// from the admin view of the VDC, because the tenant view does not carry it.
+//
+// A tenant account that is not an org administrator cannot read the admin view.
+// That is not an error: zero tells the caller to fall back to the assumption in
+// the pool spec, and the capacity check still guards memory and storage.
+func (p *Provider) cpuMHzPerCore(ctx context.Context) int64 {
+	p.cpuOnce.Do(func() {
+		adminOrg, err := p.client.GetAdminOrgByName(p.cfg.Org)
+		if err != nil {
+			log.FromContext(ctx).V(1).Info("vDC CPU speed is not readable; the capacity pre-flight will use the pool assumption",
+				"org", p.cfg.Org, "error", err)
+			return
+		}
+		adminVDC, err := adminOrg.GetAdminVDCByName(p.cfg.VDC, true)
+		if err != nil {
+			log.FromContext(ctx).V(1).Info("vDC CPU speed is not readable; the capacity pre-flight will use the pool assumption",
+				"vdc", p.cfg.VDC, "error", err)
+			return
+		}
+		switch {
+		case adminVDC.AdminVdc.VCpuInMhz2 != nil:
+			p.cpuMHz = *adminVDC.AdminVdc.VCpuInMhz2
+		case adminVDC.AdminVdc.VCpuInMhz != nil:
+			p.cpuMHz = *adminVDC.AdminVdc.VCpuInMhz
+		}
+	})
+	return p.cpuMHz
 }
 
 // ListWorkerVMs returns the VMs in vapp whose metadata contains every

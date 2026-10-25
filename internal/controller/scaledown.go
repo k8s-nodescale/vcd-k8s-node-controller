@@ -279,8 +279,9 @@ func (r *WorkerPoolReconciler) deleteWorkerStep(ctx context.Context, pool *infra
 	// A slot whose VM is already gone needs no drain and no cloud call: the
 	// request is satisfied by writing the slot off and releasing its address.
 	// Without this a named deletion of a vanished worker would try to power off
-	// an empty VM ID and park the pool in ScaleDownFailed.
-	if node.Phase == infrav1.NodePhaseMissing {
+	// an empty VM ID and park the pool in ScaleDownFailed. A queued slot is the
+	// same: it never had a VM, so there is nothing to drain either.
+	if node.Phase == infrav1.NodePhaseMissing || node.Phase == infrav1.NodePhaseQueued {
 		if node.IP != "" {
 			_ = alloc.Free(node.IP)
 		}
@@ -293,8 +294,13 @@ func (r *WorkerPoolReconciler) deleteWorkerStep(ctx context.Context, pool *infra
 				pool.Spec.Replicas = int32(len(pool.Status.Nodes))
 			}
 		}
-		r.eventf(pool, corev1.EventTypeNormal, "WorkerWrittenOff",
-			fmt.Sprintf("missing worker %s (%s) written off; address released", node.Name, node.IP))
+		if node.Phase == infrav1.NodePhaseQueued {
+			r.eventf(pool, corev1.EventTypeNormal, "WorkerDropped",
+				fmt.Sprintf("queued worker %s (%s) dropped; it never had a VM", node.Name, node.IP))
+		} else {
+			r.eventf(pool, corev1.EventTypeNormal, "WorkerWrittenOff",
+				fmt.Sprintf("missing worker %s (%s) written off; address released", node.Name, node.IP))
+		}
 		return true, ctrl.Result{RequeueAfter: deleteStepRequeue}, nil
 	}
 
@@ -504,7 +510,7 @@ func (r *WorkerPoolReconciler) scaleDown(ctx context.Context, pool *infrav1.K8sW
 	guard := false
 	for i := 0; i < len(pool.Status.Nodes) && remaining > 0; {
 		node := pool.Status.Nodes[i]
-		if node.Phase != infrav1.NodePhaseMissing {
+		if node.Phase != infrav1.NodePhaseMissing && node.Phase != infrav1.NodePhaseQueued {
 			i++
 			continue
 		}
@@ -521,8 +527,13 @@ func (r *WorkerPoolReconciler) scaleDown(ctx context.Context, pool *infrav1.K8sW
 		pool.Status.Nodes = append(pool.Status.Nodes[:i], pool.Status.Nodes[i+1:]...)
 		pool.Status.ObservedReplicas--
 		pruneDeleteWorker(pool, node.Name)
-		r.eventf(pool, corev1.EventTypeNormal, "WorkerWrittenOff",
-			fmt.Sprintf("missing worker %s (%s) written off; address released", node.Name, node.IP))
+		if node.Phase == infrav1.NodePhaseQueued {
+			r.eventf(pool, corev1.EventTypeNormal, "WorkerDropped",
+				fmt.Sprintf("queued worker %s (%s) dropped; it never had a VM", node.Name, node.IP))
+		} else {
+			r.eventf(pool, corev1.EventTypeNormal, "WorkerWrittenOff",
+				fmt.Sprintf("missing worker %s (%s) written off; address released", node.Name, node.IP))
+		}
 		remaining--
 	}
 	if guard {
