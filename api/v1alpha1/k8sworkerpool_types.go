@@ -52,6 +52,12 @@ const (
 	// ResizeAnnotation opts a single worker into a Manual rollout:
 	// kubectl annotate node <worker> k8s-nodescale.github.io/resize=allow
 	ResizeAnnotation = AnnotationDomain + "/resize"
+
+	// FinalizerName keeps the pool object alive until its workers are gone.
+	// Without it "kubectl delete k8sworkerpool" removes the CR and leaves the
+	// VMs, the Node objects and the ingress pool members behind with nothing
+	// left to own them.
+	FinalizerName = AnnotationDomain + "/workerpool-cleanup"
 )
 
 // Rollout phases reported in status.rollout.

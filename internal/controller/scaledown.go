@@ -44,6 +44,10 @@ type deletionRequest struct {
 	name   string
 	inSpec bool // listed in spec.scaleDown.deleteWorkers
 	force  bool
+	// finalizer marks the removal that runs because the pool object is being
+	// deleted. It bypasses the scale-down policy and never rewrites the spec
+	// of an object that is already going away.
+	finalizer bool
 }
 
 // reconcileDeletions processes named deletion requests before the replica
@@ -249,15 +253,16 @@ func (r *WorkerPoolReconciler) deleteWorkerStep(ctx context.Context, pool *infra
 	if removesUsable {
 		usableAfter--
 	}
-	if reason, msg := r.removalGuard(ctx, pool, guardName, len(pool.Status.Nodes)-1, removesUsable, usableAfter); reason != "" {
+	if reason, msg := r.removalGuard(ctx, pool, guardName, len(pool.Status.Nodes)-1, removesUsable, usableAfter, req.finalizer); reason != "" {
 		if node.Phase == infrav1.NodePhaseDeleting {
 			logger.Info("removal continues although the policy would refuse it: the VM is already being deleted",
 				"worker", node.Name)
 		} else {
-			if node.DeleteStartedAt != nil {
+			if node.DeleteStartedAt != nil && !req.finalizer {
 				// The removal had already cordoned the worker. The policy no
 				// longer allows it, so put the worker back into service instead
-				// of leaving it Draining under a refusal.
+				// of leaving it Draining under a refusal. A pool being deleted
+				// is not reverted: nobody wants the worker back.
 				if err := r.revertDeletion(ctx, pool, node, kubeName, "the removal was refused by policy"); err != nil {
 					msg += "; the worker stays cordoned: " + err.Error()
 				} else {
@@ -282,9 +287,11 @@ func (r *WorkerPoolReconciler) deleteWorkerStep(ctx context.Context, pool *infra
 		pool.Status.Ledger = toStatusLedger(alloc.Ledger())
 		pool.Status.Nodes = append(pool.Status.Nodes[:idx], pool.Status.Nodes[idx+1:]...)
 		pool.Status.ObservedReplicas--
-		pruneDeleteWorker(pool, node.Name)
-		if pool.Spec.Replicas > int32(len(pool.Status.Nodes)) {
-			pool.Spec.Replicas = int32(len(pool.Status.Nodes))
+		if !req.finalizer {
+			pruneDeleteWorker(pool, node.Name)
+			if pool.Spec.Replicas > int32(len(pool.Status.Nodes)) {
+				pool.Spec.Replicas = int32(len(pool.Status.Nodes))
+			}
 		}
 		r.eventf(pool, corev1.EventTypeNormal, "WorkerWrittenOff",
 			fmt.Sprintf("missing worker %s (%s) written off; address released", node.Name, node.IP))
@@ -368,7 +375,10 @@ func (r *WorkerPoolReconciler) deleteWorkerStep(ctx context.Context, pool *infra
 			// instead of the eviction API, which bypasses the budget.
 			// scaleDown.waitForPDB turns this into the old refusal for
 			// clusters where a budget must win and a human decides.
-			if pool.Spec.ScaleDown.WaitForPDB {
+			// waitForPDB is a scale-down preference: deleting the pool itself
+			// is explicit, so a budget that never allows a disruption must not
+			// pin the finalizer forever.
+			if pool.Spec.ScaleDown.WaitForPDB && !req.finalizer {
 				node.Phase = infrav1.NodePhaseFailed
 				msg := fmt.Sprintf("drain did not finish within %s: %s", budget, node.Message)
 				node.Message = msg
@@ -440,6 +450,9 @@ func (r *WorkerPoolReconciler) deleteWorkerStep(ctx context.Context, pool *infra
 			node.Message = "VM deletion failed: " + err.Error()
 			return false, ctrl.Result{}, err
 		}
+		// A worker removed before it joined must not keep a usable join
+		// credential; workers that reached Ready were revoked already.
+		r.revokeBootstrapToken(ctx, node)
 
 		name, ip := node.Name, node.IP
 		if ip != "" {
@@ -495,7 +508,7 @@ func (r *WorkerPoolReconciler) scaleDown(ctx context.Context, pool *infrav1.K8sW
 			i++
 			continue
 		}
-		if reason, msg := r.removalGuard(ctx, pool, strings.ToLower(node.Name), len(pool.Status.Nodes)-1, false, usableWorkers(pool.Status.Nodes)); reason != "" {
+		if reason, msg := r.removalGuard(ctx, pool, strings.ToLower(node.Name), len(pool.Status.Nodes)-1, false, usableWorkers(pool.Status.Nodes), false); reason != "" {
 			r.setCondition(pool, metav1.ConditionFalse, reason, msg)
 			r.eventf(pool, corev1.EventTypeWarning, reason, msg)
 			guard = true
@@ -566,7 +579,7 @@ func (r *WorkerPoolReconciler) scaleDown(ctx context.Context, pool *infrav1.K8sW
 		}
 		slotsAfter := len(pool.Status.Nodes) - len(requests) - 1
 		usableAfter := usable - int32(len(requests)) - 1
-		if reason, msg := r.removalGuard(ctx, pool, strings.ToLower(node.Name), slotsAfter, true, usableAfter); reason != "" {
+		if reason, msg := r.removalGuard(ctx, pool, strings.ToLower(node.Name), slotsAfter, true, usableAfter, false); reason != "" {
 			r.setCondition(pool, metav1.ConditionFalse, reason, msg)
 			r.eventf(pool, corev1.EventTypeWarning, reason, msg)
 			guard = true

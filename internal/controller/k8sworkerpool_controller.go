@@ -104,6 +104,21 @@ func (r *WorkerPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 	before := pool.DeepCopy()
 
+	// A pool being deleted is not reconciled towards its spec: the finalizer
+	// drains and removes every worker first, then releases the object.
+	if !pool.DeletionTimestamp.IsZero() {
+		res, err := r.reconcilePoolDeletion(ctx, &pool)
+		// The final status write is expected to lose the object once the
+		// finalizer is gone; that is not an error.
+		if ferr := r.flush(ctx, before, &pool); ferr != nil && !apierrors.IsNotFound(ferr) {
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, ferr
+		}
+		return res, err
+	}
+
 	res, err := r.reconcile(ctx, &pool)
 
 	// The single status write of this pass.
@@ -127,6 +142,14 @@ func (r *WorkerPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 // It never writes status; Reconcile does that once, after it returns.
 func (r *WorkerPoolReconciler) reconcile(ctx context.Context, pool *infrav1.K8sWorkerPool) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
+
+	// The finalizer is what turns "delete the CR" into "delete the workers".
+	// It is added before anything is created, so a pool can never own a VM
+	// without owning its own cleanup.
+	if err := r.ensureFinalizer(ctx, pool); err != nil {
+		r.setCondition(pool, metav1.ConditionFalse, "FinalizerFailed", err.Error())
+		return ctrl.Result{}, err
+	}
 
 	if msg := r.validateSpec(pool); msg != "" {
 		r.setCondition(pool, metav1.ConditionFalse, "InvalidSpec", msg)

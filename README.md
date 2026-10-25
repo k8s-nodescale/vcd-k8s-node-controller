@@ -808,6 +808,41 @@ The floor and the flag are evaluated against what the pool can actually serve:
 | same, with `minReplicas: 0` + `allowLastWorker: true` | written off, pool becomes empty |
 | `allowLastWorker: true`, `minReplicas: 1` | `InvalidSpec`, nothing reconciled |
 
+### Deleting the pool object
+
+`kubectl delete k8sworkerpool <name>` removes the pool **and its workers**. The
+object carries the finalizer `k8s-nodescale.github.io/workerpool-cleanup`, so it
+does not disappear until every worker has been drained, removed from the ingress
+pool, stopped, deleted in vCD and had its address released. Only then is the
+finalizer dropped and the CR garbage-collected:
+
+    kubectl -n default delete k8sworkerpool kion-web-dev
+    kubectl -n default get k8sworkerpool kion-web-dev -w   # Terminating until done
+
+What this means in practice:
+
+- **It is not a scale-down.** `minReplicas` and `allowLastWorker` do not apply:
+  the owner asked for the whole pool, so every worker goes, including the last
+  one. `status` reports `PoolDeleting` with the number of workers left.
+- The two physics refusals still hold: a worker the controller itself runs on
+  (`WorkerHostsController`) and a worker whose `hostPath`/`local` volumes would
+  be lost (`VolumeDataAtRisk`). The object stays `Terminating` with the reason in
+  `status.conditions` until the obstacle is removed - move the controller off
+  the pool, or set `scaleDown.force` / annotate the node with
+  `k8s-nodescale.github.io/force-delete=true` if the data really is disposable.
+- One worker is advanced per pass, like a scale-down, so a drain that waits for
+  a PDB does not block the work queue. The same `drainTimeout` budget and the
+  same post-budget escalation apply; `waitForPDB` is ignored here, because a
+  budget that never allows a disruption would otherwise pin the finalizer
+  forever.
+- Deleting the namespace or the vApp does not bypass this: the CR stays until
+  the workers are gone. A pool created before the finalizer existed picks it up
+  on the first reconcile, so an upgrade needs no migration.
+- Do not strip the finalizer by hand (`kubectl patch ... -p
+  '{"metadata":{"finalizers":null}}'`) unless the workers are already gone:
+  that orphans the VMs, the Node objects and the ingress pool members with
+  nothing left to own them.
+
 ## Terraform integration contract
 
 - The Terraform module installs this chart behind a `node_controller.enabled`

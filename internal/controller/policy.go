@@ -257,20 +257,25 @@ func usableWorkers(nodes []infrav1.WorkerNodeStatus) int32 {
 // Two refusals survive scaleDown.allowLastWorker because they are not policy:
 // the worker this controller runs on, and (checked by the caller) node-local
 // volumes that hold data.
-func (r *WorkerPoolReconciler) removalGuard(ctx context.Context, pool *infrav1.K8sWorkerPool, kubeName string, slotsAfter int, removesUsable bool, usableAfter int32) (reason, msg string) {
-	if minReplicas := pool.Spec.ScaleDown.MinReplicas; minReplicas > 0 && removesUsable && usableAfter < minReplicas {
-		return "MinReplicasProtected", fmt.Sprintf(
-			"refusing to delete %s: %d worker(s) able to serve would fall below scaleDown.minReplicas=%d",
-			kubeName, usableAfter, minReplicas)
-	}
-	if slotsAfter > 0 {
-		return "", ""
-	}
-	// The two explicit conditions: minReplicas: 0 and the flag.
-	if pool.Spec.ScaleDown.MinReplicas > 0 || !pool.Spec.ScaleDown.AllowLastWorker {
-		return "LastWorkerProtected", fmt.Sprintf(
-			"refusing to delete %s: this would leave the pool with no workers; emptying the pool needs scaleDown.minReplicas: 0 and scaleDown.allowLastWorker: true",
-			kubeName)
+func (r *WorkerPoolReconciler) removalGuard(ctx context.Context, pool *infrav1.K8sWorkerPool, kubeName string, slotsAfter int, removesUsable bool, usableAfter int32, finalizer bool) (reason, msg string) {
+	// Deleting the pool itself is not a scale-down: the owner asked for every
+	// worker to go, so neither the floor nor the last-worker opt-in applies.
+	// The two non-policy refusals below still do.
+	if !finalizer {
+		if minReplicas := pool.Spec.ScaleDown.MinReplicas; minReplicas > 0 && removesUsable && usableAfter < minReplicas {
+			return "MinReplicasProtected", fmt.Sprintf(
+				"refusing to delete %s: %d worker(s) able to serve would fall below scaleDown.minReplicas=%d",
+				kubeName, usableAfter, minReplicas)
+		}
+		if slotsAfter > 0 {
+			return "", ""
+		}
+		// The two explicit conditions: minReplicas: 0 and the flag.
+		if pool.Spec.ScaleDown.MinReplicas > 0 || !pool.Spec.ScaleDown.AllowLastWorker {
+			return "LastWorkerProtected", fmt.Sprintf(
+				"refusing to delete %s: this would leave the pool with no workers; emptying the pool needs scaleDown.minReplicas: 0 and scaleDown.allowLastWorker: true",
+				kubeName)
+		}
 	}
 	// Not policy: the pass would die with the worker it is deleting.
 	if own := r.ownNodeName(ctx); own != "" && kubeName != "" && strings.EqualFold(own, kubeName) {
