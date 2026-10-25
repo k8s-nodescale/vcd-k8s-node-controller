@@ -111,6 +111,13 @@ func (r *WorkerPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		// The final status write is expected to lose the object once the
 		// finalizer is gone; that is not an error.
 		if ferr := r.flush(ctx, before, &pool); ferr != nil && !apierrors.IsNotFound(ferr) {
+			if apierrors.IsConflict(ferr) {
+				// The cache was one revision behind (the delete request and the
+				// status write race): the next pass recomputes from the server.
+				logger.V(1).Info("status update conflicted during deletion, retrying",
+					"pool", pool.Name)
+				return ctrl.Result{Requeue: true}, nil
+			}
 			if err != nil {
 				return ctrl.Result{}, err
 			}
