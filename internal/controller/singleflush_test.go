@@ -56,11 +56,13 @@ func newTestReconcilerWithFuncs(t *testing.T, fc *fakeCloud, fk *fakeKube, funcs
 	}
 }
 
-// TestReconcileWritesStatusOncePerPass guards the single-flush rule: one write
-// on a pass that changes something, none on a steady-state pass. Two writes in
-// one pass made the controller race against its own resourceVersion and retry
-// forever with "the object has been modified".
-func TestReconcileWritesStatusOncePerPass(t *testing.T) {
+// TestReconcileDoesNotRewriteUnchangedStatus guards the flush rule: a pass that
+// changes nothing writes nothing, because writing an identical status bumps the
+// resourceVersion and re-triggers the loop. A pass that creates a worker is
+// allowed a bounded number of progress writes (I-19: the slot and the VM id
+// must be visible while a create runs for minutes), but each of them must
+// carry something new.
+func TestReconcileDoesNotRewriteUnchangedStatus(t *testing.T) {
 	ctx := context.Background()
 	pool := testPool(2)
 	// kubelet reports less than the vCD flavor (kube-reserved), which is what
@@ -82,8 +84,10 @@ func TestReconcileWritesStatusOncePerPass(t *testing.T) {
 	if _, err := r.Reconcile(ctx, requestFor(pool)); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
-	if writes != 1 {
-		t.Fatalf("a pass with changes wrote status %d times, want exactly 1", writes)
+	// Two workers, each published before and after its create, plus the
+	// pass's own flush.
+	if writes < 1 || writes > 2*2+1 {
+		t.Fatalf("a scale-up pass wrote status %d times, want 1..%d", writes, 2*2+1)
 	}
 	got := getPool(t, r, pool)
 	for _, n := range got.Status.Nodes {

@@ -9,6 +9,14 @@ import (
 // ErrNotImplemented marks provider methods that still need a real implementation.
 var ErrNotImplemented = errors.New("cloud provider method not implemented")
 
+// ErrVMNotFound means the VM is gone from the vApp. A caller that races a
+// deletion treats it as done, not as a failure.
+var ErrVMNotFound = errors.New("VM not found")
+
+// ErrPoweredOn means the call needs the VM powered off. It is a state to
+// correct, not a failure: the caller stops the VM and retries.
+var ErrPoweredOn = errors.New("VM must be powered off")
+
 // ErrPoolNotConfigured means the worker pool has an ingress load balancer
 // configured that this provider cannot address (missing edge gateway name, or
 // NSX-T, which is not implemented yet). Callers treat it as a warning: the node
@@ -31,8 +39,10 @@ type VM struct {
 	Name       string
 	IP         string
 	PowerState string
-	CPU        int32
-	MemoryMB   int32
+	// PoweredOn is true while vCD reports the VM running.
+	PoweredOn bool
+	CPU       int32
+	MemoryMB  int32
 	// DiskGB is the total capacity of all disks on the VM.
 	DiskGB int32
 	// OSDiskGB is the system disk (bus 0/unit 0) alone, which is what
@@ -83,6 +93,10 @@ type PoolRef struct {
 // Provider abstracts all vCD operations required for worker scaling.
 type Provider interface {
 	ListWorkerVMs(ctx context.Context, vapp string, selector map[string]string) ([]VM, error)
+	// GetVM reads one VM by id. It is the cheap read the rollout does before
+	// it changes anything: a step retried after a status conflict must not
+	// power-cycle a VM that is already in the wanted state.
+	GetVM(ctx context.Context, vappName, id string) (VM, error)
 	CreateVM(ctx context.Context, spec CreateVMSpec) (VM, error)
 	DeleteVM(ctx context.Context, vappName, id string) error
 	// PowerOffVM hard-powers-off a VM, keeping it in the vApp. It is

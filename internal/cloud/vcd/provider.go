@@ -163,17 +163,57 @@ func (p *Provider) ListWorkerVMs(ctx context.Context, vappName string, selector 
 	return result, nil
 }
 
+// GetVM reads one worker VM by id.
+func (p *Provider) GetVM(ctx context.Context, vappName, id string) (cloud.VM, error) {
+	if err := ctx.Err(); err != nil {
+		return cloud.VM{}, err
+	}
+	if strings.TrimSpace(id) == "" {
+		return cloud.VM{}, fmt.Errorf("%w: empty id", cloud.ErrVMNotFound)
+	}
+	vdc, err := p.vdc()
+	if err != nil {
+		return cloud.VM{}, err
+	}
+	vapp, err := vdc.GetVAppByName(vappName, true)
+	if err != nil {
+		return cloud.VM{}, fmt.Errorf("get vApp %q: %w", vappName, err)
+	}
+	vm, err := vapp.GetVMById(id, true)
+	if err != nil {
+		if govcd.ContainsNotFound(err) {
+			return cloud.VM{}, fmt.Errorf("%w: %q", cloud.ErrVMNotFound, id)
+		}
+		return cloud.VM{}, fmt.Errorf("get VM %q: %w", id, err)
+	}
+	info, err := p.vmInfo(vm, nil)
+	if err != nil {
+		return cloud.VM{}, err
+	}
+	if info == nil {
+		return cloud.VM{}, fmt.Errorf("%w: %q", cloud.ErrVMNotFound, id)
+	}
+	return *info, nil
+}
+
 // CreateVM creates a worker VM from a vApp template and configures it before
 // the first power-on:
 //
 //  1. metadata (so a partially created VM is discoverable by ListWorkerVMs),
 //  2. CPU/memory,
-//  3. disk.EnableUUID,
-//  4. internal data disks in deterministic bus/unit order,
-//  5. guest customization (the initscript),
-//  6. power-on.
+//  3. the system disk,
+//  4. disk.EnableUUID,
+//  5. internal data disks in deterministic bus/unit order,
+//  6. guest customization (the initscript),
+//  7. power-on.
 //
 // If any step fails, the VM is removed again on a best-effort basis.
+//
+// It also finishes a create that an earlier pass did not complete. The second half matters: a controller restart or a timeout in
+// the middle of a create leaves a half-configured VM behind (I-18), and the
+// ledger has already given this slot its name, so converging on the existing
+// VM is the only loss-free outcome. Every step below is idempotent, and a VM
+// that is already powered on had reached the last step of its create.
 func (p *Provider) CreateVM(ctx context.Context, spec cloud.CreateVMSpec) (cloud.VM, error) {
 	if err := ctx.Err(); err != nil {
 		return cloud.VM{}, err
@@ -190,50 +230,69 @@ func (p *Provider) CreateVM(ctx context.Context, spec cloud.CreateVMSpec) (cloud
 	if err != nil {
 		return cloud.VM{}, fmt.Errorf("get vApp %q: %w", spec.VApp, err)
 	}
-	template, err := p.findTemplate(vdc, spec)
-	if err != nil {
-		return cloud.VM{}, err
-	}
 
-	if existing, err := vapp.GetVMByName(spec.Name, true); err == nil && existing != nil {
-		return cloud.VM{}, fmt.Errorf("VM %q already exists in vApp %q", spec.Name, spec.VApp)
-	} else if err != nil && !govcd.ContainsNotFound(err) {
-		return cloud.VM{}, fmt.Errorf("check existing VM %q: %w", spec.Name, err)
-	}
-
-	network := &types.NetworkConnectionSection{
-		Info:                          "NetworkConnectionSection",
-		PrimaryNetworkConnectionIndex: 0,
-		NetworkConnection: []*types.NetworkConnection{{
-			Network:                 spec.OrgNetwork,
-			NetworkConnectionIndex:  0,
-			IPAddress:               spec.IP,
-			IsConnected:             true,
-			NeedsCustomization:      true,
-			IPAddressAllocationMode: types.IPAllocationModeManual,
-			IpType:                  "IPV4",
-		}},
-	}
-
-	task, err := vapp.AddNewVM(spec.Name, *template, network, true)
-	if err != nil {
-		return cloud.VM{}, fmt.Errorf("create VM %q: %w", spec.Name, err)
-	}
-	if err := task.WaitTaskCompletion(); err != nil {
-		return cloud.VM{}, fmt.Errorf("wait for VM %q creation: %w", spec.Name, err)
-	}
-
-	vm, err := vapp.GetVMByName(spec.Name, true)
-	if err != nil {
-		return cloud.VM{}, fmt.Errorf("get created VM %q: %w", spec.Name, err)
+	vm, resumed := (*govcd.VM)(nil), false
+	if existing, gerr := vapp.GetVMByName(spec.Name, true); gerr == nil && existing != nil {
+		vm, resumed = existing, true
+	} else if gerr != nil && !govcd.ContainsNotFound(gerr) {
+		return cloud.VM{}, fmt.Errorf("check existing VM %q: %w", spec.Name, gerr)
 	}
 
 	created := false
+	if !resumed {
+		// The template is only needed for a fresh VM: a resumed create must not fail
+		// because the template moved.
+		template, err := p.findTemplate(vdc, spec)
+		if err != nil {
+			return cloud.VM{}, err
+		}
+		network := &types.NetworkConnectionSection{
+			Info:                          "NetworkConnectionSection",
+			PrimaryNetworkConnectionIndex: 0,
+			NetworkConnection: []*types.NetworkConnection{{
+				Network:                 spec.OrgNetwork,
+				NetworkConnectionIndex:  0,
+				IPAddress:               spec.IP,
+				IsConnected:             true,
+				NeedsCustomization:      true,
+				IPAddressAllocationMode: types.IPAllocationModeManual,
+				IpType:                  "IPV4",
+			}},
+		}
+		task, err := vapp.AddNewVM(spec.Name, *template, network, true)
+		if err != nil {
+			return cloud.VM{}, fmt.Errorf("create VM %q: %w", spec.Name, err)
+		}
+		if err := task.WaitTaskCompletion(); err != nil {
+			return cloud.VM{}, fmt.Errorf("wait for VM %q creation: %w", spec.Name, err)
+		}
+		if vm, err = vapp.GetVMByName(spec.Name, true); err != nil {
+			return cloud.VM{}, fmt.Errorf("get created VM %q: %w", spec.Name, err)
+		}
+	}
+
 	defer func() {
 		if !created {
 			_ = removeVM(vapp, vm)
 		}
 	}()
+
+	if resumed {
+		if err := vm.Refresh(); err != nil {
+			return cloud.VM{}, fmt.Errorf("refresh resumed VM %q: %w", spec.Name, err)
+		}
+		if vm.VM.Status == vcdPoweredOn {
+			info, err := p.vmInfo(vm, nil)
+			if err != nil {
+				return cloud.VM{}, err
+			}
+			if info == nil {
+				return cloud.VM{}, fmt.Errorf("VM %q disappeared", spec.Name)
+			}
+			created = true
+			return *info, nil
+		}
+	}
 
 	if len(spec.Metadata) > 0 {
 		values := make(map[string]interface{}, len(spec.Metadata))
@@ -274,7 +333,7 @@ func (p *Provider) CreateVM(ctx context.Context, spec cloud.CreateVMSpec) (cloud
 	if err := ctx.Err(); err != nil {
 		return cloud.VM{}, err
 	}
-	task, err = vm.PowerOn()
+	task, err := vm.PowerOn()
 	if err != nil {
 		return cloud.VM{}, fmt.Errorf("power on VM %q: %w", spec.Name, err)
 	}
@@ -288,6 +347,9 @@ func (p *Provider) CreateVM(ctx context.Context, spec cloud.CreateVMSpec) (cloud
 	info, err := p.vmInfo(vm, nil)
 	if err != nil {
 		return cloud.VM{}, err
+	}
+	if info == nil {
+		return cloud.VM{}, fmt.Errorf("VM %q disappeared", spec.Name)
 	}
 	created = true
 	return *info, nil
@@ -441,6 +503,13 @@ func powerOn(vm *govcd.VM) error {
 // refused: vCD cannot reduce CPU or memory and a smaller disk would destroy
 // data, so shrinking is a recreate operation (drain, delete the VM, create a
 // new one in the same ledger slot), not a resize.
+// ResizeVM grows a powered-off VM. It reads the VM first and returns without
+// touching it when the shape already matches, so a step that a status conflict
+// re-drove cannot fail on a VM that a previous pass already resized (I-10).
+// CPU, memory and the system disk are changed in the one power-off window the
+// caller opened, and the result is verified before the caller powers it on: a
+// resize that only half applied must not boot a worker with the wrong shape
+// (I-17).
 func (p *Provider) ResizeVM(ctx context.Context, vappName, id string, cpus, memoryMB, osDiskGB int32) (cloud.VM, error) {
 	if err := ctx.Err(); err != nil {
 		return cloud.VM{}, err
@@ -457,9 +526,6 @@ func (p *Provider) ResizeVM(ctx context.Context, vappName, id string, cpus, memo
 	if err != nil {
 		return cloud.VM{}, fmt.Errorf("get VM %q: %w", id, err)
 	}
-	if vm.VM.Status != 8 { // POWERED_OFF
-		return cloud.VM{}, fmt.Errorf("VM %q must be powered off to resize (status %s)", vm.VM.Name, vappStatus(vm.VM.Status))
-	}
 
 	curCPU, curMem, _ := vmResources(vm)
 	curDisk := systemDiskGB(vm)
@@ -472,10 +538,26 @@ func (p *Provider) ResizeVM(ctx context.Context, vappName, id string, cpus, memo
 		return cloud.VM{}, fmt.Errorf("VM %q has a %d GB system disk, cannot shrink to %d GB", vm.VM.Name, curDisk, osDiskGB)
 	}
 
+	want := func(have, want int32) bool { return want <= 0 || have == want }
+	if want(curCPU, cpus) && want(curMem, memoryMB) && want(curDisk, osDiskGB) {
+		info, err := p.vmInfo(vm, nil)
+		if err != nil {
+			return cloud.VM{}, err
+		}
+		if info == nil {
+			return cloud.VM{}, fmt.Errorf("VM %q disappeared", id)
+		}
+		return *info, nil
+	}
+
+	if vm.VM.Status != vcdPoweredOff {
+		return cloud.VM{}, fmt.Errorf("%w: VM %q is %s", cloud.ErrPoweredOn, vm.VM.Name, vappStatus(vm.VM.Status))
+	}
+
 	// The system disk is changed through the VM spec section, so it goes
 	// first: that call carries the current CPU and memory with it, and doing
 	// it after ChangeCPUCount would write the pre-resize values back.
-	if osDiskGB > 0 {
+	if osDiskGB > 0 && curDisk != osDiskGB {
 		if err := setSystemDiskSize(vm, osDiskGB); err != nil {
 			return cloud.VM{}, err
 		}
@@ -510,6 +592,10 @@ func (p *Provider) ResizeVM(ctx context.Context, vappName, id string, cpus, memo
 	}
 	if info.OSDiskGB == 0 {
 		info.OSDiskGB = systemDiskGB(vm)
+	}
+	if !want(info.CPU, cpus) || !want(info.MemoryMB, memoryMB) || !want(info.OSDiskGB, osDiskGB) {
+		return cloud.VM{}, fmt.Errorf("VM %q reports %d vCPU / %d MB / %d GB after the resize, want %d / %d / %d",
+			vm.VM.Name, info.CPU, info.MemoryMB, info.OSDiskGB, cpus, memoryMB, osDiskGB)
 	}
 	return *info, nil
 }
@@ -756,6 +842,7 @@ func (p *Provider) vmInfo(vm *govcd.VM, selector map[string]string) (*cloud.VM, 
 		Name:       vm.VM.Name,
 		IP:         primaryIP(vm),
 		PowerState: vappStatus(vm.VM.Status),
+		PoweredOn:  vm.VM.Status == vcdPoweredOn,
 		CPU:        cpu,
 		MemoryMB:   memMB,
 		DiskGB:     diskGB,
@@ -826,6 +913,13 @@ func vmResources(vm *govcd.VM) (cpu, memMB, diskGB int32) {
 	return cpu, memMB, diskGB
 }
 
+// vCD VM power states. types.VAppStatuses maps them for display; the two used
+// here are the ones a resize has to tell apart.
+const (
+	vcdPoweredOn  = 4
+	vcdPoweredOff = 8
+)
+
 func vappStatus(status int) string {
 	if s, ok := types.VAppStatuses[status]; ok {
 		return s
@@ -873,20 +967,37 @@ func (p *Provider) attachDisks(vdc *govcd.Vdc, vm *govcd.VM, specs []cloud.DiskS
 	}
 
 	occupied := []cloud.DiskPlacement{{Index: -1, BusNumber: 0, UnitNumber: 0}}
-	if vm.VM.VmSpecSection != nil && vm.VM.VmSpecSection.DiskSection != nil {
-		for i, disk := range vm.VM.VmSpecSection.DiskSection.DiskSettings {
-			if disk == nil {
-				continue
-			}
-			occupied = append(occupied, cloud.DiskPlacement{
-				Index:      i,
-				BusNumber:  disk.BusNumber,
-				UnitNumber: disk.UnitNumber,
-			})
+	// Data disks that are already there are matched by size, so a resumed
+	// create does not attach a second copy of a disk it attached before the
+	// interruption. Disks of the same size are interchangeable for a worker.
+	present := make(map[int32]int)
+	for i, disk := range vm.VM.VmSpecSection.DiskSection.DiskSettings {
+		if disk == nil {
+			continue
 		}
+		if disk.BusNumber == 0 && disk.UnitNumber == 0 {
+			continue
+		}
+		present[int32((disk.SizeMb+1023)/1024)]++
+		occupied = append(occupied, cloud.DiskPlacement{
+			Index:      i,
+			BusNumber:  disk.BusNumber,
+			UnitNumber: disk.UnitNumber,
+		})
+	}
+	var missing []cloud.DiskSpec
+	for _, spec := range specs {
+		if present[spec.SizeGB] > 0 {
+			present[spec.SizeGB]--
+			continue
+		}
+		missing = append(missing, spec)
+	}
+	if len(missing) == 0 {
+		return nil
 	}
 
-	placements, err := cloud.PlanDiskPlacements(specs, occupied)
+	placements, err := cloud.PlanDiskPlacements(missing, occupied)
 	if err != nil {
 		return err
 	}

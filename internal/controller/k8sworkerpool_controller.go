@@ -126,9 +126,10 @@ func (r *WorkerPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return res, err
 	}
 
-	res, err := r.reconcile(ctx, &pool)
+	res, err := r.reconcile(ctx, before, &pool)
 
-	// The single status write of this pass.
+	// The write that closes the pass. A create may already have published its
+	// progress (see scaleUp); this one records everything else.
 	if ferr := r.flush(ctx, before, &pool); ferr != nil {
 		if apierrors.IsConflict(ferr) {
 			// Our cache was one revision behind. The next pass recomputes
@@ -146,8 +147,10 @@ func (r *WorkerPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 }
 
 // reconcile computes the observed state and moves the pool towards the spec.
-// It never writes status; Reconcile does that once, after it returns.
-func (r *WorkerPoolReconciler) reconcile(ctx context.Context, pool *infrav1.K8sWorkerPool) (ctrl.Result, error) {
+// It writes status only from scaleUp, which publishes a slot before and after
+// a create that can take minutes (I-19); everything else is written by
+// Reconcile once, after this returns.
+func (r *WorkerPoolReconciler) reconcile(ctx context.Context, before, pool *infrav1.K8sWorkerPool) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
 	// The finalizer is what turns "delete the CR" into "delete the workers".
@@ -263,10 +266,22 @@ func (r *WorkerPoolReconciler) reconcile(ctx context.Context, pool *infrav1.K8sW
 		return res, nil
 	}
 
+	// A create that a restart interrupted leaves a powered-off VM with no Node
+	// behind it. Finish it before the replica arithmetic reads the slot as
+	// healthy; the watchdog would otherwise park it Failed (I-18).
+	if handled, err := r.resumeInterruptedCreates(ctx, pool, alloc); handled {
+		if err != nil {
+			logger.Error(err, "could not resume an interrupted create", "pool", pool.Name)
+			r.setCondition(pool, metav1.ConditionFalse, "CreateResumeFailed", err.Error())
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: requeueProgressing}, nil
+	}
+
 	desired := pool.Spec.Replicas
 	switch {
 	case desired > pool.Status.ObservedReplicas:
-		if err := r.scaleUp(ctx, pool, alloc, desired-pool.Status.ObservedReplicas); err != nil {
+		if err := r.scaleUp(ctx, before, pool, alloc, desired-pool.Status.ObservedReplicas); err != nil {
 			logger.Error(err, "scale up failed", "pool", pool.Name)
 			r.setCondition(pool, metav1.ConditionFalse, "ScaleUpFailed", err.Error())
 			return ctrl.Result{}, err
@@ -702,7 +717,7 @@ func mergeNodes(pool *infrav1.K8sWorkerPool, vms []cloud.VM, alloc *ipam.Allocat
 // harmless because the next pass adopts the VMs that exist in vCD again. If a
 // create fails, the address is kept reserved only when the VM still exists in
 // vCD; otherwise it is released for reuse.
-func (r *WorkerPoolReconciler) scaleUp(ctx context.Context, pool *infrav1.K8sWorkerPool, alloc *ipam.Allocator, n int32) error {
+func (r *WorkerPoolReconciler) scaleUp(ctx context.Context, before, pool *infrav1.K8sWorkerPool, alloc *ipam.Allocator, n int32) error {
 	logger := log.FromContext(ctx)
 
 	for i := int32(0); i < n; i++ {
@@ -717,8 +732,38 @@ func (r *WorkerPoolReconciler) scaleUp(ctx context.Context, pool *infrav1.K8sWor
 		}
 		name := workerName(pool.Spec.NamePrefix, ordinal)
 
+		// The slot is written before the VM exists, so a create that takes
+		// minutes is visible instead of the pool reporting nothing until the
+		// pass ends (I-19). A crash between this write and the VM is harmless:
+		// the slot is reserved, and AutoHeal recreates it.
+		now := metav1.Now()
+		pool.Status.Nodes = append(pool.Status.Nodes, infrav1.WorkerNodeStatus{
+			Name:                  name,
+			IP:                    ip,
+			Phase:                 infrav1.NodePhaseProvisioning,
+			ProvisioningStartedAt: &now,
+			Message:               "creating the VM",
+			CPU:                   pool.Spec.Flavor.CPUs,
+			MemoryMB:              pool.Spec.Flavor.MemoryMB,
+			Flavor: &infrav1.FlavorStatus{
+				CPUs:     pool.Spec.Flavor.CPUs,
+				MemoryMB: pool.Spec.Flavor.MemoryMB,
+				OSDiskGB: pool.Spec.Flavor.OSDiskGB,
+			},
+		})
+		pool.Status.ObservedReplicas = int32(len(pool.Status.Nodes))
+		pool.Status.Ledger = toStatusLedger(alloc.Ledger())
+		if err := r.flush(ctx, before, pool); err != nil {
+			return err
+		}
+
 		vm, tokID, err := r.createWorker(ctx, pool, alloc, name, ip)
 		if err != nil {
+			// The placeholder must not survive a failed create: it has no VM
+			// and would read as a Missing slot.
+			pool.Status.Nodes = pool.Status.Nodes[:len(pool.Status.Nodes)-1]
+			pool.Status.ObservedReplicas = int32(len(pool.Status.Nodes))
+			pool.Status.Ledger = toStatusLedger(alloc.Ledger())
 			return err
 		}
 
@@ -729,28 +774,86 @@ func (r *WorkerPoolReconciler) scaleUp(ctx context.Context, pool *infrav1.K8sWor
 		if memMB == 0 {
 			memMB = pool.Spec.Flavor.MemoryMB
 		}
-		now := metav1.Now()
-		pool.Status.Nodes = append(pool.Status.Nodes, infrav1.WorkerNodeStatus{
-			Name:                  name,
-			IP:                    ip,
-			ProviderID:            vm.ID,
-			Phase:                 infrav1.NodePhaseProvisioning,
-			ProvisioningStartedAt: &now,
-			CPU:                   cpu,
-			MemoryMB:              memMB,
-			DiskGB:                vm.DiskGB,
-			Flavor: &infrav1.FlavorStatus{
-				CPUs:     vm.CPU,
-				MemoryMB: vm.MemoryMB,
-				OSDiskGB: vm.OSDiskGB,
-			},
-			BootstrapTokenID: tokID,
-		})
-		pool.Status.ObservedReplicas = int32(len(pool.Status.Nodes))
+		st := &pool.Status.Nodes[len(pool.Status.Nodes)-1]
+		st.ProviderID = vm.ID
+		st.Phase = infrav1.NodePhaseProvisioning
+		st.Message = ""
+		st.CPU = cpu
+		st.MemoryMB = memMB
+		st.DiskGB = vm.DiskGB
+		st.Flavor = &infrav1.FlavorStatus{CPUs: vm.CPU, MemoryMB: vm.MemoryMB, OSDiskGB: vm.OSDiskGB}
+		st.BootstrapTokenID = tokID
 		pool.Status.Ledger = toStatusLedger(alloc.Ledger())
+		// Persist the VM id as soon as it exists: a restart after this point
+		// adopts the VM instead of creating a second one.
+		if err := r.flush(ctx, before, pool); err != nil {
+			return err
+		}
 		logger.Info("created worker", "node", name, "ip", ip, "providerID", vm.ID)
 	}
 	return nil
+}
+
+// resumeInterruptedCreates finishes a create the controller did not reach the
+// end of. A restart in the middle of CreateVM leaves a VM the controller made
+// powered off, with no Node behind it and no bootstrap token recorded for it
+// (I-18). Nothing else would ever start it, so the create is simply run again:
+// CreateVM converges on the existing VM and every step is idempotent. A VM that
+// is powered on had reached the last step of its create and is left alone, and
+// so is anything the controller did not create itself.
+func (r *WorkerPoolReconciler) resumeInterruptedCreates(ctx context.Context, pool *infrav1.K8sWorkerPool, alloc *ipam.Allocator) (bool, error) {
+	logger := log.FromContext(ctx)
+
+	for i := range pool.Status.Nodes {
+		n := &pool.Status.Nodes[i]
+		if n.ProviderID == "" || n.Phase != infrav1.NodePhaseProvisioning ||
+			n.Resize != nil || n.DeleteStartedAt != nil || n.NodeName != "" ||
+			n.BootstrapTokenID != "" {
+			continue
+		}
+		vm, err := r.Cloud.GetVM(ctx, pool.Spec.VCD.VApp, n.ProviderID)
+		if err != nil {
+			if errors.Is(err, cloud.ErrVMNotFound) {
+				// mergeMissingSlots and AutoHeal own a slot whose VM is gone.
+				continue
+			}
+			return true, err
+		}
+		if vm.PoweredOn || vm.Metadata["managed-by"] != "vcd-nodescale" {
+			continue
+		}
+
+		staleToken := vm.Metadata["token-id"]
+		resumed, tokID, err := r.createWorker(ctx, pool, alloc, n.Name, n.IP)
+		if err != nil {
+			n.Message = "resuming the interrupted create failed: " + err.Error()
+			logger.Error(err, "resume an interrupted create", "worker", n.Name)
+			r.eventf(pool, corev1.EventTypeWarning, "WorkerCreateResumeFailed",
+				fmt.Sprintf("worker %s (%s): %v", n.Name, n.IP, err))
+			return true, err
+		}
+		if staleToken != "" && staleToken != tokID {
+			if err := r.Kube.RevokeBootstrapTokenID(ctx, staleToken); err != nil {
+				logger.Error(err, "revoke the token of the interrupted create", "worker", n.Name, "token", staleToken)
+			}
+		}
+		now := metav1.Now()
+		n.ProviderID = resumed.ID
+		n.Phase = infrav1.NodePhaseProvisioning
+		n.ProvisioningStartedAt = &now
+		n.BootstrapTokenID = tokID
+		n.Message = ""
+		n.CPU = resumed.CPU
+		n.MemoryMB = resumed.MemoryMB
+		n.DiskGB = resumed.DiskGB
+		n.Flavor = &infrav1.FlavorStatus{CPUs: resumed.CPU, MemoryMB: resumed.MemoryMB, OSDiskGB: resumed.OSDiskGB}
+		pool.Status.Ledger = toStatusLedger(alloc.Ledger())
+		logger.Info("resumed an interrupted create", "worker", n.Name, "providerID", resumed.ID)
+		r.eventf(pool, corev1.EventTypeNormal, "WorkerCreateResumed",
+			fmt.Sprintf("worker %s (%s) was left powered off by an interrupted create; the create was finished", n.Name, n.IP))
+		return true, nil
+	}
+	return false, nil
 }
 
 // createWorker provisions one worker VM into the slot (name, ip). It owns the

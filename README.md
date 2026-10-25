@@ -415,10 +415,20 @@ kubectl -n default get k8sworkerpool demo-cluster \
 # {"type":"Ready","status":"True","reason":"Converged","message":"3/3 workers Ready",...}
 ```
 
-Add **one replica at a time**: `scaleUp` creates every missing VM in a single
-pass and writes `status` once at the end, so a larger jump keeps reporting the
-previous `Converged` condition for several minutes and hides where the pass
-actually is.
+Each worker is published in `status.nodes[]` before its VM exists (`phase:
+Provisioning`, `message: creating the VM`) and again as soon as the VM id is
+known, so a create that takes minutes is visible while it runs instead of
+appearing only when the pass ends. The pass itself still creates one VM after
+another, so asking for five replicas on an empty pool takes about five times as
+long as one.
+
+A create that a controller restart interrupted is finished on the next pass. The
+interruption leaves the VM powered off with no Node behind it, and nothing else
+would ever start it: the controller re-runs the (idempotent) configuration with
+a fresh join command and powers it on, revoking the token of the interrupted
+attempt. A VM that is already powered on had reached the last step of its create
+and is left alone, and a VM the controller did not create itself (a Terraform
+baseline worker) is never touched by this path.
 
 ### What not to do
 
@@ -584,8 +594,17 @@ Each worker goes through the removal pipeline with a resize in the middle
 instead of a delete:
 
     cordon (nodeName) -> ingress pool out -> drain (PDB) -> VolumeAttachment wait
-      -> power off VM -> grow CPU/memory/system disk -> power on
-      -> wait Node Ready and the flavor to match -> uncordon -> ingress pool in
+      -> read the VM -> power off -> grow CPU/memory/system disk -> verify the shape
+      -> power on -> wait Node Ready and the flavor to match -> uncordon
+      -> ingress pool in
+
+The VM is read before anything is powered off, so a step that a status conflict
+re-drove does not power-cycle a worker whose shape already matches, and a VM that
+something started again is stopped rather than failing the slot. CPU, memory and
+the system disk change in that one power-off window, and the worker is only
+powered on again once vCD reports the target shape: a resize that only half
+applied parks the slot `Failed` with the VM stopped, instead of booting a worker
+that reports Ready with the wrong disk.
 
 One worker at a time by default. `rollout.maxUnavailable` (int or percentage)
 lets a batch be out of service together; PDBs remain the real brake, and a batch
@@ -846,7 +865,7 @@ What this means in practice:
 ## Terraform integration contract
 
 - The Terraform module installs this chart behind a `node_controller.enabled`
-  toggle and pins `chart_version` / `image_tag` (currently `0.7.5`).
+  toggle and pins `chart_version` / `image_tag` (currently `0.7.6`).
 - **Once the controller is enabled, do not use Terraform to manage worker count
   or worker LB pool membership.** Use the CRD instead. The Terraform module's
   README must state this explicitly.
@@ -877,7 +896,7 @@ Build locally (the Dockerfile uses `golang:1.27.1-alpine` and
 `gcr.io/distroless/static:nonroot`):
 
 ```
-docker build -t docker.io/werton13/vcd-k8s-node-controller:0.7.5 .
+docker build -t docker.io/werton13/vcd-k8s-node-controller:0.7.6 .
 ```
 
 Public module defaults are used inside the build. On a restricted network,
@@ -887,14 +906,14 @@ override them:
 docker build \
   --build-arg GOPROXY=https://nexus.example.com/repository/golang/ \
   --build-arg GOSUMDB=off \
-  -t docker.io/werton13/vcd-k8s-node-controller:0.7.5 .
+  -t docker.io/werton13/vcd-k8s-node-controller:0.7.6 .
 ```
 
 Push (or use `make image-push`):
 
 ```
 docker login docker.io
-docker push docker.io/werton13/vcd-k8s-node-controller:0.7.5
+docker push docker.io/werton13/vcd-k8s-node-controller:0.7.6
 docker push docker.io/werton13/vcd-k8s-node-controller:latest
 ```
 

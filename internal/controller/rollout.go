@@ -314,23 +314,84 @@ func (r *WorkerPoolReconciler) advanceResize(ctx context.Context, pool *infrav1.
 		if err := r.Kube.WaitVolumesDetached(ctx, kubeName, volumeWaitTimeout); err != nil {
 			return err
 		}
-		if err := r.Cloud.PowerOffVM(ctx, pool.Spec.VCD.VApp, n.ProviderID); err != nil {
-			return fmt.Errorf("stop %s: %w", n.Name, err)
+		// Read the VM before powering anything off. A step that a status
+		// conflict re-drove can find the resize already finished, and a VM that
+		// already carries the target shape must not be power-cycled again
+		// (I-10).
+		vm, err := r.Cloud.GetVM(ctx, pool.Spec.VCD.VApp, n.ProviderID)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", n.Name, err)
+		}
+		have := &infrav1.FlavorStatus{CPUs: vm.CPU, MemoryMB: vm.MemoryMB, OSDiskGB: vm.OSDiskGB}
+		if compareFlavor(have, target) == flavorEqual {
+			n.Flavor = have
+			if !vm.PoweredOn {
+				if err := r.Cloud.PowerOnVM(ctx, pool.Spec.VCD.VApp, n.ProviderID); err != nil {
+					return fmt.Errorf("power on %s: %w", n.Name, err)
+				}
+			}
+			n.Resize.Phase = resizePhaseBooting
+			n.Resize.Message = "already carries the target shape; waiting for the Node to become Ready"
+			n.Message = n.Resize.Message
+			return nil
+		}
+		if vm.PoweredOn {
+			if err := r.Cloud.PowerOffVM(ctx, pool.Spec.VCD.VApp, n.ProviderID); err != nil {
+				return fmt.Errorf("stop %s: %w", n.Name, err)
+			}
 		}
 		n.Resize.Phase = resizePhaseStopped
-		n.Resize.Message = "drained and powered off; waiting to be resized"
+		n.Resize.Message = "drained and powered off; resizing in the next pass"
 		n.Message = n.Resize.Message
 		return nil
 
 	case resizePhaseStopped:
-		vm, err := r.Cloud.ResizeVM(ctx, pool.Spec.VCD.VApp, n.ProviderID, target.CPUs, target.MemoryMB, target.OSDiskGB)
+		// CPU, memory and the system disk are changed in this one power-off
+		// window, and the worker is only powered on again once the VM reports
+		// the target shape (I-17). vCD resizes a stopped VM only, so a VM that
+		// something started again is stopped first instead of failing the slot
+		// (I-10).
+		vm, err := r.Cloud.GetVM(ctx, pool.Spec.VCD.VApp, n.ProviderID)
 		if err != nil {
-			return fmt.Errorf("resize %s: %w", n.Name, err)
+			return fmt.Errorf("read %s: %w", n.Name, err)
 		}
-		if err := r.Cloud.PowerOnVM(ctx, pool.Spec.VCD.VApp, n.ProviderID); err != nil {
-			return fmt.Errorf("power on %s: %w", n.Name, err)
+		have := &infrav1.FlavorStatus{CPUs: vm.CPU, MemoryMB: vm.MemoryMB, OSDiskGB: vm.OSDiskGB}
+		if compareFlavor(have, target) != flavorEqual {
+			if vm.PoweredOn {
+				if err := r.Cloud.PowerOffVM(ctx, pool.Spec.VCD.VApp, n.ProviderID); err != nil {
+					return fmt.Errorf("stop %s: %w", n.Name, err)
+				}
+				n.Resize.Message = "powered off again; resizing in the next pass"
+				n.Message = n.Resize.Message
+				return nil
+			}
+			resized, err := r.Cloud.ResizeVM(ctx, pool.Spec.VCD.VApp, n.ProviderID, target.CPUs, target.MemoryMB, target.OSDiskGB)
+			if err != nil {
+				if errors.Is(err, cloud.ErrPoweredOn) {
+					if perr := r.Cloud.PowerOffVM(ctx, pool.Spec.VCD.VApp, n.ProviderID); perr != nil {
+						return fmt.Errorf("stop %s: %w", n.Name, perr)
+					}
+					n.Resize.Message = "the VM was running; powered off and resizing in the next pass"
+					n.Message = n.Resize.Message
+					return nil
+				}
+				return fmt.Errorf("resize %s: %w", n.Name, err)
+			}
+			vm = resized
+			have = &infrav1.FlavorStatus{CPUs: vm.CPU, MemoryMB: vm.MemoryMB, OSDiskGB: vm.OSDiskGB}
+			if compareFlavor(have, target) != flavorEqual {
+				// Do not boot a worker with the wrong shape: a resize that
+				// only half applied would otherwise look like a finished one.
+				return fmt.Errorf("worker %s reports %d vCPU / %d MB / %d GB after the resize, want %d / %d / %d; it stays powered off",
+					n.Name, have.CPUs, have.MemoryMB, have.OSDiskGB, target.CPUs, target.MemoryMB, target.OSDiskGB)
+			}
 		}
-		n.Flavor = &infrav1.FlavorStatus{CPUs: vm.CPU, MemoryMB: vm.MemoryMB, OSDiskGB: vm.OSDiskGB}
+		if !vm.PoweredOn {
+			if err := r.Cloud.PowerOnVM(ctx, pool.Spec.VCD.VApp, n.ProviderID); err != nil {
+				return fmt.Errorf("power on %s: %w", n.Name, err)
+			}
+		}
+		n.Flavor = have
 		n.Resize.Phase = resizePhaseBooting
 		n.Resize.Message = "resized and powered on; waiting for the Node to become Ready"
 		n.Message = n.Resize.Message

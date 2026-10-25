@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -32,6 +33,9 @@ type fakeCloud struct {
 	cycles          []string
 	resizes         []string
 	failResize      bool
+	resizeIgnores   bool
+	poweredOn       []string
+	createHook      func()
 	calls           int
 	failAt          int
 	failAfterCreate bool
@@ -44,28 +48,72 @@ func (f *fakeCloud) ListWorkerVMs(ctx context.Context, vapp string, selector map
 }
 
 func (f *fakeCloud) CreateVM(ctx context.Context, spec cloud.CreateVMSpec) (cloud.VM, error) {
+	if f.createHook != nil {
+		f.createHook()
+	}
 	f.calls++
 	if f.failAt > 0 && f.calls == f.failAt {
 		if f.failAfterCreate {
 			// Simulates a VM that survived a failed power-on/cleanup.
 			f.vms = append(f.vms, cloud.VM{
 				ID: "vm-" + spec.Name, Name: spec.Name, IP: spec.IP,
-				CPU: spec.CPUs, MemoryMB: spec.MemoryMB,
+				CPU: spec.CPUs, MemoryMB: spec.MemoryMB, PoweredOn: true,
+				Metadata: spec.Metadata,
 			})
 		}
 		return cloud.VM{}, errors.New("injected create failure")
 	}
+	// An existing VM is resumed, like the provider does: the create converges
+	// instead of attaching a second VM to the same slot.
+	for i := range f.vms {
+		if f.vms[i].Name != spec.Name {
+			continue
+		}
+		f.vms[i].CPU = spec.CPUs
+		f.vms[i].MemoryMB = spec.MemoryMB
+		f.vms[i].OSDiskGB = spec.OSDiskGB
+		f.vms[i].PoweredOn = true
+		if f.vms[i].Metadata == nil {
+			f.vms[i].Metadata = map[string]string{}
+		}
+		for k, v := range spec.Metadata {
+			f.vms[i].Metadata[k] = v
+		}
+		f.created = append(f.created, spec)
+		return f.vms[i], nil
+	}
 	vm := cloud.VM{
 		ID: "vm-" + spec.Name, Name: spec.Name, IP: spec.IP,
 		CPU: spec.CPUs, MemoryMB: spec.MemoryMB, DiskGB: 10,
+		OSDiskGB: spec.OSDiskGB, PoweredOn: true, Metadata: spec.Metadata,
 	}
 	f.vms = append(f.vms, vm)
 	f.created = append(f.created, spec)
 	return vm, nil
 }
 
+// GetVM mirrors the provider contract: a VM that is gone is ErrVMNotFound.
+func (f *fakeCloud) GetVM(ctx context.Context, vappName, id string) (cloud.VM, error) {
+	for i := range f.vms {
+		if f.vms[i].ID == id {
+			return f.vms[i], nil
+		}
+	}
+	return cloud.VM{}, fmt.Errorf("%w: %s", cloud.ErrVMNotFound, id)
+}
+
+func (f *fakeCloud) setPowered(id string, on bool) {
+	for i := range f.vms {
+		if f.vms[i].ID == id {
+			f.vms[i].PoweredOn = on
+			return
+		}
+	}
+}
+
 func (f *fakeCloud) PowerOffVM(ctx context.Context, vappName, id string) error {
 	f.poweredOff = append(f.poweredOff, id)
+	f.setPowered(id, false)
 	if f.events != nil {
 		*f.events = append(*f.events, "cloud:poweroff "+id)
 	}
@@ -87,6 +135,8 @@ func (f *fakeCloud) DeleteVM(ctx context.Context, vappName, id string) error {
 	return nil
 }
 func (f *fakeCloud) PowerOnVM(ctx context.Context, vappName, id string) error {
+	f.poweredOn = append(f.poweredOn, id)
+	f.setPowered(id, true)
 	if f.events != nil {
 		*f.events = append(*f.events, "cloud:poweron "+id)
 	}
@@ -109,6 +159,12 @@ func (f *fakeCloud) ResizeVM(ctx context.Context, vappName, id string, cpus, mem
 	for i := range f.vms {
 		if f.vms[i].ID != id {
 			continue
+		}
+		if f.vms[i].PoweredOn {
+			return cloud.VM{}, fmt.Errorf("%w: VM %q is POWERED_ON", cloud.ErrPoweredOn, id)
+		}
+		if f.resizeIgnores {
+			return f.vms[i], nil
 		}
 		if cpus > 0 {
 			f.vms[i].CPU = cpus
