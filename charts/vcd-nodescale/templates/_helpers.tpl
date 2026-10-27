@@ -21,3 +21,9 @@
 {{- define "vcd-nodescale.image" -}}
 {{- printf "%s:%s" .Values.image.repository (default .Chart.AppVersion .Values.image.tag) -}}
 {{- end -}}
+
+{{- define "vcd-nodescale.uiImage" -}}
+{{- $repo := default .Values.image.repository .Values.ui.image.repository -}}
+{{- $tag := default (default .Chart.AppVersion .Values.image.tag) .Values.ui.image.tag -}}
+{{- printf "%s:%s" $repo $tag -}}
+{{- end -}}

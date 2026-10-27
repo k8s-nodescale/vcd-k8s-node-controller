@@ -45,3 +45,10 @@ rules:
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups:
+      - metrics.k8s.io
+    resources:
+      - nodes
+    verbs:
+      - get
+      - list

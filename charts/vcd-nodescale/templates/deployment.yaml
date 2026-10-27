@@ -105,6 +105,52 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
+        {{- if .Values.ui.enabled }}
+        - name: ui
+          image: {{ include "vcd-nodescale.uiImage" . }}
+          imagePullPolicy: {{ default .Values.image.pullPolicy .Values.ui.image.pullPolicy }}
+          command: ["/ui"]
+          args:
+            - --addr=:{{ .Values.ui.port }}
+            - --path-prefix={{ .Values.ui.pathPrefix }}
+            - --refresh-interval={{ .Values.ui.refreshInterval }}
+            - --node-exporter-labels={{ .Values.ui.nodeExporter.labelSelector }}
+            - --node-exporter-port={{ .Values.ui.nodeExporter.port }}
+            - --auth-secret={{ .Values.ui.auth.secretName }}
+            - --auth-secret-key={{ .Values.ui.auth.key }}
+            - --auth-refresh={{ .Values.ui.auth.refreshInterval }}
+            {{- if not .Values.ui.auth.enabled }}
+            - --auth-disabled=true
+            {{- end }}
+          env:
+            # The auth Secret lives in the Pod's own namespace.
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          ports:
+            - name: ui
+              containerPort: {{ .Values.ui.port }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.ui.pathPrefix }}/healthz
+              port: ui
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.ui.pathPrefix }}/healthz
+              port: ui
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.ui.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

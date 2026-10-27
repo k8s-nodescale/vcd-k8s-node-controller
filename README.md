@@ -978,10 +978,118 @@ What this means in practice:
   that orphans the VMs, the Node objects and the ingress pool members with
   nothing left to own them.
 
+## Management UI
+
+The chart can run an optional second container in the same Pod, `nodescale-ui`.
+It serves one page and a small JSON API over the same `K8sWorkerPool` objects.
+It never talks to vCD: every action it offers is an edit to the CRD, so the
+controller decides what happens exactly as it would for `kubectl`.
+
+```yaml
+ui:
+  enabled: true
+```
+
+With `ui.enabled: true` the chart also creates a Service and an Ingress, both
+named `nodescale-ui`, and the page answers under `/nodescale-ui`:
+
+```
+http://<any-node-ip>:<ingress-http-node-port>/nodescale-ui/
+https://<any-node-ip>:<ingress-https-node-port>/nodescale-ui/
+```
+
+The ingress has no `host` by default (`ui.ingress.host`), so it answers on any
+name; set one where a real hostname exists. HTTPS uses the ingress controller's
+default certificate, and the ingress sets `ssl-redirect`; a real certificate
+goes in `ui.ingress.tls`.
+
+### What the page does
+
+| Action | What it changes |
+| --- | --- |
+| scale-out `+1`, scale-in `-1`, set replicas | `spec.replicas` |
+| apply flavor | `spec.flavor.cpus`, `.memoryMB`, `.osDiskGB` (only the fields you fill in) |
+| delete a worker | appends the name to `spec.scaleDown.deleteWorkers` |
+
+Every gate still applies: `scaleDown.minReplicas`, `allowLastWorker`, the drain,
+the last-worker guard and the node-local-volume refusal. A request the pool
+refuses shows up as the pool's `Ready` condition message, which the page
+displays under the summary.
+
+The table is one row per slot: CPU and memory, each in three columns - requests,
+limits and real utilisation. Each column is coloured on its own: green below
+80%, orange from 80% to 90%, red at 90% and above. A node that is green on
+requests and red on real utilisation is exactly the case worth looking at.
+
+Requests and limits come from the pods on the node against its allocatable
+capacity. Real utilisation is scraped from node-exporter pods
+(`ui.nodeExporter`, default label
+`app.kubernetes.io/name=prometheus-node-exporter`, port 9100); when those are
+absent the sidecar falls back to `metrics.k8s.io`, and when neither answers the
+column shows a dash instead of a number.
+
+### Authentication
+
+Authentication is on by default. Two groups live in one Secret
+(`ui.auth.secretName`, default `nodescale-ui-auth`, key `users.yaml`):
+
+```yaml
+admins:
+  - username: admin
+    passwordHash: "$2a$10$..."
+viewers:
+  - username: viewer
+    passwordHash: "$2a$10$..."
+```
+
+- `admins` may read and change, `viewers` may only read. The page hides the
+  controls for a viewer and the server refuses the request with `403`, so the
+  hiding is cosmetic and the refusal is the control.
+- A name listed in both groups is an admin.
+- Passwords are bcrypt hashes: `htpasswd -nB <user>` and copy the hash. The
+  Secret is re-read every `ui.auth.refreshInterval` (60s), so a rotation needs
+  no restart.
+- A missing or unparsable Secret closes the page: everything except
+  `/nodescale-ui/healthz` answers `503` instead of opening.
+
+The chart creates the Secret on install when it does not exist yet
+(`ui.auth.createSecret`), with the accounts `admin` (admins) and `viewer`
+(viewers) and 24-character generated passwords. Read them once, then delete the
+key so they stop existing:
+
+```
+kubectl -n vcd-nodescale-system get secret nodescale-ui-auth   -o jsonpath='{.data.initial-passwords}' | base64 -d
+kubectl -n vcd-nodescale-system patch secret nodescale-ui-auth   --type=json -p '[{"op":"remove","path":"/data/initial-passwords"}]'
+```
+
+`helm upgrade` never rotates the accounts and `helm uninstall` keeps the Secret
+(`helm.sh/resource-policy: keep`). Where Ansible installs the chart it generates
+the passwords itself, keeps them on the control host and creates the Secret
+once, in which case the values set `ui.auth.createSecret: false`.
+
+The API is HTTP Basic; the page has no session and no logout, so the browser's
+dialog is the session. Writes additionally require the header
+`X-Requested-With: nodescale-ui`, which a cross-site form cannot set:
+
+```
+curl -u admin:'<password>' -X POST   -H 'Content-Type: application/json' -H 'X-Requested-With: nodescale-ui'   -d '{"replicas":3}'   http://<node>:<port>/nodescale-ui/api/pools/default/kion-web-dev/replicas
+```
+
+Every accepted change is logged with the account and recorded on the pool:
+
+```
+kubectl -n default get k8sworkerpool kion-web-dev   -o jsonpath='{.metadata.annotations.k8s-nodescale\.github\.io/last-action-by}'
+```
+
+### Turning it off
+
+`ui.enabled: false` is the default and deploys nothing: no container, no
+Service, no Ingress, no Secret.
+
 ## Terraform integration contract
 
 - The Terraform module installs this chart behind a `node_controller.enabled`
-  toggle and pins `chart_version` / `image_tag` (currently `0.9.0`).
+  toggle and pins `chart_version` / `image_tag` (currently `0.10.0`).
 - **Once the controller is enabled, do not use Terraform to manage worker count
   or worker LB pool membership.** Use the CRD instead. The Terraform module's
   README must state this explicitly.
@@ -1012,7 +1120,7 @@ Build locally (the Dockerfile uses `golang:1.27.1-alpine` and
 `gcr.io/distroless/static:nonroot`):
 
 ```
-docker build -t docker.io/werton13/vcd-k8s-node-controller:0.9.0 .
+docker build -t docker.io/werton13/vcd-k8s-node-controller:0.10.0 .
 ```
 
 Public module defaults are used inside the build. On a restricted network,
@@ -1022,14 +1130,14 @@ override them:
 docker build \
   --build-arg GOPROXY=https://nexus.example.com/repository/golang/ \
   --build-arg GOSUMDB=off \
-  -t docker.io/werton13/vcd-k8s-node-controller:0.9.0 .
+  -t docker.io/werton13/vcd-k8s-node-controller:0.10.0 .
 ```
 
 Push (or use `make image-push`):
 
 ```
 docker login docker.io
-docker push docker.io/werton13/vcd-k8s-node-controller:0.9.0
+docker push docker.io/werton13/vcd-k8s-node-controller:0.10.0
 docker push docker.io/werton13/vcd-k8s-node-controller:latest
 ```
 

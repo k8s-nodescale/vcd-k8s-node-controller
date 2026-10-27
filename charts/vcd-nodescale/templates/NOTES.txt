@@ -14,3 +14,24 @@ Then create a K8sWorkerPool (see config/samples/infra_v1alpha1_k8sworkerpool.yam
 
 WARNING: once this controller is enabled, do not use Terraform to manage
 worker count or worker LB pool membership; use the CRD instead.
+{{- if .Values.ui.enabled }}
+
+The management UI is served at {{ .Values.ui.pathPrefix }}/ on the ingress
+controller (plain HTTP on its HTTP node port, HTTPS on its HTTPS node port with
+the controller's default certificate).
+{{- if and .Values.ui.auth.enabled .Values.ui.auth.createSecret }}
+
+The chart generated the two accounts. Read the passwords once, then delete the
+key so they stop existing:
+
+  kubectl -n {{ include "vcd-nodescale.namespace" . }} get secret {{ .Values.ui.auth.secretName }} \
+    -o jsonpath='{.data.initial-passwords}' | base64 -d
+
+  kubectl -n {{ include "vcd-nodescale.namespace" . }} patch secret {{ .Values.ui.auth.secretName }} \
+    --type=json -p '[{"op":"remove","path":"/data/initial-passwords"}]'
+
+Rotate a password with "htpasswd -nB <user>" and put the hash into the
+users.yaml key of that Secret; the page picks it up within
+{{ .Values.ui.auth.refreshInterval }} without a restart.
+{{- end }}
+{{- end }}

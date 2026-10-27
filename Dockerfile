@@ -21,7 +21,8 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 COPY . .
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    go build -trimpath -ldflags="-s -w" -o /out/manager ./cmd/manager
+    go build -trimpath -ldflags="-s -w" -o /out/manager ./cmd/manager && \
+    go build -trimpath -ldflags="-s -w" -o /out/ui ./cmd/ui
 
 FROM gcr.io/distroless/static:nonroot
 LABEL org.opencontainers.image.title="vcd-k8s-node-controller" \
@@ -29,5 +30,8 @@ LABEL org.opencontainers.image.title="vcd-k8s-node-controller" \
       org.opencontainers.image.source="https://github.com/k8s-nodescale/vcd-k8s-node-controller" \
       org.opencontainers.image.licenses="Apache-2.0"
 COPY --from=build /out/manager /manager
+# The optional management page. Same image, same binary set: a deployment that
+# sets ui.enabled runs it as a second container with command: ["/ui"].
+COPY --from=build /out/ui /ui
 USER 65532:65532
 ENTRYPOINT ["/manager"]

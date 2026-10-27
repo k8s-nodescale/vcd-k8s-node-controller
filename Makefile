@@ -1,9 +1,9 @@
 IMAGE ?= docker.io/werton13/vcd-k8s-node-controller
-TAG ?= 0.9.0
+TAG ?= 0.10.0
 GO ?= go
 CONTROLLER_GEN ?= controller-gen
 
-.PHONY: all fmt vet test build run docker-build image image-push image-save generate manifests helm-lint clean
+.PHONY: all fmt vet test build run run-ui docker-build image image-push image-save generate manifests helm-lint clean
 
 all: fmt vet test build
 
@@ -13,9 +13,13 @@ vet: ; $(GO) vet ./...
 
 test: ; $(GO) test ./...
 
-build: ; CGO_ENABLED=0 $(GO) build -o bin/manager ./cmd/manager
+build: ; CGO_ENABLED=0 $(GO) build -o bin/manager ./cmd/manager && CGO_ENABLED=0 $(GO) build -o bin/ui ./cmd/ui
 
 run: ; $(GO) run ./cmd/manager
+
+# The management page needs a kubeconfig and, unless --auth-disabled is passed,
+# the accounts Secret.
+run-ui: ; $(GO) run ./cmd/ui
 
 docker-build: ; docker build -t $(IMAGE):$(TAG) -t $(IMAGE):latest .
 

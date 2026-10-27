@@ -1,0 +1,365 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nodescale-ui</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f6f7f9;
+    --card: #ffffff;
+    --fg: #1b1f24;
+    --muted: #5c6672;
+    --line: #dfe3e8;
+    --ok: #1e7b34;
+    --warn: #b35c00;
+    --high: #b3261e;
+    --accent: #14539a;
+    --chip: #eef1f5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14171a;
+      --card: #1c2024;
+      --fg: #e6e9ee;
+      --muted: #9aa4b0;
+      --line: #2b3138;
+      --ok: #4ec26a;
+      --warn: #f0a03c;
+      --high: #f2695e;
+      --accent: #6aa9f0;
+      --chip: #232a31;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  }
+  header {
+    display: flex; flex-wrap: wrap; gap: 12px; align-items: center;
+    padding: 14px 18px; border-bottom: 1px solid var(--line); background: var(--card);
+  }
+  header h1 { font-size: 15px; margin: 0; letter-spacing: .02em; }
+  header .spacer { flex: 1 1 auto; }
+  .muted { color: var(--muted); }
+  .small { font-size: 12px; }
+  main { padding: 16px 18px 40px; display: flex; flex-direction: column; gap: 16px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+  .row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+  .kpi { display: flex; gap: 18px; flex-wrap: wrap; }
+  .kpi div { display: flex; flex-direction: column; }
+  .kpi b { font-size: 18px; font-variant-numeric: tabular-nums; }
+  .chip { background: var(--chip); border-radius: 999px; padding: 2px 9px; font-size: 12px; }
+  .chip.ok { color: var(--ok); }
+  .chip.warn { color: var(--warn); }
+  .chip.high { color: var(--high); }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { padding: 7px 9px; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; }
+  th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: left; }
+  thead th { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); font-weight: 600; }
+  tbody tr:hover { background: var(--chip); }
+  .lv-ok { color: var(--ok); font-weight: 600; }
+  .lv-warn { color: var(--warn); font-weight: 600; }
+  .lv-high { color: var(--high); font-weight: 600; }
+  .dash { color: var(--muted); }
+  input[type=number], input[type=text] {
+    background: var(--bg); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 6px; padding: 5px 7px; width: 84px; font: inherit;
+  }
+  button {
+    background: var(--accent); color: #fff; border: 0; border-radius: 6px;
+    padding: 6px 12px; font: inherit; cursor: pointer;
+  }
+  button.ghost { background: transparent; color: var(--fg); border: 1px solid var(--line); }
+  button.danger { background: transparent; color: var(--high); border: 1px solid var(--line); padding: 3px 9px; font-size: 12px; }
+  button:disabled { opacity: .45; cursor: default; }
+  .toast { position: fixed; right: 16px; bottom: 16px; max-width: 420px; background: var(--card);
+           border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 8px;
+           padding: 10px 12px; box-shadow: 0 6px 24px rgba(0,0,0,.18); display: none; }
+  .toast.err { border-left-color: var(--high); }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--muted); }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; }
+  .scroll { overflow-x: auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>nodescale-ui</h1>
+  <select id="poolPick" class="muted" style="background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:4px 6px;font:inherit"></select>
+  <span class="spacer"></span>
+  <span class="chip" id="whoami" title="signed-in account"></span>
+  <span class="small muted" id="stamp">loading…</span>
+</header>
+
+<main>
+  <section class="card" id="summary">
+    <div class="row" style="justify-content:space-between">
+      <div class="kpi">
+        <div><span class="small muted">replicas</span><b id="kReplicas">–</b></div>
+        <div><span class="small muted">observed</span><b id="kObserved">–</b></div>
+        <div><span class="small muted">ready</span><b id="kReady">–</b></div>
+        <div><span class="small muted">rollout</span><b id="kPhase">–</b></div>
+        <div><span class="small muted">flavor</span><b id="kFlavor" style="font-size:14px">–</b></div>
+      </div>
+      <div class="row" id="scaleActions">
+        <button class="ghost" id="minus" title="scale-in: spec.replicas - 1">−1</button>
+        <button class="ghost" id="plus" title="scale-out: spec.replicas + 1">+1</button>
+        <input type="number" id="replicasInput" min="0" step="1">
+        <button id="setReplicas">set replicas</button>
+      </div>
+    </div>
+    <div class="row" id="flavorActions" style="margin-top:12px">
+      <span class="small muted">scale-up / down</span>
+      <input type="number" id="fCpus" min="1" step="1" placeholder="cpus">
+      <input type="number" id="fMem" min="512" step="512" placeholder="memory MB">
+      <input type="number" id="fDisk" min="0" step="1" placeholder="os disk GB">
+      <button id="setFlavor">apply flavor</button>
+      <span class="small muted" id="flavorHint"></span>
+    </div>
+    <div class="small" id="warning" style="margin-top:10px;color:var(--warn);display:none"></div>
+  </section>
+
+  <section class="card">
+    <div class="row" style="justify-content:space-between;margin-bottom:8px">
+      <strong style="font-size:13px">workers</strong>
+      <div class="legend">
+        <span><span class="dot" style="background:var(--ok)"></span>&lt; 80%</span>
+        <span><span class="dot" style="background:var(--warn)"></span>80–90%</span>
+        <span><span class="dot" style="background:var(--high)"></span>≥ 90%</span>
+        <span>requests · limits · real, each on its own</span>
+      </div>
+    </div>
+    <div class="scroll">
+      <table>
+        <thead>
+          <tr>
+            <th rowspan="2">node</th>
+            <th rowspan="2">phase</th>
+            <th colspan="3" style="text-align:center">CPU</th>
+            <th colspan="3" style="text-align:center">memory</th>
+            <th rowspan="2"></th>
+          </tr>
+          <tr>
+            <th>req</th><th>lim</th><th>real</th>
+            <th>req</th><th>lim</th><th>real</th>
+          </tr>
+        </thead>
+        <tbody id="rows">
+          <tr><td colspan="9" class="muted small">loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="small muted" id="realSource" style="margin-top:8px"></div>
+  </section>
+</main>
+
+<div class="toast" id="toast"></div>
+<script>
+(function () {
+  "use strict";
+  var BASE = "__PREFIX__";
+  var state = { pools: [], current: null, stamp: "", stale: false, me: null };
+  var pick = document.getElementById("poolPick");
+
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  function toast(msg, isErr) {
+    var t = document.getElementById("toast");
+    t.textContent = msg;
+    t.className = "toast" + (isErr ? " err" : "");
+    t.style.display = "block";
+    clearTimeout(toast.timer);
+    toast.timer = setTimeout(function () { t.style.display = "none"; }, isErr ? 9000 : 4000);
+  }
+
+  function pct(share, used, unit) {
+    if (!share || share.percent == null) {
+      return '<span class="dash">–</span>';
+    }
+    var v = share.percent;
+    var cls = share.level === "high" ? "lv-high" : share.level === "warn" ? "lv-warn" : "lv-ok";
+    var title = used != null ? " title=\"" + used + " " + unit + "\"" : "";
+    return '<span class="' + cls + '"' + title + ">" + v.toFixed(0) + "%</span>";
+  }
+
+  function cpuCell(u) { return pct(u && u.cpu, u && u.millicores, "m"); }
+  function memCell(u) { return pct(u && u.memory, u && u.memoryMB, "MB"); }
+
+  function api(path, opts) {
+    return fetch(BASE + path, opts).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (body) {
+        if (!r.ok) {
+          throw new Error((body && body.error) || ("HTTP " + r.status));
+        }
+        return body;
+      });
+    });
+  }
+
+  function post(action, body) {
+    var p = state.current;
+    return api("/api/pools/" + encodeURIComponent(p.namespace) + "/" + encodeURIComponent(p.name) + "/" + action, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Requested-With": "nodescale-ui" },
+      body: JSON.stringify(body || {})
+    }).then(function (r) {
+      toast("accepted: " + action);
+      return refresh();
+    }).catch(function (e) { toast(e.message, true); });
+  }
+
+  function loadMe() {
+    return api("/api/me").then(function (me) {
+      state.me = me;
+      var chip = document.getElementById("whoami");
+      chip.textContent = me.auth ? me.username + " · " + me.role : "no auth";
+      chip.className = "chip " + (me.role === "admin" ? "ok" : "warn");
+    }).catch(function () {
+      state.me = null;
+    });
+  }
+
+  function refresh() {
+    loadMe();
+    return api("/api/pools").then(function (data) {
+      state.pools = data.pools || [];
+      state.stamp = data.collectedAt || "";
+      state.stale = !!data.stale;
+      if (!state.current || !findPool(state.current.namespace, state.current.name)) {
+        state.current = state.pools.length ? state.pools[0] : null;
+      } else {
+        state.current = findPool(state.current.namespace, state.current.name);
+      }
+      renderPools();
+      render();
+    }).catch(function (e) {
+      document.getElementById("stamp").textContent = "unavailable: " + e.message;
+    });
+  }
+
+  function findPool(ns, name) {
+    for (var i = 0; i < state.pools.length; i++) {
+      if (state.pools[i].namespace === ns && state.pools[i].name === name) { return state.pools[i]; }
+    }
+    return null;
+  }
+
+  function renderPools() {
+    pick.innerHTML = state.pools.map(function (p) {
+      return '<option value="' + esc(p.namespace + "/" + p.name) + '">' + esc(p.namespace + "/" + p.name) + "</option>";
+    }).join("");
+    if (state.current) {
+      pick.value = state.current.namespace + "/" + state.current.name;
+    }
+    pick.style.display = state.pools.length > 1 ? "" : "none";
+  }
+
+  function render() {
+    var p = state.current;
+    var stamp = document.getElementById("stamp");
+    if (!p) {
+      stamp.textContent = "no K8sWorkerPool in this cluster";
+      document.getElementById("rows").innerHTML = '<tr><td colspan="9" class="muted small">nothing to show</td></tr>';
+      return;
+    }
+    stamp.textContent = (state.stale ? "stale · " : "") + (state.stamp ? new Date(state.stamp).toLocaleTimeString() : "");
+
+    document.getElementById("kReplicas").textContent = p.replicas;
+    document.getElementById("kObserved").textContent = p.observedReplicas;
+    document.getElementById("kReady").textContent = p.readyReplicas;
+    document.getElementById("kPhase").textContent = p.phase || "Idle";
+    document.getElementById("kFlavor").textContent =
+      p.flavor.cpus + " vCPU · " + p.flavor.memoryMB + " MB" +
+      (p.flavor.osDiskGB ? " · " + p.flavor.osDiskGB + " GB" : "") +
+      (p.flavor.template ? " · " + p.flavor.template : "");
+
+    var warn = document.getElementById("warning");
+    if (p.warning) { warn.textContent = p.warning; warn.style.display = ""; }
+    else { warn.style.display = "none"; }
+
+    document.getElementById("replicasInput").value = p.replicas;
+    document.getElementById("fCpus").value = p.flavor.cpus;
+    document.getElementById("fMem").value = p.flavor.memoryMB;
+    document.getElementById("fDisk").value = p.flavor.osDiskGB || "";
+    document.getElementById("flavorHint").textContent =
+      "minReplicas " + p.minReplicas + (p.allowLastWorker ? " · last worker allowed" : "");
+
+    var admin = !state.me || state.me.role === "admin";
+    document.getElementById("scaleActions").style.display = admin ? "" : "none";
+    document.getElementById("flavorActions").style.display = admin ? "" : "none";
+
+    var rows = p.nodes.map(function (n) {
+      var act = n.deleting
+        ? '<span class="small muted">removing…</span>'
+        : admin
+          ? '<button class="danger" data-del="' + esc(n.name) + '">delete</button>'
+          : '<span class="small muted">view only</span>';
+      return "<tr>" +
+        "<td>" + esc(n.name) + (n.ip ? ' <span class="small muted">' + esc(n.ip) + "</span>" : "") + "</td>" +
+        '<td><span class="chip' + (n.phase === "Ready" ? " ok" : "") + '">' + esc(n.phase) + "</span></td>" +
+        "<td>" + cpuCell(n.requests) + "</td><td>" + cpuCell(n.limits) + "</td><td>" + cpuCell(n.real) + "</td>" +
+        "<td>" + memCell(n.requests) + "</td><td>" + memCell(n.limits) + "</td><td>" + memCell(n.real) + "</td>" +
+        "<td>" + act + "</td></tr>";
+    }).join("");
+    document.getElementById("rows").innerHTML = rows ||
+      '<tr><td colspan="9" class="muted small">no workers in this pool</td></tr>';
+
+    var sources = {};
+    p.nodes.forEach(function (n) { if (n.realSource) { sources[n.realSource] = (sources[n.realSource] || 0) + 1; } });
+    var parts = Object.keys(sources).map(function (k) { return sources[k] + " × " + k; });
+    document.getElementById("realSource").textContent =
+      parts.length ? "real utilisation from " + parts.join(", ") : "real utilisation unavailable: no node-exporter and no metrics-server answer";
+  }
+
+  document.getElementById("plus").addEventListener("click", function () {
+    if (state.current) { post("replicas", { replicas: state.current.replicas + 1 }); }
+  });
+  document.getElementById("minus").addEventListener("click", function () {
+    if (!state.current) { return; }
+    var next = state.current.replicas - 1;
+    if (next < 0) { return; }
+    if (next === 0 && !state.current.allowLastWorker) {
+      toast("scale-in to 0 needs scaleDown.allowLastWorker: true on the pool", true);
+      return;
+    }
+    post("replicas", { replicas: next });
+  });
+  document.getElementById("setReplicas").addEventListener("click", function () {
+    var v = parseInt(document.getElementById("replicasInput").value, 10);
+    if (isNaN(v) || v < 0) { toast("replicas must be a number >= 0", true); return; }
+    post("replicas", { replicas: v });
+  });
+  document.getElementById("setFlavor").addEventListener("click", function () {
+    var body = {
+      cpus: parseInt(document.getElementById("fCpus").value, 10) || 0,
+      memoryMB: parseInt(document.getElementById("fMem").value, 10) || 0,
+      osDiskGB: parseInt(document.getElementById("fDisk").value, 10) || 0
+    };
+    post("flavor", body);
+  });
+  document.getElementById("rows").addEventListener("click", function (ev) {
+    var name = ev.target && ev.target.getAttribute && ev.target.getAttribute("data-del");
+    if (!name) { return; }
+    if (!window.confirm("Remove " + name + "? It is drained and deleted, and the pool loses one worker.")) { return; }
+    post("delete-workers", { workers: [name] });
+  });
+  pick.addEventListener("change", function () {
+    var parts = pick.value.split("/");
+    state.current = findPool(parts[0], parts.slice(1).join("/"));
+    render();
+  });
+
+  refresh();
+  setInterval(refresh, 5000);
+})();
+</script>
+</body>
+</html>

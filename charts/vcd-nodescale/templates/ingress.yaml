@@ -1,0 +1,43 @@
+{{- if and .Values.ui.enabled .Values.ui.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: nodescale-ui
+  namespace: {{ include "vcd-nodescale.namespace" . }}
+  labels:
+    app.kubernetes.io/name: {{ include "vcd-nodescale.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: ui
+  annotations:
+    {{- if .Values.ui.ingress.tls.enabled }}
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    {{- end }}
+    {{- with .Values.ui.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  {{- with .Values.ui.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- if and .Values.ui.ingress.tls.enabled .Values.ui.ingress.tls.secretName .Values.ui.ingress.host }}
+  tls:
+    - hosts:
+        - {{ .Values.ui.ingress.host | quote }}
+      secretName: {{ .Values.ui.ingress.tls.secretName }}
+  {{- end }}
+  rules:
+    {{- if .Values.ui.ingress.host }}
+    - host: {{ .Values.ui.ingress.host | quote }}
+      http:
+    {{- else }}
+    - http:
+    {{- end }}
+        paths:
+          - path: {{ .Values.ui.ingress.path }}
+            pathType: Prefix
+            backend:
+              service:
+                name: nodescale-ui
+                port:
+                  name: http
+{{- end }}

@@ -60,3 +60,73 @@ dnsPolicy: ""
 
 # Two replicas with leader election and a required anti-affinity make the
 # controller survive a node removal. See README "Controller placement".
+
+# Management UI (roadmap 11). A second container in the same Pod serving a page
+# and a small API over the same K8sWorkerPool object: replicas, spec.flavor and
+# removal of a named worker. It never talks to vCD - the controller stays the
+# only thing that does - so every action is a CRD edit and every gate
+# (minReplicas, allowLastWorker, the drain, the last-worker guard) still applies.
+ui:
+  enabled: false
+
+  image:
+    repository: "" # defaults to image.repository
+    tag: "" # defaults to image.tag / .Chart.AppVersion
+    pullPolicy: "" # defaults to image.pullPolicy
+
+  port: 8090
+  pathPrefix: /nodescale-ui
+  # How often the snapshot is rebuilt: pools, pods, node capacity, exporter
+  # scrapes. The page polls the snapshot, so it never waits for a scrape.
+  refreshInterval: 15s
+
+  # Real utilisation is scraped from node-exporter pods, and metrics.k8s.io is
+  # the fallback. Neither is required: without both the third column shows a
+  # dash instead of a number.
+  nodeExporter:
+    labelSelector: app.kubernetes.io/name=prometheus-node-exporter
+    port: 9100
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+
+  # Authentication. Two groups live in one Secret: admins may change the pool,
+  # viewers may only read it. The page hides the controls, the server refuses
+  # the request.
+  auth:
+    enabled: true
+    secretName: nodescale-ui-auth
+    key: users.yaml
+    # A rotated password works without a restart.
+    refreshInterval: 60s
+    # createSecret writes the Secret on install when it does not exist yet: two
+    # bcrypt hashes in users.yaml and the generated passwords in
+    # initial-passwords for the operator to read once. An upgrade never
+    # rotates them, and an existing Secret is left alone. Turn this off where
+    # Ansible or an external secret store owns the Secret.
+    createSecret: true
+    adminUsername: admin
+    viewerUsername: viewer
+
+  service:
+    type: ClusterIP
+    port: 80
+
+  ingress:
+    enabled: true
+    className: nginx
+    # Empty host means catch-all: the page answers on any name, i.e.
+    # http://<node-ip>:<ingress-http-nodeport>/nodescale-ui.
+    host: ""
+    path: /nodescale-ui
+    annotations: {}
+    tls:
+      # ssl-redirect sends plain HTTP to HTTPS on the controller's default
+      # certificate. A named secret needs a host as well.
+      enabled: true
+      secretName: ""
