@@ -154,7 +154,7 @@ func applyCreatedWorker(n *infrav1.WorkerNodeStatus, vm cloud.VM, tokID string, 
 	n.CPU = cpu
 	n.MemoryMB = memMB
 	n.DiskGB = vm.DiskGB
-	n.Flavor = &infrav1.FlavorStatus{CPUs: vm.CPU, MemoryMB: vm.MemoryMB, OSDiskGB: vm.OSDiskGB}
+	n.Flavor = flavorOf(vm)
 	n.BootstrapTokenID = tokID
 }
 
@@ -184,6 +184,7 @@ func (r *WorkerPoolReconciler) queueSlots(ctx context.Context, pool *infrav1.K8s
 				CPUs:     pool.Spec.Flavor.CPUs,
 				MemoryMB: pool.Spec.Flavor.MemoryMB,
 				OSDiskGB: pool.Spec.Flavor.OSDiskGB,
+				Template: pool.Spec.Flavor.Template,
 			},
 		})
 	}

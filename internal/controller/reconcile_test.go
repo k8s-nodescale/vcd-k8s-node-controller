@@ -65,7 +65,7 @@ func (f *fakeCloud) CreateVM(ctx context.Context, spec cloud.CreateVMSpec) (clou
 			f.vms = append(f.vms, cloud.VM{
 				ID: "vm-" + spec.Name, Name: spec.Name, IP: spec.IP,
 				CPU: spec.CPUs, MemoryMB: spec.MemoryMB, PoweredOn: true,
-				Metadata: spec.Metadata,
+				Template: spec.Template, Metadata: spec.Metadata,
 			})
 		}
 		return cloud.VM{}, errors.New("injected create failure")
@@ -79,6 +79,7 @@ func (f *fakeCloud) CreateVM(ctx context.Context, spec cloud.CreateVMSpec) (clou
 		f.vms[i].CPU = spec.CPUs
 		f.vms[i].MemoryMB = spec.MemoryMB
 		f.vms[i].OSDiskGB = spec.OSDiskGB
+		f.vms[i].Template = spec.Template
 		f.vms[i].PoweredOn = true
 		if f.vms[i].Metadata == nil {
 			f.vms[i].Metadata = map[string]string{}
@@ -92,7 +93,8 @@ func (f *fakeCloud) CreateVM(ctx context.Context, spec cloud.CreateVMSpec) (clou
 	vm := cloud.VM{
 		ID: "vm-" + spec.Name, Name: spec.Name, IP: spec.IP,
 		CPU: spec.CPUs, MemoryMB: spec.MemoryMB, DiskGB: 10,
-		OSDiskGB: spec.OSDiskGB, PoweredOn: true, Metadata: spec.Metadata,
+		OSDiskGB: spec.OSDiskGB, PoweredOn: true, Template: spec.Template,
+		Metadata: spec.Metadata,
 	}
 	f.vms = append(f.vms, vm)
 	f.created = append(f.created, spec)

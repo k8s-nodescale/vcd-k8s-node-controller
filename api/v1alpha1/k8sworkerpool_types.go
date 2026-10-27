@@ -476,19 +476,34 @@ type WorkerNodeStatus struct {
 	ProvisioningStartedAt *metav1.Time `json:"provisioningStartedAt,omitempty"`
 }
 
-// FlavorStatus is the compute shape a VM runs with, as reported by vCD.
+// FlavorStatus is what a worker actually runs with, as the platform reports
+// it: the observed side of spec.flavor. The rollout compares the two and asks
+// for work only where they differ.
 type FlavorStatus struct {
 	CPUs     int32 `json:"cpus,omitempty"`
 	MemoryMB int32 `json:"memoryMB,omitempty"`
 	OSDiskGB int32 `json:"osDiskGB,omitempty"`
+	// Template is the image the VM was cloned from, recorded on the VM when
+	// the provider creates it. A worker the controller adopted (a Terraform
+	// bootstrap worker) carries no such record, so this stays empty and means
+	// "no opinion": an unknown image never turns adoption into a recreate.
+	// +optional
+	Template string `json:"template,omitempty"`
 }
 
 // ResizeStatus is the per-worker rollout state.
 type ResizeStatus struct {
-	// Phase is Cordoned, Draining, Stopped, Resizing, Booting, WaitingReady,
-	// Done or Failed.
+	// Phase is Cordoned, Stopped, Booting or Failed for a change applied in
+	// place, and Cordoned, Deleting, Creating, Booting or Failed for a worker
+	// that is replaced (Recreate).
 	Phase     string       `json:"phase,omitempty"`
 	StartedAt *metav1.Time `json:"startedAt,omitempty"`
+	// Recreate is set when spec.flavor cannot be reached in place - a shrink,
+	// a mix of grow and shrink, or another template - so the worker is
+	// replaced instead: drained, deleted and created again under the same
+	// name at the same address.
+	// +optional
+	Recreate bool `json:"recreate,omitempty"`
 	// DrainStartedAt is when the drain of this worker began. The roll spends
 	// scaleDown.drainTimeout from here and then escalates the way a scale-down
 	// does, so a PodDisruptionBudget with no possible disruption cannot pin a

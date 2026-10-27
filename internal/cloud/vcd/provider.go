@@ -330,6 +330,12 @@ func (p *Pool) GetVM(ctx context.Context, id string) (cloud.VM, error) {
 	return *info, nil
 }
 
+// metadataKeyTemplate is the VM metadata entry that records which image the VM
+// was cloned from. The reconciler reads it back through VM.Template and
+// replaces a worker whose spec.flavor.template names another one; a VM without
+// it (created by Terraform, or by an older build) carries no opinion.
+const metadataKeyTemplate = "template"
+
 // CreateVM creates a worker VM from a vApp template and configures it before
 // the first power-on:
 //
@@ -431,11 +437,14 @@ func (p *Pool) CreateVM(ctx context.Context, spec cloud.CreateVMSpec) (cloud.VM,
 		}
 	}
 
-	if len(spec.Metadata) > 0 {
-		values := make(map[string]interface{}, len(spec.Metadata))
-		for k, v := range spec.Metadata {
-			values[k] = v
-		}
+	values := make(map[string]interface{}, len(spec.Metadata)+1)
+	if spec.Template != "" {
+		values[metadataKeyTemplate] = spec.Template
+	}
+	for k, v := range spec.Metadata {
+		values[k] = v
+	}
+	if len(values) > 0 {
 		if err := vm.MergeMetadata(types.MetadataStringValue, values); err != nil {
 			return cloud.VM{}, fmt.Errorf("set metadata on VM %q: %w", spec.Name, err)
 		}
@@ -984,6 +993,7 @@ func (p *Pool) vmInfo(vm *govcd.VM, selector map[string]string) (*cloud.VM, erro
 		MemoryMB:   memMB,
 		DiskGB:     diskGB,
 		OSDiskGB:   systemDiskGB(vm),
+		Template:   metadata[metadataKeyTemplate],
 		Metadata:   metadata,
 	}, nil
 }

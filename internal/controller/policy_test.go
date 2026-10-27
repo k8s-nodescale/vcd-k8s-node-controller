@@ -256,7 +256,10 @@ func TestRolloutGrowsWorkersOneByOne(t *testing.T) {
 
 // Shrinking cannot be done in place: the pool reports it instead of silently
 // ignoring the spec change.
-func TestRolloutReportsUnsupportedShrink(t *testing.T) {
+// A shrink used to be refused with UnsupportedChange. It is a recreate now, and
+// it still respects maxUnavailable: the first worker leaves service, the second
+// waits for its turn, and ResizeVM is never asked for a smaller VM.
+func TestRolloutRecreatesAShrunkWorker(t *testing.T) {
 	pool := testPool(2)
 	fc := &fakeCloud{}
 	fk := &fakeKube{nodes: readyNodes("pool-wrk-01", "pool-wrk-02")}
@@ -267,11 +270,18 @@ func TestRolloutReportsUnsupportedShrink(t *testing.T) {
 	reconcileOnce(t, r, pool)
 
 	got := getPool(t, r, pool)
-	if cond := metaReady(got); cond == nil || cond.Reason != "UnsupportedChange" {
-		t.Fatalf("Ready condition = %#v, want UnsupportedChange", cond)
+	if cond := metaReady(got); cond != nil && cond.Reason == "UnsupportedChange" {
+		t.Fatalf("Ready condition = %#v, want the shrink applied instead of refused", cond)
 	}
 	if len(fc.resizes) != 0 {
 		t.Fatalf("resized %v, want no resize attempt for a shrink", fc.resizes)
+	}
+	// Highest ordinal first, one worker at a time.
+	if n := nodeByName(got, "pool-wrk-02"); n == nil || n.Resize == nil || !n.Resize.Recreate {
+		t.Fatalf("pool-wrk-02 = %#v, want the first recreate", n)
+	}
+	if other := nodeByName(got, "pool-wrk-01"); other == nil || other.Resize != nil {
+		t.Fatalf("pool-wrk-01 = %#v, want it untouched until the first one is back", other)
 	}
 }
 

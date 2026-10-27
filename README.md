@@ -85,7 +85,9 @@ Implemented:
   `status.nodes[].flavor` the observed one; a mismatch drives the worker through
   cordon -> pool out -> drain -> power off -> resize -> power on -> Ready ->
   uncordon, resumable from `status`, bounded by `rollout.maxUnavailable`. A
-  shrink is reported as `UnsupportedChange`. See
+  change vCD cannot apply in place - a shrink, or another `flavor.template` -
+  replaces the worker instead: the same drain, then delete and create again under
+  the same name and address. See
   [Rolling compute-spec changes](#rolling-compute-spec-changes).
 
 Not implemented yet:
@@ -121,8 +123,8 @@ One `K8sWorkerPool` describes the worker set of a single cluster. You own
 | `bootstrap.k8sVersion` | no | Full apt version pinned in the guest, e.g. `1.35.9-1.1`. |
 | `bootstrap.k8sMinorRepo` | no | `pkgs.k8s.io` minor repo, e.g. `v1.35`. |
 | `flavor.cpus` / `flavor.memoryMB` | yes | VM shape. |
-| `flavor.osDiskGB` | no | Grows the cloned template's system disk (bus 0/unit 0) before the first power-on. Terraform nodes use `disks_config.osdisk.sizegb`; a clone without this keeps the template size (10 GB on the current Ubuntu template). Shrinking is refused. |
-| `flavor.template` | no | vCD catalog template (must expose `disk.EnableUUID`). |
+| `flavor.osDiskGB` | no | Grows the cloned template's system disk (bus 0/unit 0) before the first power-on. Terraform nodes use `disks_config.osdisk.sizegb`; a clone without this keeps the template size (10 GB on the current Ubuntu template). A smaller value replaces the worker (see [Rolling compute-spec changes](#rolling-compute-spec-changes)). |
+| `flavor.template` | no | vCD catalog template (must expose `disk.EnableUUID`). Another value replaces the worker: a different image is a different VM. |
 | `flavor.disks[]` | no | Data disks: `sizeGB`, `mount` (`/var`, `/var/lib`), `busType`, `busNumber`, `unitNumber`, `storageProfile`. Mirrors Terraform `diskw1` / `diskw2`. |
 | `provider` | no | Platform that runs the workers: `vcd` (default) or `vsphere`. The block for the selected platform is required. `vsphere` is a stub: a pool that names it is rejected as `InvalidSpec` instead of half-working. See [Platform providers](#platform-providers). |
 | `vcd.org` / `vcd.vdc` / `vcd.vapp` / `vcd.orgNetwork` | yes* | Placement of the VM. Required when `provider` is `vcd`. |
@@ -146,7 +148,7 @@ One `K8sWorkerPool` describes the worker set of a single cluster. You own
 | `rollout.maxUnavailable` | no | How many workers may be out of service at once during a roll (int or percentage, default `1`). PDBs are the real brake. |
 | `rollout.order` | no | `Descending` (default, highest ordinal first) or `Ascending`. |
 | `rollout.pauseOnFailure` | no | Stop the roll when a worker does not come back (default `true`). |
-| `rollout.readyTimeout` | no | How long a resized worker may take to become Ready (default `10m`). |
+| `rollout.readyTimeout` | no | How long a resized worker may take to become Ready (default `10m`). A recreated worker bootstraps from scratch and is bounded by `provisioning.timeout` instead. |
 | `provisioning.timeout` | no | How long a VM may run without its Kubernetes Node before the worker is parked as `Failed` (default `15m`). The VM is kept for inspection and the pool reports `Ready=False`/`WorkerFailed`; a registration that arrives later still promotes the worker to `Ready`. |
 | `capacity.preflight` | no | Read the vDC's free capacity before a create or a resize and park work that cannot fit (default `true`). See [When the vDC is full](#when-the-vdc-is-full). |
 | `capacity.cpuMhzPerCore` | no | MHz per vCPU used for the CPU estimate when the vDC does not report its own speed to the controller account (default `2000`). The admin view of the vDC is read once; a tenant account that cannot read it falls back to this number. |
@@ -178,9 +180,9 @@ reports `ErrPoolNotConfigured` for a pool it cannot address (NSX-T today).
 | --- | --- |
 | `observedReplicas` | Worker **slots** the controller knows about: VMs that exist, slots whose VM disappeared and stay reserved (`Missing` / parked `Failed`), and slots waiting for capacity (`Queued`). |
 | `ledger.nextIndex` / `used[]` / `free[]` | Address book. `used` holds every allocated worker IP; addresses of deleted VMs are never released automatically. |
-| `nodes[]` | Per worker: `name` (the vCD VM name), `nodeName` (the Kubernetes Node object name, lower case - the only name the controller passes to the Kubernetes API), `ip`, `providerID` (the VM id in the platform, today `urn:vcloud:vm:...`), `phase`, `cpu`, `memoryMB`, `diskGB`, `k8sReady`, `kubeletVersion`, `message`, `deleteStartedAt`, `flavor` (what the VM actually runs with, read back from vCD), `healAttempts` / `healLastAttempt` (the AutoHeal budget), `resize` (the per-worker rollout step), `provisioningStartedAt` (when the watchdog clock started for a VM that has no Node yet), `bootstrapTokenID` (the token kept alive until the join, then revoked; never the secret half). `message` is where a blocked removal explains itself (the PDB, the attached volume, the local PV). |
+| `nodes[]` | Per worker: `name` (the vCD VM name), `nodeName` (the Kubernetes Node object name, lower case - the only name the controller passes to the Kubernetes API), `ip`, `providerID` (the VM id in the platform, today `urn:vcloud:vm:...`), `phase`, `cpu`, `memoryMB`, `diskGB`, `k8sReady`, `kubeletVersion`, `message`, `deleteStartedAt`, `flavor` (what the VM actually runs with, template included, read back from the platform), `healAttempts` / `healLastAttempt` (the AutoHeal budget), `resize` (the per-worker rollout step: `phase`, `recreate`, `drainStartedAt`, `message`), `provisioningStartedAt` (when the watchdog clock started for a VM that has no Node yet), `bootstrapTokenID` (the token kept alive until the join, then revoked; never the secret half). `message` is where a blocked removal explains itself (the PDB, the attached volume, the local PV). |
 | `rollout` | `phase` (`Idle`, `Progressing`, `Paused`, `Queued`), `message` (why a roll is waiting, e.g. the capacity it needs), `targetFlavor`, `workersTotal`, `workersDone`, `currentWorker`, `lastError`, `startedAt`. |
-| `conditions[]` | `Ready`, with reason `Converged` (`3/3 workers Ready`), `Progressing` while a worker is not Ready yet, `WorkerMissing` when a slot lost its VM, `WorkerFailed` when a worker is parked (drain timeout, exhausted AutoHeal, or no Node within `provisioning.timeout`), `LastWorkerProtected` / `WorkerHostsController` on a refused emptying, `RolloutInProgress` while a roll holds the pool, `UnsupportedChange` for a shrink, `NoResourceAvailable` when workers are queued for vDC capacity, plus `ScaleUpFailed`, `ScaleDownFailed`, `RolloutFailed` and `InvalidSpec` on errors. |
+| `conditions[]` | `Ready`, with reason `Converged` (`3/3 workers Ready`), `Progressing` while a worker is not Ready yet, `WorkerMissing` when a slot lost its VM, `WorkerFailed` when a worker is parked (drain timeout, exhausted AutoHeal, or no Node within `provisioning.timeout`), `LastWorkerProtected` / `WorkerHostsController` on a refused emptying, `RolloutInProgress` while a roll holds the pool, `NoResourceAvailable` when workers are queued for vDC capacity, plus `ScaleUpFailed`, `ScaleDownFailed`, `RolloutFailed` and `InvalidSpec` on errors. |
 
 Phases: `Provisioning` (VM created, Node not registered yet) -> `Joining` (Node
 registered, not Ready) -> `Ready`. Removal uses `Draining` (cordon, pool
@@ -670,6 +672,14 @@ instead of a delete:
       -> power on -> wait Node Ready and the flavor to match -> uncordon
       -> ingress pool in
 
+A change that cannot be applied in place takes the recreate branch after the
+drain instead of powering off:
+
+    cordon (nodeName) -> ingress pool out -> drain (PDB) -> VolumeAttachment wait
+      -> power off -> delete the Node object -> delete the VM
+      -> create the VM again in the same slot (new shape, new image)
+      -> wait Node Ready and the flavor to match -> uncordon -> ingress pool in
+
 The VM is read before anything is powered off, so a step that a status conflict
 re-drove does not power-cycle a worker whose shape already matches, and a VM that
 something started again is stopped rather than failing the slot. CPU, memory and
@@ -713,10 +723,27 @@ default) the whole roll pauses there: `status.rollout.phase: Paused` and
 `lastError` name the worker. Resolve it (usually `deleteWorkers`, then let the
 pool create a fresh worker at the current spec) and the roll resumes.
 
-Shrinking is refused by vCD for CPU/memory and would destroy data for a disk, so
-it is a recreate, not a resize: the pool reports `Ready=False` with reason
-`UnsupportedChange` and touches nothing. Use `deleteWorkers` to replace such
-a worker at the smaller shape.
+vCD cannot shrink a VM - CPU and memory have no smaller setting, and a smaller
+disk would destroy data - and another `spec.flavor.template` is another operating
+system. Both are a **recreate**, not a resize: the worker goes through the same
+cordon, pool-out and drain, and then its VM is deleted and created again in the
+same slot with the new shape and image, under the same name and address, so the
+ledger and `status.nodes` do not move. `status.nodes[].resize.recreate` is `true`
+for the whole operation, the phases are `Cordoned`, `Deleting`, `Creating` and
+`Booting`, and a `WorkerRecreate` event names the reason before anything is
+drained.
+
+A recreate is a fresh provision, so it is bounded by `spec.provisioning.timeout`
+rather than `rollout.readyTimeout`, the join token is renewed while the guest is
+still installing, and it consumes no free vDC capacity: the old VM is deleted
+before the new one is created. Data on the worker's disks does not survive it -
+that is exactly what makes a shrink possible.
+
+A worker the controller adopted carries no record of the image it was cloned
+from, so `status.nodes[].flavor.template` stays empty, and an unknown image is no
+opinion: changing `spec.flavor.template` does not replace an adopted worker.
+Replace it once (`deleteWorkers`) and the worker that replaces it carries the
+record.
 
 `strategy: Manual` disables automatic rolls: only workers annotated
 `k8s-nodescale.github.io/resize=allow` are resized, which suits environments where
@@ -954,7 +981,7 @@ What this means in practice:
 ## Terraform integration contract
 
 - The Terraform module installs this chart behind a `node_controller.enabled`
-  toggle and pins `chart_version` / `image_tag` (currently `0.8.0`).
+  toggle and pins `chart_version` / `image_tag` (currently `0.9.0`).
 - **Once the controller is enabled, do not use Terraform to manage worker count
   or worker LB pool membership.** Use the CRD instead. The Terraform module's
   README must state this explicitly.
@@ -985,7 +1012,7 @@ Build locally (the Dockerfile uses `golang:1.27.1-alpine` and
 `gcr.io/distroless/static:nonroot`):
 
 ```
-docker build -t docker.io/werton13/vcd-k8s-node-controller:0.8.0 .
+docker build -t docker.io/werton13/vcd-k8s-node-controller:0.9.0 .
 ```
 
 Public module defaults are used inside the build. On a restricted network,
@@ -995,14 +1022,14 @@ override them:
 docker build \
   --build-arg GOPROXY=https://nexus.example.com/repository/golang/ \
   --build-arg GOSUMDB=off \
-  -t docker.io/werton13/vcd-k8s-node-controller:0.8.0 .
+  -t docker.io/werton13/vcd-k8s-node-controller:0.9.0 .
 ```
 
 Push (or use `make image-push`):
 
 ```
 docker login docker.io
-docker push docker.io/werton13/vcd-k8s-node-controller:0.8.0
+docker push docker.io/werton13/vcd-k8s-node-controller:0.9.0
 docker push docker.io/werton13/vcd-k8s-node-controller:latest
 ```
 

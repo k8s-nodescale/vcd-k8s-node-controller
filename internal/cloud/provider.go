@@ -210,6 +210,10 @@ type VM struct {
 	// OSDiskGB is the system disk (bus 0/unit 0) alone, which is what
 	// spec.flavor.osDiskGB describes.
 	OSDiskGB int32
+	// Template is the image the VM was cloned from, as the platform names it.
+	// It is empty when the platform cannot tell - a VM the controller did not
+	// create - and an empty template is "no opinion", never a difference.
+	Template string
 	Metadata map[string]string
 }
 

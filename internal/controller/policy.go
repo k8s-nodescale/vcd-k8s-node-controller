@@ -89,6 +89,15 @@ func (r *WorkerPoolReconciler) mergeMissingSlots(pool *infrav1.K8sWorkerPool, no
 			present[key] = true
 			continue
 		}
+		if prev.Resize != nil && prev.Resize.Recreate {
+			// A recreate deletes the VM before it creates the replacement,
+			// so the slot is empty on purpose and the rollout owns it.
+			// Marking it Missing would clear the resize state and strand the
+			// worker halfway through a replacement.
+			out = append(out, prev)
+			present[key] = true
+			continue
+		}
 		if prev.Phase == infrav1.NodePhaseQueued {
 			// A queued slot never had a VM: it is waiting for capacity, not
 			// missing. Keep it and its reserved address as they are.

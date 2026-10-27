@@ -794,12 +794,9 @@ func mergeNodes(pool *infrav1.K8sWorkerPool, vms []cloud.VM, alloc *ipam.Allocat
 			node.DiskGB = vm.DiskGB
 		}
 		// What the VM actually runs with; spec.flavor is the desired side. A VM
-		// resized by hand is noticed by the same comparison the rollout uses.
-		node.Flavor = &infrav1.FlavorStatus{
-			CPUs:     vm.CPU,
-			MemoryMB: vm.MemoryMB,
-			OSDiskGB: vm.OSDiskGB,
-		}
+		// resized or re-cloned by hand is noticed by the same comparison the
+		// rollout uses, template included.
+		node.Flavor = flavorOf(vm)
 		out = append(out, node)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
@@ -857,6 +854,7 @@ func (r *WorkerPoolReconciler) scaleUp(ctx context.Context, before, pool *infrav
 				CPUs:     pool.Spec.Flavor.CPUs,
 				MemoryMB: pool.Spec.Flavor.MemoryMB,
 				OSDiskGB: pool.Spec.Flavor.OSDiskGB,
+				Template: pool.Spec.Flavor.Template,
 			},
 		})
 		pool.Status.ObservedReplicas = int32(len(pool.Status.Nodes))
@@ -889,7 +887,7 @@ func (r *WorkerPoolReconciler) scaleUp(ctx context.Context, before, pool *infrav
 		st.CPU = cpu
 		st.MemoryMB = memMB
 		st.DiskGB = vm.DiskGB
-		st.Flavor = &infrav1.FlavorStatus{CPUs: vm.CPU, MemoryMB: vm.MemoryMB, OSDiskGB: vm.OSDiskGB}
+		st.Flavor = flavorOf(vm)
 		st.BootstrapTokenID = tokID
 		pool.Status.Ledger = toStatusLedger(alloc.Ledger())
 		// Persist the VM id as soon as it exists: a restart after this point
@@ -958,7 +956,7 @@ func (r *WorkerPoolReconciler) resumeInterruptedCreates(ctx context.Context, poo
 		n.CPU = resumed.CPU
 		n.MemoryMB = resumed.MemoryMB
 		n.DiskGB = resumed.DiskGB
-		n.Flavor = &infrav1.FlavorStatus{CPUs: resumed.CPU, MemoryMB: resumed.MemoryMB, OSDiskGB: resumed.OSDiskGB}
+		n.Flavor = flavorOf(resumed)
 		pool.Status.Ledger = toStatusLedger(alloc.Ledger())
 		logger.Info("resumed an interrupted create", "worker", n.Name, "providerID", resumed.ID)
 		r.eventf(pool, corev1.EventTypeNormal, "WorkerCreateResumed",

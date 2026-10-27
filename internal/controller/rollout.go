@@ -26,10 +26,14 @@ import (
 var errRolloutDrainBlocked = errors.New("the drain budget is spent and scaleDown.waitForPDB is set")
 
 // Per-worker rollout phases, persisted in status.nodes[].resize.phase so a
-// controller restart resumes where the previous pass stopped.
+// controller restart resumes where the previous pass stopped. A change the
+// platform can apply in place walks Cordoned -> Stopped -> Booting; a worker
+// that has to be replaced walks Cordoned -> Deleting -> Creating -> Booting.
 const (
 	resizePhaseCordoned = "Cordoned"
 	resizePhaseStopped  = "Stopped"
+	resizePhaseDeleting = "Deleting"
+	resizePhaseCreating = "Creating"
 	resizePhaseBooting  = "Booting"
 	resizePhaseFailed   = "Failed"
 )
@@ -44,13 +48,58 @@ const (
 	flavorGrow
 	flavorShrink
 	flavorMixed
+	// flavorTemplate means the VM was cloned from another image.
+	flavorTemplate
 )
 
+// String names the difference the way status and events report it.
+func (d flavorDelta) String() string {
+	switch d {
+	case flavorGrow:
+		return "grow"
+	case flavorShrink:
+		return "shrink"
+	case flavorMixed:
+		return "mixed"
+	case flavorTemplate:
+		return "template"
+	default:
+		return "equal"
+	}
+}
+
+// needsRecreate reports whether d can only be reached by replacing the VM. The
+// platform cannot shrink a vCPU count, a memory size or a disk, and a different
+// image is a different machine: all three mean delete and create again instead
+// of power off and resize.
+func (d flavorDelta) needsRecreate() bool {
+	return d == flavorShrink || d == flavorMixed || d == flavorTemplate
+}
+
+// recreateReason explains a delta that cannot be applied in place.
+func recreateReason(d flavorDelta) string {
+	switch d {
+	case flavorShrink:
+		return "spec.flavor is smaller than the worker and a VM cannot shrink"
+	case flavorMixed:
+		return "spec.flavor grows one dimension and shrinks another"
+	case flavorTemplate:
+		return "spec.flavor.template names another image"
+	}
+	return "spec.flavor needs a new VM"
+}
+
 // compareFlavor compares what a VM has with what the spec wants. Zero means
-// "no opinion" on either side, so an unobserved value never triggers work.
+// "no opinion" on either side, so an unobserved value never triggers work; an
+// empty template (a worker adopted without a record of its image) is the same.
 func compareFlavor(have, want *infrav1.FlavorStatus) flavorDelta {
 	if have == nil || want == nil {
 		return flavorEqual
+	}
+	if have.Template != "" && want.Template != "" && have.Template != want.Template {
+		// A different image cannot be reached under a running worker: the
+		// operating system itself would have to change.
+		return flavorTemplate
 	}
 	grow, shrink := false, false
 	cmp := func(h, w int32) {
@@ -75,6 +124,18 @@ func compareFlavor(have, want *infrav1.FlavorStatus) flavorDelta {
 		return flavorGrow
 	default:
 		return flavorEqual
+	}
+}
+
+// flavorOf is the observed side of spec.flavor for one VM. Every observation
+// goes through here, so the template can never be forgotten by one call site
+// and remembered by another.
+func flavorOf(vm cloud.VM) *infrav1.FlavorStatus {
+	return &infrav1.FlavorStatus{
+		CPUs:     vm.CPU,
+		MemoryMB: vm.MemoryMB,
+		OSDiskGB: vm.OSDiskGB,
+		Template: vm.Template,
 	}
 }
 
@@ -121,7 +182,8 @@ func rolloutInFlight(pool *infrav1.K8sWorkerPool) int {
 func failedResizeHealable(pool *infrav1.K8sWorkerPool, target *infrav1.FlavorStatus) bool {
 	for i := range pool.Status.Nodes {
 		n := &pool.Status.Nodes[i]
-		if n.Resize != nil && n.Resize.Phase == resizePhaseFailed && compareFlavor(n.Flavor, target) == flavorEqual {
+		if n.Resize != nil && n.Resize.Phase == resizePhaseFailed && n.ProviderID != "" &&
+			compareFlavor(n.Flavor, target) == flavorEqual {
 			return true
 		}
 	}
@@ -137,9 +199,12 @@ func rolloutBlocksRemoval(pool *infrav1.K8sWorkerPool) bool {
 
 // reconcileRollout applies spec.flavor to existing workers one batch at a time:
 // cordon, remove from the ingress pool, drain, wait for volumes to detach,
-// power off, resize, power on, wait for Ready, uncordon, put back. Each pass
-// advances a worker by one step and persists that step in status, so a
-// controller restart during a roll resumes instead of starting over.
+// power off, resize, power on, wait for Ready, uncordon, put back. A change the
+// platform cannot apply in place - a shrink, or another template - is a
+// recreate instead: the same drain, then the VM is deleted and created again
+// under the same name at the same address. Each pass advances a worker by one
+// step and persists that step in status, so a controller restart during a roll
+// resumes instead of starting over.
 //
 // It returns handled=true while a roll is in progress, which keeps the pass from
 // overwriting the rollout conditions with the converged state.
@@ -150,24 +215,28 @@ func (r *WorkerPoolReconciler) reconcileRollout(ctx context.Context, pool *infra
 		CPUs:     pool.Spec.Flavor.CPUs,
 		MemoryMB: pool.Spec.Flavor.MemoryMB,
 		OSDiskGB: pool.Spec.Flavor.OSDiskGB,
+		Template: pool.Spec.Flavor.Template,
 	}
 
 	inFlight := rolloutInFlight(pool)
-	var pending, unsupported []int
+	// pending is every worker that needs work, and deltas records why. A
+	// recreate spends the same disruption budget as a resize - the worker
+	// leaves service either way - so both share one queue, and only the steps
+	// after the drain differ.
+	var pending []int
+	deltas := make(map[int]flavorDelta)
 	for i := range pool.Status.Nodes {
 		n := &pool.Status.Nodes[i]
 		if n.Resize != nil || n.Phase == infrav1.NodePhaseMissing ||
 			n.Phase == infrav1.NodePhaseFailed || n.DeleteStartedAt != nil || n.Flavor == nil {
 			continue
 		}
-		switch compareFlavor(n.Flavor, target) {
-		case flavorEqual:
+		d := compareFlavor(n.Flavor, target)
+		if d == flavorEqual {
 			continue
-		case flavorShrink, flavorMixed:
-			unsupported = append(unsupported, i)
-		case flavorGrow:
-			pending = append(pending, i)
 		}
+		pending = append(pending, i)
+		deltas[i] = d
 	}
 
 	// A Failed slot is not in flight, but it may still be closable when the VM
@@ -175,17 +244,6 @@ func (r *WorkerPoolReconciler) reconcileRollout(ctx context.Context, pool *infra
 	healable := failedResizeHealable(pool, target)
 
 	if inFlight == 0 && len(pending) == 0 && !healable {
-		if len(unsupported) > 0 {
-			var names []string
-			for _, i := range unsupported {
-				names = append(names, pool.Status.Nodes[i].Name)
-			}
-			msg := fmt.Sprintf("spec.flavor is smaller than %d worker(s) (%s); vCD cannot shrink a VM, so this needs a recreate per worker and is not implemented yet",
-				len(names), strings.Join(names, ", "))
-			r.setCondition(pool, metav1.ConditionFalse, "UnsupportedChange", msg)
-			r.eventf(pool, corev1.EventTypeWarning, "UnsupportedChange", msg)
-			return true, ctrl.Result{RequeueAfter: requeueConverged}, nil
-		}
 		if pool.Status.Rollout.Phase != "" && pool.Status.Rollout.Phase != infrav1.RolloutPhaseIdle {
 			pool.Status.Rollout = infrav1.RolloutStatus{Phase: infrav1.RolloutPhaseIdle}
 			r.eventf(pool, corev1.EventTypeNormal, "RolloutComplete", "every worker matches spec.flavor")
@@ -249,6 +307,13 @@ func (r *WorkerPoolReconciler) reconcileRollout(ctx context.Context, pool *infra
 			var need cloud.CapacityRequest
 			var fits []int
 			for _, i := range start {
+				if deltas[i].needsRecreate() {
+					// A recreate deletes the old VM before it creates the new
+					// one, so it asks the vDC for nothing it does not already
+					// hold; only the batch width decides when it starts.
+					fits = append(fits, i)
+					continue
+				}
 				next := addCapacityRequest(need, resizeCapacityRequest(pool.Status.Nodes[i].Flavor, target))
 				if ok, short := capacity.Fits(next, mhz); !ok {
 					queuedWhy = strings.Join(short, "; ")
@@ -262,11 +327,20 @@ func (r *WorkerPoolReconciler) reconcileRollout(ctx context.Context, pool *infra
 	}
 	for _, i := range start {
 		n := &pool.Status.Nodes[i]
-		n.Resize = &infrav1.ResizeStatus{Phase: resizePhaseCordoned, StartedAt: &now}
+		recreate := deltas[i].needsRecreate()
+		n.Resize = &infrav1.ResizeStatus{Phase: resizePhaseCordoned, StartedAt: &now, Recreate: recreate}
 		n.Phase = infrav1.NodePhaseResizing
 		n.Message = "rollout: taking the worker out of service"
+		if recreate {
+			// Say it before anything is drained: this worker is not coming
+			// back as the same machine.
+			n.Message = "rollout: replacing the worker; taking it out of service"
+			r.eventf(pool, corev1.EventTypeNormal, "WorkerRecreate",
+				fmt.Sprintf("worker %s is replaced: %s", n.Name, recreateReason(deltas[i])))
+		}
 		inFlight++
-		logger.Info("rollout: started", "worker", n.Name, "have", n.Flavor, "want", target)
+		logger.Info("rollout: started", "worker", n.Name, "have", n.Flavor, "want", target,
+			"delta", deltas[i].String(), "recreate", recreate)
 	}
 
 	if pool.Status.Rollout.StartedAt == nil {
@@ -284,13 +358,13 @@ func (r *WorkerPoolReconciler) reconcileRollout(ctx context.Context, pool *infra
 			// pool add at the very end is the usual culprit. Retry the closing
 			// steps, which are idempotent, instead of freezing the slot in
 			// Resizing/Failed for good.
-			if err := r.advanceResize(ctx, pool, n, target); err == nil && n.Resize == nil {
+			if err := r.advanceResize(ctx, pool, alloc, n, target); err == nil && n.Resize == nil {
 				continue
 			}
 			failed = true
 			continue
 		}
-		if err := r.advanceResize(ctx, pool, n, target); err != nil {
+		if err := r.advanceResize(ctx, pool, alloc, n, target); err != nil {
 			// A drain that cannot finish yet is progress, not a failure: the
 			// pass retries and the PDB is what decides.
 			if errors.Is(err, kube.ErrDrainIncomplete) {
@@ -364,7 +438,7 @@ func (r *WorkerPoolReconciler) reconcileRollout(ctx context.Context, pool *infra
 }
 
 // advanceResize moves one worker one step through the rollout.
-func (r *WorkerPoolReconciler) advanceResize(ctx context.Context, pool *infrav1.K8sWorkerPool, n *infrav1.WorkerNodeStatus, target *infrav1.FlavorStatus) error {
+func (r *WorkerPoolReconciler) advanceResize(ctx context.Context, pool *infrav1.K8sWorkerPool, alloc *ipam.Allocator, n *infrav1.WorkerNodeStatus, target *infrav1.FlavorStatus) error {
 	kubeName := n.NodeName
 	if kubeName == "" {
 		kubeName = strings.ToLower(n.Name)
@@ -433,7 +507,7 @@ func (r *WorkerPoolReconciler) advanceResize(ctx context.Context, pool *infrav1.
 		if err != nil {
 			return fmt.Errorf("read %s: %w", n.Name, err)
 		}
-		have := &infrav1.FlavorStatus{CPUs: vm.CPU, MemoryMB: vm.MemoryMB, OSDiskGB: vm.OSDiskGB}
+		have := flavorOf(vm)
 		if compareFlavor(have, target) == flavorEqual {
 			n.Flavor = have
 			if !vm.PoweredOn {
@@ -443,6 +517,16 @@ func (r *WorkerPoolReconciler) advanceResize(ctx context.Context, pool *infrav1.
 			}
 			n.Resize.Phase = resizePhaseBooting
 			n.Resize.Message = "already carries the target shape; waiting for the Node to become Ready"
+			n.Message = n.Resize.Message
+			return nil
+		}
+		if n.Resize.Recreate {
+			// Drained and out of the ingress pool. A smaller shape or another
+			// image cannot be reached under this VM, so it goes; the slot
+			// keeps its name and address, and the replacement lands where the
+			// old worker was.
+			n.Resize.Phase = resizePhaseDeleting
+			n.Resize.Message = "drained; deleting the VM to create it again with the new spec.flavor"
 			n.Message = n.Resize.Message
 			return nil
 		}
@@ -466,7 +550,7 @@ func (r *WorkerPoolReconciler) advanceResize(ctx context.Context, pool *infrav1.
 		if err != nil {
 			return fmt.Errorf("read %s: %w", n.Name, err)
 		}
-		have := &infrav1.FlavorStatus{CPUs: vm.CPU, MemoryMB: vm.MemoryMB, OSDiskGB: vm.OSDiskGB}
+		have := flavorOf(vm)
 		if compareFlavor(have, target) != flavorEqual {
 			if vm.PoweredOn {
 				if err := prov.PowerOffVM(ctx, n.ProviderID); err != nil {
@@ -489,7 +573,7 @@ func (r *WorkerPoolReconciler) advanceResize(ctx context.Context, pool *infrav1.
 				return fmt.Errorf("resize %s: %w", n.Name, err)
 			}
 			vm = resized
-			have = &infrav1.FlavorStatus{CPUs: vm.CPU, MemoryMB: vm.MemoryMB, OSDiskGB: vm.OSDiskGB}
+			have = flavorOf(vm)
 			if compareFlavor(have, target) != flavorEqual {
 				// Do not boot a worker with the wrong shape: a resize that
 				// only half applied would otherwise look like a finished one.
@@ -510,6 +594,91 @@ func (r *WorkerPoolReconciler) advanceResize(ctx context.Context, pool *infrav1.
 			fmt.Sprintf("worker %s resized to %d vCPU / %d MB", n.Name, target.CPUs, target.MemoryMB))
 		return nil
 
+	case resizePhaseDeleting:
+		// The scale-down order, for the same reason: stop the guest, then
+		// remove the Node, then the VM. A Node deleted while kubelet still
+		// runs is re-registered within seconds, and the replacement would
+		// inherit the old providerID and its volumes instead of starting
+		// clean.
+		if err := prov.PowerOffVM(ctx, n.ProviderID); err != nil {
+			return fmt.Errorf("stop %s: %w", n.Name, err)
+		}
+		if kubeName != "" {
+			if err := r.Kube.DeleteNode(ctx, kubeName); err != nil && !apierrors.IsNotFound(err) {
+				return fmt.Errorf("delete Node %s: %w", kubeName, err)
+			}
+		}
+		if err := prov.DeleteVM(ctx, n.ProviderID); err != nil {
+			return fmt.Errorf("delete %s: %w", n.Name, err)
+		}
+		// The guest is gone; its join credential must not stay usable.
+		r.revokeBootstrapToken(ctx, n)
+		n.ProviderID = ""
+		n.NodeName = ""
+		n.Flavor = nil
+		n.Resize.Phase = resizePhaseCreating
+		n.Resize.Message = "VM deleted; creating it again with the new spec.flavor"
+		n.Message = n.Resize.Message
+		return nil
+
+	case resizePhaseCreating:
+		// A VM with this name already exists when an earlier pass created it
+		// and the status write was lost: mergeNodes has adopted it into
+		// ProviderID, and attaching a second VM to the slot is the one thing
+		// to avoid.
+		if n.ProviderID != "" {
+			vm, err := prov.GetVM(ctx, n.ProviderID)
+			if err != nil {
+				return fmt.Errorf("read %s: %w", n.Name, err)
+			}
+			n.Flavor = flavorOf(vm)
+			n.Resize.Phase = resizePhaseBooting
+			n.Resize.Message = "created; waiting for the Node to become Ready"
+			n.Message = n.Resize.Message
+			return nil
+		}
+		vm, tokID, err := r.createWorker(ctx, pool, alloc, n.Name, n.IP)
+		if err != nil {
+			// The old VM is already gone, so parking the slot would need a
+			// human to finish a replacement that a transient platform error
+			// interrupted. Keep the phase and retry, the way a failed scale-up
+			// does, with the reason in status.
+			if msg := "recreating the VM failed, retrying: " + err.Error(); n.Resize.Message != msg {
+				n.Resize.Message = msg
+				n.Message = msg
+				r.eventf(pool, corev1.EventTypeWarning, "WorkerRecreateFailed",
+					fmt.Sprintf("worker %s: %v", n.Name, err))
+			}
+			return nil
+		}
+		have := flavorOf(vm)
+		// The VM was created from spec.flavor, so a provider that reports a
+		// value back as zero is not a difference: fill the gap from the spec
+		// instead of failing the slot on it.
+		if have.CPUs == 0 {
+			have.CPUs = pool.Spec.Flavor.CPUs
+		}
+		if have.MemoryMB == 0 {
+			have.MemoryMB = pool.Spec.Flavor.MemoryMB
+		}
+		if have.OSDiskGB == 0 {
+			have.OSDiskGB = pool.Spec.Flavor.OSDiskGB
+		}
+		if have.Template == "" {
+			have.Template = pool.Spec.Flavor.Template
+		}
+		now := metav1.Now()
+		n.ProviderID = vm.ID
+		n.BootstrapTokenID = tokID
+		n.ProvisioningStartedAt = &now
+		n.Flavor = have
+		n.Resize.Phase = resizePhaseBooting
+		n.Resize.Message = "created again; waiting for the Node to become Ready"
+		n.Message = n.Resize.Message
+		r.eventf(pool, corev1.EventTypeNormal, "WorkerRecreated",
+			fmt.Sprintf("worker %s was replaced; it joins again at %s", n.Name, n.IP))
+		return nil
+
 	case resizePhaseBooting:
 		nodes, err := r.Kube.ListNodes(ctx)
 		if err != nil {
@@ -523,9 +692,18 @@ func (r *WorkerPoolReconciler) advanceResize(ctx context.Context, pool *infrav1.
 			}
 		}
 		if info == nil || !info.Ready {
-			if n.Resize.StartedAt != nil && time.Since(n.Resize.StartedAt.Time) > rolloutReadyTimeout(pool) {
-				return fmt.Errorf("worker %s did not become Ready within %s after the resize",
-					n.Name, rolloutReadyTimeout(pool))
+			// A replaced worker bootstraps its guest from scratch, so it gets
+			// the provisioning budget and a join token that is still valid
+			// when the guest gets there. The watchdog does both for a create,
+			// but it skips a slot a roll owns.
+			budget, since, action := rolloutReadyTimeout(pool), n.Resize.StartedAt, "resize"
+			if n.Resize.Recreate {
+				budget, since, action = provisioningTimeout(pool), n.ProvisioningStartedAt, "recreate"
+				r.renewBootstrapToken(ctx, pool, n)
+			}
+			if since != nil && time.Since(since.Time) > budget {
+				return fmt.Errorf("worker %s did not become Ready within %s after the %s",
+					n.Name, budget, action)
 			}
 			n.Resize.Message = "waiting for the Node to become Ready"
 			return nil
@@ -536,9 +714,12 @@ func (r *WorkerPoolReconciler) advanceResize(ctx context.Context, pool *infrav1.
 		return r.finishResize(ctx, pool, n, target, kubeName)
 
 	case resizePhaseFailed:
-		// Only a worker that already carries the target shape can be closed out
-		// here; anything else keeps its failure for the operator.
-		if compareFlavor(n.Flavor, target) != flavorEqual {
+		// Only a worker that still has a VM and already carries the target
+		// shape can be closed out here; anything else keeps its failure for
+		// the operator. A slot left without a VM by a failed recreate is the
+		// clearest example: it has no shape at all, and finishResize would
+		// report a worker that does not exist as Ready.
+		if n.ProviderID == "" || compareFlavor(n.Flavor, target) != flavorEqual {
 			return nil
 		}
 		nodes, err := r.Kube.ListNodes(ctx)
@@ -561,6 +742,11 @@ func (r *WorkerPoolReconciler) advanceResize(ctx context.Context, pool *infrav1.
 // node out of the cluster: the slot stays in the resize state and the next pass
 // retries the (idempotent) pool add.
 func (r *WorkerPoolReconciler) finishResize(ctx context.Context, pool *infrav1.K8sWorkerPool, n *infrav1.WorkerNodeStatus, target *infrav1.FlavorStatus, kubeName string) error {
+	// The worker has a Node again, so its join credential is spent and the
+	// provisioning clock stops. An in-place resize revoked the token when the
+	// Node first registered, so this only does work for a recreate.
+	r.revokeBootstrapToken(ctx, n)
+	n.ProvisioningStartedAt = nil
 	if err := r.Kube.Uncordon(ctx, kubeName); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("uncordon %s: %w", kubeName, err)
 	}
@@ -581,11 +767,15 @@ func (r *WorkerPoolReconciler) finishResize(ctx context.Context, pool *infrav1.K
 			return nil
 		}
 	}
+	replaced := n.Resize.Recreate
 	n.Resize = nil
 	n.Phase = infrav1.NodePhaseReady
 	n.Message = ""
-	r.eventf(pool, corev1.EventTypeNormal, "WorkerResizeComplete",
-		fmt.Sprintf("worker %s is back in service with %d vCPU / %d MB", n.Name, target.CPUs, target.MemoryMB))
+	msg := fmt.Sprintf("worker %s is back in service with %d vCPU / %d MB", n.Name, target.CPUs, target.MemoryMB)
+	if replaced {
+		msg = fmt.Sprintf("worker %s was replaced and is back in service with %d vCPU / %d MB", n.Name, target.CPUs, target.MemoryMB)
+	}
+	r.eventf(pool, corev1.EventTypeNormal, "WorkerResizeComplete", msg)
 	return nil
 }
 

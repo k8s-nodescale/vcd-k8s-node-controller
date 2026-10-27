@@ -544,6 +544,13 @@ spec:
                         osDiskGB:
                           format: int32
                           type: integer
+                        template:
+                          description: |-
+                            Template is the image the VM was cloned from, recorded on the VM when
+                            the provider creates it. A worker the controller adopted (a Terraform
+                            bootstrap worker) carries no such record, so this stays empty and means
+                            "no opinion": an unknown image never turns adoption into a recreate.
+                          type: string
                       type: object
                     healAttempts:
                       description: |-
@@ -625,9 +632,17 @@ spec:
                           type: string
                         phase:
                           description: |-
-                            Phase is Cordoned, Draining, Stopped, Resizing, Booting, WaitingReady,
-                            Done or Failed.
+                            Phase is Cordoned, Stopped, Booting or Failed for a change applied in
+                            place, and Cordoned, Deleting, Creating, Booting or Failed for a worker
+                            that is replaced (Recreate).
                           type: string
+                        recreate:
+                          description: |-
+                            Recreate is set when spec.flavor cannot be reached in place - a shrink,
+                            a mix of grow and shrink, or another template - so the worker is
+                            replaced instead: drained, deleted and created again under the same
+                            name at the same address.
+                          type: boolean
                         startedAt:
                           format: date-time
                           type: string
@@ -658,8 +673,10 @@ spec:
                     format: date-time
                     type: string
                   targetFlavor:
-                    description: FlavorStatus is the compute shape a VM runs with,
-                      as reported by vCD.
+                    description: |-
+                      FlavorStatus is what a worker actually runs with, as the platform reports
+                      it: the observed side of spec.flavor. The rollout compares the two and asks
+                      for work only where they differ.
                     properties:
                       cpus:
                         format: int32
@@ -670,6 +687,13 @@ spec:
                       osDiskGB:
                         format: int32
                         type: integer
+                      template:
+                        description: |-
+                          Template is the image the VM was cloned from, recorded on the VM when
+                          the provider creates it. A worker the controller adopted (a Terraform
+                          bootstrap worker) carries no such record, so this stays empty and means
+                          "no opinion": an unknown image never turns adoption into a recreate.
+                        type: string
                     type: object
                   workersDone:
                     format: int32

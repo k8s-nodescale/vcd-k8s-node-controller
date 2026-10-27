@@ -601,10 +601,14 @@ status:
 `k8s-nodescale.github.io/resize=allow` - for environments where the window matters more
 than the API.
 
-**Later.** A template change or a shrink is a recreate: drain, power off, delete
-the VM, create a new one from the new spec **into the same ledger slot**, so the
-name and the address are preserved. The ledger is what makes that possible, and
-it is the natural 0.6 candidate.
+**Implemented in 0.9.0.** A template change or a shrink is a recreate: drain,
+power off, delete the VM, create a new one from the new spec **into the same
+ledger slot**, so the name and the address are preserved. The ledger is what makes
+that possible. The worker walks `Cordoned` -> `Deleting` -> `Creating` ->
+`Booting`; `status.nodes[].resize.recreate` carries the mode so a restart
+resumes in it, and the template is recorded on the VM at create time (read back
+as `status.nodes[].flavor.template`) so a different image is detected at all. A
+worker adopted without that record carries no template opinion.
 
 ### 10.7 Implementation notes and deviations (0.5.0)
 
@@ -617,8 +621,9 @@ What the code does, where it differs from the design above:
   enforced by the eviction API and PDBs, not by concurrency, and serializing
   keeps one status write per pass.
 - **One step per pass per worker.** A worker advances at most one step per
-  reconcile (`Cordoned` -> `Stopped` -> `Booting` -> done), which is what makes
-  a controller restart mid-roll resume instead of restarting the worker.
+  reconcile (`Cordoned` -> `Stopped` -> `Booting` -> done, or `Cordoned` ->
+  `Deleting` -> `Creating` -> `Booting` -> done for a recreate), which is what
+  makes a controller restart mid-roll resume instead of restarting the worker.
 - **Ready is verified against vCD, not the Node's capacity.** After the power-on
   the controller waits for `Ready=True` and for the flavor it read back from vCD
   to equal `spec.flavor`; the Node's allocatable is not used as the resize
@@ -626,9 +631,10 @@ What the code does, where it differs from the design above:
 - **The system disk grows through the VM spec section** (`VcdVmSpecSection`), CPU
   and memory through `ChangeCPUCount`/`ChangeMemorySize`; the disk is applied
   first so the spec-section write cannot carry the pre-resize CPU/memory back.
-- **Shrink is refused per worker.** `Ready=False` with reason
-  `UnsupportedChange`, no changes to the VM; replace the worker with
-  `deleteWorkers` instead.
+- **Shrink was refused per worker in 0.5.0.** `Ready=False` with reason
+  `UnsupportedChange`, no changes to the VM. Since 0.9.0 a shrink and a
+  template change are a recreate into the same slot (see **Later** above) and
+  `UnsupportedChange` is gone.
 - **`AutoHeal` uses a fixed back-off**, not exponential (section 10.2). Bounded
   attempts are what stop a broken template; a fixed interval is easier to reason
   about and to observe in events.
