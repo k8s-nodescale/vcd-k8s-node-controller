@@ -155,7 +155,10 @@ Ansible.
   ├── api/v1alpha1/            # CRD Go types + deepcopy
   ├── cmd/manager/             # main entrypoint
   ├── internal/controller/     # reconcilers (worker pool, node watcher)
-  ├── internal/cloud/vcd/      # govcd CloudProvider implementation
+  ├── internal/cloud/          # platform contract: WorkerCompute, CapacityReader,
+  │                            #   optional PoolMembership, Factory + Placement
+  ├── internal/cloud/vcd/      # govcd factory + per-pool provider
+  ├── internal/cloud/vsphere/  # vSphere stub (same contract, ErrNotImplemented)
   ├── internal/kube/           # client-go KubeProvider implementation
   ├── internal/cloudinit/      # user-data/initscript templates (go:embed)
   ├── config/                  # kustomize: crd, rbac, manager
