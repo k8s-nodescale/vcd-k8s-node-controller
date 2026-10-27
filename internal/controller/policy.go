@@ -208,7 +208,13 @@ func (r *WorkerPoolReconciler) healLostNode(ctx context.Context, pool *infrav1.K
 		st.Message = "lost its Node registration; waiting for the AutoHeal backoff"
 		return
 	}
-	if err := r.Cloud.CycleVM(ctx, pool.Spec.VCD.VApp, st.ProviderID); err != nil {
+	prov, perr := r.platform(pool)
+	if perr != nil {
+		st.Message = "AutoHeal cannot reach the platform: " + perr.Error()
+		logger.Error(perr, "AutoHeal has no platform provider", "worker", st.Name)
+		return
+	}
+	if err := prov.CycleVM(ctx, st.ProviderID); err != nil {
 		st.Message = "AutoHeal power-cycle failed: " + err.Error()
 		logger.Error(err, "AutoHeal power-cycle failed", "worker", st.Name)
 		r.eventf(pool, corev1.EventTypeWarning, "AutoHealFailed",

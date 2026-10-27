@@ -50,9 +50,10 @@ func httpTimeout(cfg Config) time.Duration {
 	return defaultHTTPTimeout
 }
 
-// Provider is a govcd-backed cloud.Provider.
-
-type Provider struct {
+// Client is an authenticated vCloud Director connection. It is the cloud
+// Factory: it hands out one Pool per placement, so one process serves every
+// pool regardless of where it lives.
+type Client struct {
 	cfg    Config
 	client *govcd.VCDClient
 
@@ -63,10 +64,22 @@ type Provider struct {
 	cpuMHz  int64
 }
 
-var _ cloud.Provider = (*Provider)(nil)
+// Pool is one pool's view of vCloud Director, bound to the vApp and org
+// network its placement names. Every method works inside that vApp, so none of
+// them carries its name.
+type Pool struct {
+	*Client
+	placement cloud.VCDPlacement
+}
+
+var (
+	_ cloud.Factory        = (*Client)(nil)
+	_ cloud.Provider       = (*Pool)(nil)
+	_ cloud.PoolMembership = (*Pool)(nil)
+)
 
 // New connects to vCD and authenticates.
-func New(cfg Config) (*Provider, error) {
+func New(cfg Config) (*Client, error) {
 	endpoint, err := normalizeURL(cfg.URL)
 	if err != nil {
 		return nil, err
@@ -81,7 +94,22 @@ func New(cfg Config) (*Provider, error) {
 	if err := client.Authenticate(cfg.User, cfg.Password, cfg.Org); err != nil {
 		return nil, err
 	}
-	return &Provider{cfg: cfg, client: client}, nil
+	return &Client{cfg: cfg, client: client}, nil
+}
+
+// For returns the provider for one pool. The placement carries the vApp, org
+// network and catalog every call works in.
+func (c *Client) For(placement cloud.Placement) (cloud.Provider, error) {
+	if placement.Provider != "" && placement.Provider != cloud.ProviderVCD {
+		return nil, fmt.Errorf("vcd: placement names provider %q", placement.Provider)
+	}
+	if placement.VCD == nil {
+		return nil, errors.New("vcd: the placement carries no spec.vcd")
+	}
+	if strings.TrimSpace(placement.VCD.VApp) == "" {
+		return nil, errors.New("vcd: spec.vcd.vapp is empty")
+	}
+	return &Pool{Client: c, placement: *placement.VCD}, nil
 }
 
 // normalizeURL returns the vCD API endpoint expected by govcd: a single
@@ -138,18 +166,18 @@ func normalizeURL(raw string) (string, error) {
 // The compute capacity is reported by vCD in MHz (CPU) and MB (memory). A vDC
 // whose allocation model does not cap a category reports Limit 0, which the
 // caller reads as "unbounded".
-func (p *Provider) Capacity(ctx context.Context) (cloud.VDCCapacity, error) {
+func (p *Pool) Capacity(ctx context.Context) (cloud.PlatformCapacity, error) {
 	if err := ctx.Err(); err != nil {
-		return cloud.VDCCapacity{}, err
+		return cloud.PlatformCapacity{}, err
 	}
 	vdc, err := p.vdc()
 	if err != nil {
-		return cloud.VDCCapacity{}, err
+		return cloud.PlatformCapacity{}, err
 	}
 
-	out := cloud.VDCCapacity{
-		AllocationModel: vdc.Vdc.AllocationModel,
-		CPUMHzPerCore:   p.cpuMHzPerCore(ctx),
+	out := cloud.PlatformCapacity{
+		Model:         vdc.Vdc.AllocationModel,
+		CPUMHzPerCore: p.cpuMHzPerCore(ctx),
 	}
 	if len(vdc.Vdc.ComputeCapacity) > 0 && vdc.Vdc.ComputeCapacity[0] != nil {
 		cc := vdc.Vdc.ComputeCapacity[0]
@@ -202,7 +230,7 @@ func storageLimitMB(sp *types.VdcStorageProfile) int64 {
 // A tenant account that is not an org administrator cannot read the admin view.
 // That is not an error: zero tells the caller to fall back to the assumption in
 // the pool spec, and the capacity check still guards memory and storage.
-func (p *Provider) cpuMHzPerCore(ctx context.Context) int64 {
+func (p *Pool) cpuMHzPerCore(ctx context.Context) int64 {
 	p.cpuOnce.Do(func() {
 		adminOrg, err := p.client.GetAdminOrgByName(p.cfg.Org)
 		if err != nil {
@@ -229,7 +257,7 @@ func (p *Provider) cpuMHzPerCore(ctx context.Context) int64 {
 // ListWorkerVMs returns the VMs in vapp whose metadata contains every
 // key/value pair in selector. A VM without metadata never matches a non-empty
 // selector.
-func (p *Provider) ListWorkerVMs(ctx context.Context, vappName string, selector map[string]string) ([]cloud.VM, error) {
+func (p *Pool) ListWorkerVMs(ctx context.Context, selector map[string]string) ([]cloud.VM, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -238,9 +266,9 @@ func (p *Provider) ListWorkerVMs(ctx context.Context, vappName string, selector 
 	if err != nil {
 		return nil, err
 	}
-	vapp, err := vdc.GetVAppByName(vappName, true)
+	vapp, err := vdc.GetVAppByName(p.placement.VApp, true)
 	if err != nil {
-		return nil, fmt.Errorf("get vApp %q: %w", vappName, err)
+		return nil, fmt.Errorf("get vApp %q: %w", p.placement.VApp, err)
 	}
 	if vapp.VApp.Children == nil {
 		return []cloud.VM{}, nil
@@ -270,7 +298,7 @@ func (p *Provider) ListWorkerVMs(ctx context.Context, vappName string, selector 
 }
 
 // GetVM reads one worker VM by id.
-func (p *Provider) GetVM(ctx context.Context, vappName, id string) (cloud.VM, error) {
+func (p *Pool) GetVM(ctx context.Context, id string) (cloud.VM, error) {
 	if err := ctx.Err(); err != nil {
 		return cloud.VM{}, err
 	}
@@ -281,9 +309,9 @@ func (p *Provider) GetVM(ctx context.Context, vappName, id string) (cloud.VM, er
 	if err != nil {
 		return cloud.VM{}, err
 	}
-	vapp, err := vdc.GetVAppByName(vappName, true)
+	vapp, err := vdc.GetVAppByName(p.placement.VApp, true)
 	if err != nil {
-		return cloud.VM{}, fmt.Errorf("get vApp %q: %w", vappName, err)
+		return cloud.VM{}, fmt.Errorf("get vApp %q: %w", p.placement.VApp, err)
 	}
 	vm, err := vapp.GetVMById(id, true)
 	if err != nil {
@@ -320,21 +348,24 @@ func (p *Provider) GetVM(ctx context.Context, vappName, id string) (cloud.VM, er
 // ledger has already given this slot its name, so converging on the existing
 // VM is the only loss-free outcome. Every step below is idempotent, and a VM
 // that is already powered on had reached the last step of its create.
-func (p *Provider) CreateVM(ctx context.Context, spec cloud.CreateVMSpec) (cloud.VM, error) {
+func (p *Pool) CreateVM(ctx context.Context, spec cloud.CreateVMSpec) (cloud.VM, error) {
 	if err := ctx.Err(); err != nil {
 		return cloud.VM{}, err
 	}
 	if err := validateCreateVMSpec(spec); err != nil {
 		return cloud.VM{}, err
 	}
+	if strings.TrimSpace(p.placement.OrgNetwork) == "" {
+		return cloud.VM{}, errors.New("vcd: the placement carries no org network")
+	}
 
 	vdc, err := p.vdc()
 	if err != nil {
 		return cloud.VM{}, err
 	}
-	vapp, err := vdc.GetVAppByName(spec.VApp, true)
+	vapp, err := vdc.GetVAppByName(p.placement.VApp, true)
 	if err != nil {
-		return cloud.VM{}, fmt.Errorf("get vApp %q: %w", spec.VApp, err)
+		return cloud.VM{}, fmt.Errorf("get vApp %q: %w", p.placement.VApp, err)
 	}
 
 	vm, resumed := (*govcd.VM)(nil), false
@@ -356,7 +387,7 @@ func (p *Provider) CreateVM(ctx context.Context, spec cloud.CreateVMSpec) (cloud
 			Info:                          "NetworkConnectionSection",
 			PrimaryNetworkConnectionIndex: 0,
 			NetworkConnection: []*types.NetworkConnection{{
-				Network:                 spec.OrgNetwork,
+				Network:                 p.placement.OrgNetwork,
 				NetworkConnectionIndex:  0,
 				IPAddress:               spec.IP,
 				IsConnected:             true,
@@ -464,7 +495,7 @@ func (p *Provider) CreateVM(ctx context.Context, spec cloud.CreateVMSpec) (cloud
 // DeleteVM removes a worker VM and the disks that belong to it. It is
 // idempotent: a VM that is already absent returns nil, which lets a retried
 // scale-in finish after a partial deletion.
-func (p *Provider) DeleteVM(ctx context.Context, vappName, id string) error {
+func (p *Pool) DeleteVM(ctx context.Context, id string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -472,12 +503,12 @@ func (p *Provider) DeleteVM(ctx context.Context, vappName, id string) error {
 	if err != nil {
 		return err
 	}
-	vapp, err := vdc.GetVAppByName(vappName, true)
+	vapp, err := vdc.GetVAppByName(p.placement.VApp, true)
 	if err != nil {
 		if govcd.ContainsNotFound(err) {
 			return nil
 		}
-		return fmt.Errorf("get vApp %q: %w", vappName, err)
+		return fmt.Errorf("get vApp %q: %w", p.placement.VApp, err)
 	}
 	vm, err := vapp.GetVMById(id, true)
 	if err != nil {
@@ -498,7 +529,7 @@ func (p *Provider) DeleteVM(ctx context.Context, vappName, id string) error {
 		if govcd.ContainsNotFound(err) {
 			return nil
 		}
-		return fmt.Errorf("remove VM %q from vApp %q: %w", vm.VM.Name, vappName, err)
+		return fmt.Errorf("remove VM %q from vApp %q: %w", vm.VM.Name, p.placement.VApp, err)
 	}
 	return nil
 }
@@ -507,7 +538,7 @@ func (p *Provider) DeleteVM(ctx context.Context, vappName, id string) error {
 // it to stop kubelet before the Node object is deleted: a guest that is still
 // running re-registers its Node within seconds and leaves a NotReady corpse.
 // It is idempotent, and a VM that is already gone counts as done.
-func (p *Provider) PowerOffVM(ctx context.Context, vappName, id string) error {
+func (p *Pool) PowerOffVM(ctx context.Context, id string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -515,12 +546,12 @@ func (p *Provider) PowerOffVM(ctx context.Context, vappName, id string) error {
 	if err != nil {
 		return err
 	}
-	vapp, err := vdc.GetVAppByName(vappName, true)
+	vapp, err := vdc.GetVAppByName(p.placement.VApp, true)
 	if err != nil {
 		if govcd.ContainsNotFound(err) {
 			return nil
 		}
-		return fmt.Errorf("get vApp %q: %w", vappName, err)
+		return fmt.Errorf("get vApp %q: %w", p.placement.VApp, err)
 	}
 	vm, err := vapp.GetVMById(id, true)
 	if err != nil {
@@ -553,7 +584,7 @@ func powerOff(vm *govcd.VM) error {
 
 // PowerOnVM powers a stopped VM on. It is idempotent, and a VM that is
 // already gone counts as done.
-func (p *Provider) PowerOnVM(ctx context.Context, vappName, id string) error {
+func (p *Pool) PowerOnVM(ctx context.Context, id string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -561,12 +592,12 @@ func (p *Provider) PowerOnVM(ctx context.Context, vappName, id string) error {
 	if err != nil {
 		return err
 	}
-	vapp, err := vdc.GetVAppByName(vappName, true)
+	vapp, err := vdc.GetVAppByName(p.placement.VApp, true)
 	if err != nil {
 		if govcd.ContainsNotFound(err) {
 			return nil
 		}
-		return fmt.Errorf("get vApp %q: %w", vappName, err)
+		return fmt.Errorf("get vApp %q: %w", p.placement.VApp, err)
 	}
 	vm, err := vapp.GetVMById(id, true)
 	if err != nil {
@@ -581,11 +612,11 @@ func (p *Provider) PowerOnVM(ctx context.Context, vappName, id string) error {
 // CycleVM power-cycles a VM. AutoHeal uses it when the VM is alive but its
 // Node object disappeared: a guest reboot re-registers kubelet with the
 // cluster, which a metadata-only repair cannot do.
-func (p *Provider) CycleVM(ctx context.Context, vappName, id string) error {
-	if err := p.PowerOffVM(ctx, vappName, id); err != nil {
+func (p *Pool) CycleVM(ctx context.Context, id string) error {
+	if err := p.PowerOffVM(ctx, id); err != nil {
 		return err
 	}
-	return p.PowerOnVM(ctx, vappName, id)
+	return p.PowerOnVM(ctx, id)
 }
 
 func powerOn(vm *govcd.VM) error {
@@ -616,7 +647,7 @@ func powerOn(vm *govcd.VM) error {
 // caller opened, and the result is verified before the caller powers it on: a
 // resize that only half applied must not boot a worker with the wrong shape
 // (I-17).
-func (p *Provider) ResizeVM(ctx context.Context, vappName, id string, cpus, memoryMB, osDiskGB int32) (cloud.VM, error) {
+func (p *Pool) ResizeVM(ctx context.Context, id string, cpus, memoryMB, osDiskGB int32) (cloud.VM, error) {
 	if err := ctx.Err(); err != nil {
 		return cloud.VM{}, err
 	}
@@ -624,9 +655,9 @@ func (p *Provider) ResizeVM(ctx context.Context, vappName, id string, cpus, memo
 	if err != nil {
 		return cloud.VM{}, err
 	}
-	vapp, err := vdc.GetVAppByName(vappName, true)
+	vapp, err := vdc.GetVAppByName(p.placement.VApp, true)
 	if err != nil {
-		return cloud.VM{}, fmt.Errorf("get vApp %q: %w", vappName, err)
+		return cloud.VM{}, fmt.Errorf("get vApp %q: %w", p.placement.VApp, err)
 	}
 	vm, err := vapp.GetVMById(id, true)
 	if err != nil {
@@ -723,19 +754,19 @@ func systemDiskGB(vm *govcd.VM) int32 {
 
 // AddPoolMember adds ip to an NSX-V edge load-balancer pool. It is
 // idempotent: an address that is already a member is left untouched.
-func (p *Provider) AddPoolMember(ctx context.Context, pool cloud.PoolRef, ip string) error {
+func (p *Pool) AddPoolMember(ctx context.Context, pool cloud.PoolRef, ip string) error {
 	return p.updatePoolMember(ctx, pool, ip, true)
 }
 
 // RemovePoolMember removes ip from an NSX-V edge load-balancer pool.
-func (p *Provider) RemovePoolMember(ctx context.Context, pool cloud.PoolRef, ip string) error {
+func (p *Pool) RemovePoolMember(ctx context.Context, pool cloud.PoolRef, ip string) error {
 	return p.updatePoolMember(ctx, pool, ip, false)
 }
 
 // updatePoolMember edits one member of an NSX-V server pool. The whole pool is
 // PUT back (that is the NSX-V API shape), so the update starts from the pool as
 // the edge currently reports it: members added by Terraform or by hand survive.
-func (p *Provider) updatePoolMember(ctx context.Context, pool cloud.PoolRef, ip string, add bool) error {
+func (p *Pool) updatePoolMember(ctx context.Context, pool cloud.PoolRef, ip string, add bool) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -813,7 +844,7 @@ func poolMemberName(ip string) string {
 }
 
 // edgeGateway resolves the NSX-V edge that owns a load-balancer pool.
-func (p *Provider) edgeGateway(name string) (*govcd.EdgeGateway, error) {
+func (p *Pool) edgeGateway(name string) (*govcd.EdgeGateway, error) {
 	vdc, err := p.vdc()
 	if err != nil {
 		return nil, err
@@ -878,7 +909,7 @@ func setSystemDiskSize(vm *govcd.VM, sizeGB int32) error {
 
 // vdc resolves the configured org and VDC. The controller is scoped to one
 // org/VDC (the same one Terraform used for the initial cluster).
-func (p *Provider) vdc() (*govcd.Vdc, error) {
+func (p *Pool) vdc() (*govcd.Vdc, error) {
 	org, err := p.client.GetOrgByName(p.cfg.Org)
 	if err != nil {
 		return nil, fmt.Errorf("get org %q: %w", p.cfg.Org, err)
@@ -890,8 +921,8 @@ func (p *Provider) vdc() (*govcd.Vdc, error) {
 	return vdc, nil
 }
 
-func (p *Provider) findTemplate(vdc *govcd.Vdc, spec cloud.CreateVMSpec) (*govcd.VAppTemplate, error) {
-	if strings.TrimSpace(spec.Catalog) == "" {
+func (p *Pool) findTemplate(vdc *govcd.Vdc, spec cloud.CreateVMSpec) (*govcd.VAppTemplate, error) {
+	if strings.TrimSpace(p.placement.Catalog) == "" {
 		tpl, err := vdc.GetVAppTemplateByName(spec.Template)
 		if err != nil {
 			return nil, fmt.Errorf("find template %q in VDC %q: %w", spec.Template, p.cfg.VDC, err)
@@ -906,29 +937,29 @@ func (p *Provider) findTemplate(vdc *govcd.Vdc, spec cloud.CreateVMSpec) (*govcd
 	if err != nil {
 		return nil, fmt.Errorf("get org %q: %w", p.cfg.Org, err)
 	}
-	catalog, err := org.GetCatalogByName(spec.Catalog, true)
+	catalog, err := org.GetCatalogByName(p.placement.Catalog, true)
 	if err != nil {
-		orgName := strings.TrimSpace(spec.CatalogOrg)
+		orgName := strings.TrimSpace(p.placement.CatalogOrg)
 		if orgName == "" || strings.EqualFold(orgName, p.cfg.Org) {
-			return nil, fmt.Errorf("get catalog %q in org %q: %w", spec.Catalog, p.cfg.Org, err)
+			return nil, fmt.Errorf("get catalog %q in org %q: %w", p.placement.Catalog, p.cfg.Org, err)
 		}
 		other, oerr := p.client.GetOrgByName(orgName)
 		if oerr != nil {
 			return nil, fmt.Errorf("get catalog org %q: %w", orgName, oerr)
 		}
-		catalog, err = other.GetCatalogByName(spec.Catalog, true)
+		catalog, err = other.GetCatalogByName(p.placement.Catalog, true)
 		if err != nil {
-			return nil, fmt.Errorf("get catalog %q in org %q: %w", spec.Catalog, orgName, err)
+			return nil, fmt.Errorf("get catalog %q in org %q: %w", p.placement.Catalog, orgName, err)
 		}
 	}
 	tpl, err := catalog.GetVAppTemplateByName(spec.Template)
 	if err != nil {
-		return nil, fmt.Errorf("find template %q in catalog %q: %w", spec.Template, spec.Catalog, err)
+		return nil, fmt.Errorf("find template %q in catalog %q: %w", spec.Template, p.placement.Catalog, err)
 	}
 	return tpl, nil
 }
 
-func (p *Provider) vmInfo(vm *govcd.VM, selector map[string]string) (*cloud.VM, error) {
+func (p *Pool) vmInfo(vm *govcd.VM, selector map[string]string) (*cloud.VM, error) {
 	if vm == nil || vm.VM == nil {
 		return nil, nil
 	}
@@ -1056,7 +1087,7 @@ func configureCompute(vm *govcd.VM, spec cloud.CreateVMSpec) error {
 	return nil
 }
 
-func (p *Provider) attachDisks(vdc *govcd.Vdc, vm *govcd.VM, specs []cloud.DiskSpec) error {
+func (p *Pool) attachDisks(vdc *govcd.Vdc, vm *govcd.VM, specs []cloud.DiskSpec) error {
 	if len(specs) == 0 {
 		return nil
 	}
@@ -1224,10 +1255,6 @@ func validateCreateVMSpec(spec cloud.CreateVMSpec) error {
 		return errors.New("VM name is empty")
 	case strings.TrimSpace(spec.IP) == "":
 		return errors.New("VM IP is empty")
-	case strings.TrimSpace(spec.VApp) == "":
-		return errors.New("vApp name is empty")
-	case strings.TrimSpace(spec.OrgNetwork) == "":
-		return errors.New("org network is empty")
 	case strings.TrimSpace(spec.Template) == "":
 		return errors.New("template is empty")
 	case spec.CPUs <= 0:

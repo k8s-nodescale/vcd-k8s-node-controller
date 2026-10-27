@@ -232,6 +232,16 @@ spec:
                 description: NamePrefix is the DNS-safe prefix used to build worker
                   names (e.g. myorg-cluster-prod).
                 type: string
+              provider:
+                default: vcd
+                description: |-
+                  Provider selects the platform that runs this pool's workers: vcd (the
+                  default) or vsphere. The platform block that matches it is required;
+                  the others are ignored.
+                enum:
+                - vcd
+                - vsphere
+                type: string
               provisioning:
                 description: |-
                   Provisioning bounds the window between "the VM exists" and "kubelet has
@@ -388,7 +398,9 @@ spec:
                     type: boolean
                 type: object
               vcd:
-                description: VCD points at the target vCloud Director objects.
+                description: |-
+                  VCD points at the target vCloud Director objects. Required when
+                  spec.provider is vcd (the default), ignored otherwise.
                 properties:
                   catalog:
                     type: string
@@ -421,7 +433,6 @@ spec:
             - ipPlan
             - namePrefix
             - replicas
-            - vcd
             type: object
           status:
             description: K8sWorkerPoolStatus is the observed state.

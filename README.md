@@ -124,7 +124,8 @@ One `K8sWorkerPool` describes the worker set of a single cluster. You own
 | `flavor.osDiskGB` | no | Grows the cloned template's system disk (bus 0/unit 0) before the first power-on. Terraform nodes use `disks_config.osdisk.sizegb`; a clone without this keeps the template size (10 GB on the current Ubuntu template). Shrinking is refused. |
 | `flavor.template` | no | vCD catalog template (must expose `disk.EnableUUID`). |
 | `flavor.disks[]` | no | Data disks: `sizeGB`, `mount` (`/var`, `/var/lib`), `busType`, `busNumber`, `unitNumber`, `storageProfile`. Mirrors Terraform `diskw1` / `diskw2`. |
-| `vcd.org` / `vcd.vdc` / `vcd.vapp` / `vcd.orgNetwork` | yes | Placement of the VM. |
+| `provider` | no | Platform that runs the workers: `vcd` (default) or `vsphere`. The block for the selected platform is required. `vsphere` is a stub: a pool that names it is rejected as `InvalidSpec` instead of half-working. See [Platform providers](#platform-providers). |
+| `vcd.org` / `vcd.vdc` / `vcd.vapp` / `vcd.orgNetwork` | yes* | Placement of the VM. Required when `provider` is `vcd`. |
 | `vcd.catalog` / `vcd.catalogOrg` | no | Catalog holding the template (defaults to the controller org). |
 | `vcd.dvmOffset` | no | Address offset of the deployment VM in Terraform's `ip_plan`; the controller reserves it so no worker gets that address. Only the vCD bootstrap has a DVM. |
 | `ipPlan` | yes | Mirrors Terraform's `ip_plan`: `cidr`, `mNodeOffset`, `wNodeOffset`, `kubeapiLB`, `ingressLB`, `masterCount`, `reserved[]`. Workers are allocated from `wNodeOffset` upwards. |
@@ -149,6 +150,27 @@ One `K8sWorkerPool` describes the worker set of a single cluster. You own
 | `provisioning.timeout` | no | How long a VM may run without its Kubernetes Node before the worker is parked as `Failed` (default `15m`). The VM is kept for inspection and the pool reports `Ready=False`/`WorkerFailed`; a registration that arrives later still promotes the worker to `Ready`. |
 | `capacity.preflight` | no | Read the vDC's free capacity before a create or a resize and park work that cannot fit (default `true`). See [When the vDC is full](#when-the-vdc-is-full). |
 | `capacity.cpuMhzPerCore` | no | MHz per vCPU used for the CPU estimate when the vDC does not report its own speed to the controller account (default `2000`). The admin view of the vDC is read once; a tenant account that cannot read it falls back to this number. |
+
+#### Platform providers
+
+The controller talks to a platform through a narrow contract (`internal/cloud`):
+`WorkerCompute` (list, read, create, delete, power, resize),
+`CapacityReader`, and the optional `PoolMembership`. A `Factory` binds a
+provider to one pool's `Placement`, so no call carries a vApp or network name
+and the platform is a property of the pool, not of the process.
+
+`spec.provider` picks the implementation. `vcd` (the default) is the
+complete one: `internal/cloud/vcd` authenticates once and hands out a provider
+per pool, bound to `spec.vcd`. `vsphere` is a stub in
+`internal/cloud/vsphere`: it satisfies the same contract and refuses every
+call with `cloud.ErrNotImplemented`, so a pool that names it is rejected as
+`InvalidSpec` before anything is created.
+
+vSphere has no load-balancer pool, which is why membership is a separate
+optional interface rather than part of the main contract: a provider that
+cannot edit a pool simply does not implement it, and the controller leaves
+membership to the operator. The vCD provider implements it for NSX-V and
+reports `ErrPoolNotConfigured` for a pool it cannot address (NSX-T today).
 
 `status`:
 
@@ -205,6 +227,7 @@ spec:
         busType: paravirtual
         busNumber: 1
         unitNumber: 1
+  provider: vcd
   vcd:
     org: example-org
     vdc: example-vdc
@@ -245,8 +268,10 @@ spec:
 api/v1alpha1/            CRD Go types, group registration, generated deepcopy
 cmd/manager/             controller-runtime entrypoint
 internal/controller/     WorkerPool reconciler (+ Node watch)
-internal/cloud/          cloud.Provider interface
-internal/cloud/vcd/      govcd-backed implementation
+internal/cloud/          platform contract: WorkerCompute, CapacityReader,
+                         optional PoolMembership, Factory + Placement
+internal/cloud/vcd/      vCloud Director factory + per-pool provider
+internal/cloud/vsphere/  vSphere stub (same contract, ErrNotImplemented)
 internal/kube/           kube.Provider interface + client-go implementation
 internal/ipam/           ip_plan-aware IP ledger/allocator (+ tests)
 internal/cloudinit/      renderer + embedded templates
@@ -699,7 +724,7 @@ the maintenance window matters more than the API.
 
 ## Ownership
 
-The pool owns every VM in `spec.vcd.vApp` whose name starts with
+The pool owns every VM in its placement's vApp whose name starts with
 `<spec.namePrefix>-wrk-`, together with the Node object of each of those
 workers. That is a name-prefix rule, not a metadata rule: a VM created by
 Terraform during the initial bootstrap carries no controller metadata and is
@@ -929,7 +954,7 @@ What this means in practice:
 ## Terraform integration contract
 
 - The Terraform module installs this chart behind a `node_controller.enabled`
-  toggle and pins `chart_version` / `image_tag` (currently `0.7.9`).
+  toggle and pins `chart_version` / `image_tag` (currently `0.8.0`).
 - **Once the controller is enabled, do not use Terraform to manage worker count
   or worker LB pool membership.** Use the CRD instead. The Terraform module's
   README must state this explicitly.
@@ -960,7 +985,7 @@ Build locally (the Dockerfile uses `golang:1.27.1-alpine` and
 `gcr.io/distroless/static:nonroot`):
 
 ```
-docker build -t docker.io/werton13/vcd-k8s-node-controller:0.7.9 .
+docker build -t docker.io/werton13/vcd-k8s-node-controller:0.8.0 .
 ```
 
 Public module defaults are used inside the build. On a restricted network,
@@ -970,14 +995,14 @@ override them:
 docker build \
   --build-arg GOPROXY=https://nexus.example.com/repository/golang/ \
   --build-arg GOSUMDB=off \
-  -t docker.io/werton13/vcd-k8s-node-controller:0.7.9 .
+  -t docker.io/werton13/vcd-k8s-node-controller:0.8.0 .
 ```
 
 Push (or use `make image-push`):
 
 ```
 docker login docker.io
-docker push docker.io/werton13/vcd-k8s-node-controller:0.7.9
+docker push docker.io/werton13/vcd-k8s-node-controller:0.8.0
 docker push docker.io/werton13/vcd-k8s-node-controller:latest
 ```
 

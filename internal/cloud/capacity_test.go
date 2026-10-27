@@ -5,12 +5,12 @@ import (
 	"testing"
 )
 
-func TestVDCCapacityFits(t *testing.T) {
-	base := VDCCapacity{
-		AllocationModel: "AllocationPool",
-		CPUMHzPerCore:   2300,
-		CPU:             ResourceCapacity{Limit: 56000, Used: 46000},
-		MemoryMB:        ResourceCapacity{Limit: 131072, Used: 122880},
+func TestPlatformCapacityFits(t *testing.T) {
+	base := PlatformCapacity{
+		Model:         "AllocationPool",
+		CPUMHzPerCore: 2300,
+		CPU:           ResourceCapacity{Limit: 56000, Used: 46000},
+		MemoryMB:      ResourceCapacity{Limit: 131072, Used: 122880},
 		Storage: []StorageProfileCapacity{
 			{Name: "SAS", Default: true, LimitMB: 1000 * 1024, UsedMB: 990 * 1024},
 		},
@@ -51,16 +51,16 @@ func TestVDCCapacityFits(t *testing.T) {
 	}
 }
 
-func TestVDCCapacityFitsUnbounded(t *testing.T) {
+func TestPlatformCapacityFitsUnbounded(t *testing.T) {
 	// Pay-as-you-go and flex report Limit 0: nothing to refuse.
-	var c VDCCapacity
+	var c PlatformCapacity
 	if ok, why := c.Fits(CapacityRequest{CPUs: 64, MemoryMB: 1 << 20, StorageMB: map[string]int64{"": 1 << 30}}, 2300); !ok {
 		t.Fatalf("an uncapped vDC must accept anything, got %q", why)
 	}
 }
 
-func TestVDCCapacityStorageProfile(t *testing.T) {
-	c := VDCCapacity{Storage: []StorageProfileCapacity{
+func TestPlatformCapacityStorageProfile(t *testing.T) {
+	c := PlatformCapacity{Storage: []StorageProfileCapacity{
 		{Name: "SAS", Default: true, LimitMB: 100},
 		{Name: "SSD", LimitMB: 200},
 	}}
@@ -73,7 +73,7 @@ func TestVDCCapacityStorageProfile(t *testing.T) {
 	if _, ok := c.StorageProfile("nope"); ok {
 		t.Fatal("an unknown profile must not resolve")
 	}
-	single := VDCCapacity{Storage: []StorageProfileCapacity{{Name: "ONLY", LimitMB: 1}}}
+	single := PlatformCapacity{Storage: []StorageProfileCapacity{{Name: "ONLY", LimitMB: 1}}}
 	if sp, ok := single.StorageProfile(""); !ok || sp.Name != "ONLY" {
 		t.Fatalf("a single profile is the default even without the flag: %#v %v", sp, ok)
 	}

@@ -94,8 +94,18 @@ type K8sWorkerPoolSpec struct {
 	// resize candidate (see spec.rollout).
 	Flavor NodeFlavor `json:"flavor"`
 
-	// VCD points at the target vCloud Director objects.
-	VCD VCDRef `json:"vcd"`
+	// Provider selects the platform that runs this pool's workers: vcd (the
+	// default) or vsphere. The platform block that matches it is required;
+	// the others are ignored.
+	// +kubebuilder:validation:Enum=vcd;vsphere
+	// +kubebuilder:default=vcd
+	// +optional
+	Provider string `json:"provider,omitempty"`
+
+	// VCD points at the target vCloud Director objects. Required when
+	// spec.provider is vcd (the default), ignored otherwise.
+	// +optional
+	VCD *VCDRef `json:"vcd,omitempty"`
 
 	// IPPlan mirrors the Terraform ip_plan variable so the controller
 	// never collides with Terraform-managed infrastructure or reserved VIPs.

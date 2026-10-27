@@ -5,6 +5,8 @@ import (
 	"os"
 	"testing"
 	"time"
+
+	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/cloud"
 )
 
 // TestLiveListWorkerVMs is a read-only smoke test against a real tenant. It is
@@ -20,7 +22,7 @@ func TestLiveListWorkerVMs(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	p, err := New(Config{
+	client, err := New(Config{
 		URL:      os.Getenv("VCD_URL"),
 		User:     os.Getenv("VCD_USER"),
 		Password: os.Getenv("VCD_PASSWORD"),
@@ -36,10 +38,17 @@ func TestLiveListWorkerVMs(t *testing.T) {
 	if vapp == "" {
 		t.Fatal("VCD_VAPP is not set")
 	}
+	prov, err := client.For(cloud.Placement{
+		Provider: cloud.ProviderVCD,
+		VCD:      &cloud.VCDPlacement{VApp: vapp},
+	})
+	if err != nil {
+		t.Fatalf("placement: %v", err)
+	}
 
 	// Empty selector lists every VM, exercising metadata, primary IP parsing
 	// and resource extraction against real data.
-	vms, err := p.ListWorkerVMs(ctx, vapp, nil)
+	vms, err := prov.ListWorkerVMs(ctx, nil)
 	if err != nil {
 		t.Fatalf("ListWorkerVMs(%q): %v", vapp, err)
 	}

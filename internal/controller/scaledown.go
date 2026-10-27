@@ -225,6 +225,10 @@ func (r *WorkerPoolReconciler) runDeletions(ctx context.Context, pool *infrav1.K
 // detach wait -> power off -> node delete -> VM delete -> IP release.
 func (r *WorkerPoolReconciler) deleteWorkerStep(ctx context.Context, pool *infrav1.K8sWorkerPool, alloc *ipam.Allocator, idx int, req deletionRequest) (bool, ctrl.Result, error) {
 	logger := log.FromContext(ctx)
+	prov, perr := r.platform(pool)
+	if perr != nil {
+		return false, ctrl.Result{}, perr
+	}
 	node := &pool.Status.Nodes[idx]
 
 	// Every Kubernetes call below uses kubeName, never node.Name: name is the
@@ -442,7 +446,7 @@ func (r *WorkerPoolReconciler) deleteWorkerStep(ctx context.Context, pool *infra
 		// while kubelet still runs is re-registered within seconds, so the
 		// worker comes back as a NotReady corpse that nothing owns and whose
 		// pods are never garbage collected.
-		if err := r.Cloud.PowerOffVM(ctx, pool.Spec.VCD.VApp, node.ProviderID); err != nil {
+		if err := prov.PowerOffVM(ctx, node.ProviderID); err != nil {
 			node.Message = "VM power-off failed: " + err.Error()
 			return false, ctrl.Result{}, err
 		}
@@ -452,7 +456,7 @@ func (r *WorkerPoolReconciler) deleteWorkerStep(ctx context.Context, pool *infra
 				return false, ctrl.Result{}, err
 			}
 		}
-		if err := r.Cloud.DeleteVM(ctx, pool.Spec.VCD.VApp, node.ProviderID); err != nil {
+		if err := prov.DeleteVM(ctx, node.ProviderID); err != nil {
 			node.Message = "VM deletion failed: " + err.Error()
 			return false, ctrl.Result{}, err
 		}
@@ -647,7 +651,14 @@ func (r *WorkerPoolReconciler) removeFromIngressPool(ctx context.Context, pool *
 	if strings.TrimSpace(pool.Spec.IngressPool.Name) == "" || ip == "" {
 		return nil
 	}
-	return r.Cloud.RemovePoolMember(ctx, toPoolRef(pool), ip)
+	m, err := r.membership(pool)
+	if err != nil {
+		return err
+	}
+	if m == nil {
+		return nil
+	}
+	return m.RemovePoolMember(ctx, toPoolRef(pool), ip)
 }
 
 func toPoolRef(pool *infrav1.K8sWorkerPool) cloud.PoolRef {

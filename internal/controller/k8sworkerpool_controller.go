@@ -47,14 +47,15 @@ const (
 type WorkerPoolReconciler struct {
 	client.Client
 	Scheme   *runtime.Scheme
-	Cloud    cloud.Provider
+	Cloud    cloud.Factory
 	Kube     kube.Provider
 	Renderer *cloudinit.Renderer
 	Recorder record.EventRecorder
 
-	// Org and VDC are the vCD org/VDC the cloud provider is authenticated
+	// Org and VDC are the vCD org/VDC the vCD factory is authenticated
 	// against (VCD_ORG/VCD_VDC). They are used to reject a CR whose
 	// spec.vcd.org/vdc points somewhere else instead of silently ignoring it.
+	// They are empty for another platform.
 	Org string
 	VDC string
 
@@ -167,10 +168,16 @@ func (r *WorkerPoolReconciler) reconcile(ctx context.Context, before, pool *infr
 		return ctrl.Result{RequeueAfter: requeueInvalidSpec}, nil
 	}
 
-	// List the whole vApp and match by name prefix: VMs adopted from the
-	// Terraform baseline have no controller metadata, and the vApp is shared
+	prov, perr := r.platform(pool)
+	if perr != nil {
+		r.setCondition(pool, metav1.ConditionFalse, "CloudError", perr.Error())
+		return ctrl.Result{}, perr
+	}
+
+	// List the whole pool and match by name prefix: VMs adopted from the
+	// Terraform baseline have no controller metadata, and the pool is shared
 	// with the masters and DVM.
-	all, err := r.Cloud.ListWorkerVMs(ctx, pool.Spec.VCD.VApp, nil)
+	all, err := prov.ListWorkerVMs(ctx, nil)
 	if err != nil {
 		r.setCondition(pool, metav1.ConditionFalse, "CloudError", err.Error())
 		return ctrl.Result{}, err
@@ -350,7 +357,17 @@ func (r *WorkerPoolReconciler) ensureIngressPool(ctx context.Context, pool *infr
 	if pool.Spec.IngressPool.Name == "" || st.IP == "" {
 		return
 	}
-	if err := r.Cloud.AddPoolMember(ctx, toPoolRef(pool), st.IP); err != nil {
+	m, merr := r.membership(pool)
+	if merr != nil {
+		log.FromContext(ctx).Error(merr, "resolve the ingress pool provider", "worker", st.Name, "ip", st.IP)
+		r.eventf(pool, corev1.EventTypeWarning, "IngressPoolFailed",
+			fmt.Sprintf("worker %s (%s) is Ready but the ingress pool could not be resolved: %v", st.Name, st.IP, merr))
+		return
+	}
+	if m == nil {
+		return
+	}
+	if err := m.AddPoolMember(ctx, toPoolRef(pool), st.IP); err != nil {
 		if errors.Is(err, cloud.ErrPoolNotConfigured) {
 			return
 		}
@@ -637,6 +654,45 @@ func (r *WorkerPoolReconciler) setCondition(pool *infrav1.K8sWorkerPool, status 
 	})
 }
 
+// platform returns the provider for this pool, bound to its placement. The
+// factory is the only thing the reconciler knows about the platform, so a pool
+// that names another implementation is served by that implementation.
+func (r *WorkerPoolReconciler) platform(pool *infrav1.K8sWorkerPool) (cloud.Provider, error) {
+	return r.Cloud.For(placementFor(pool))
+}
+
+// membership returns the load-balancer half of the pool's provider. It is nil
+// when the platform has no pool the controller can address, and callers then
+// leave membership to the operator.
+func (r *WorkerPoolReconciler) membership(pool *infrav1.K8sWorkerPool) (cloud.PoolMembership, error) {
+	prov, err := r.platform(pool)
+	if err != nil {
+		return nil, err
+	}
+	m, _ := prov.(cloud.PoolMembership)
+	return m, nil
+}
+
+// placementFor maps a pool's CR onto the provider-neutral placement the factory
+// takes. An empty spec.provider means vcd, which is what the CRD defaults it to.
+func placementFor(pool *infrav1.K8sWorkerPool) cloud.Placement {
+	pl := cloud.Placement{Provider: strings.ToLower(strings.TrimSpace(pool.Spec.Provider))}
+	if pl.Provider == "" {
+		pl.Provider = cloud.ProviderVCD
+	}
+	if v := pool.Spec.VCD; v != nil {
+		pl.VCD = &cloud.VCDPlacement{
+			Org:        v.Org,
+			VDC:        v.VDC,
+			VApp:       v.VApp,
+			OrgNetwork: v.OrgNetwork,
+			Catalog:    v.Catalog,
+			CatalogOrg: v.CatalogOrg,
+		}
+	}
+	return pl
+}
+
 // validateSpec rejects values the controller would otherwise silently ignore
 // (org/vdc come from the process environment) or that cannot produce a working
 // worker (no template, no join endpoint).
@@ -648,20 +704,31 @@ func (r *WorkerPoolReconciler) validateSpec(pool *infrav1.K8sWorkerPool) string 
 		return "spec.bootstrap.osUser is required"
 	case strings.TrimSpace(pool.Spec.Bootstrap.K8sMinorRepo) == "":
 		return "spec.bootstrap.k8sMinorRepo is required"
-	case strings.TrimSpace(pool.Spec.VCD.VApp) == "":
-		return "spec.vcd.vapp is required"
-	case strings.TrimSpace(pool.Spec.VCD.OrgNetwork) == "":
-		return "spec.vcd.orgNetwork is required"
 	case strings.TrimSpace(pool.Spec.Flavor.Template) == "":
 		return "spec.flavor.template is required"
 	case strings.TrimSpace(pool.Spec.Join.Endpoint) == "":
 		return "spec.join.endpoint is required"
 	}
-	if r.Org != "" && pool.Spec.VCD.Org != "" && !strings.EqualFold(r.Org, pool.Spec.VCD.Org) {
-		return fmt.Sprintf("spec.vcd.org %q does not match the controller org %q (VCD_ORG)", pool.Spec.VCD.Org, r.Org)
-	}
-	if r.VDC != "" && pool.Spec.VCD.VDC != "" && !strings.EqualFold(r.VDC, pool.Spec.VCD.VDC) {
-		return fmt.Sprintf("spec.vcd.vdc %q does not match the controller VDC %q (VCD_VDC)", pool.Spec.VCD.VDC, r.VDC)
+	switch strings.ToLower(strings.TrimSpace(pool.Spec.Provider)) {
+	case "", cloud.ProviderVCD:
+		switch {
+		case pool.Spec.VCD == nil:
+			return "spec.vcd is required when spec.provider is vcd"
+		case strings.TrimSpace(pool.Spec.VCD.VApp) == "":
+			return "spec.vcd.vapp is required"
+		case strings.TrimSpace(pool.Spec.VCD.OrgNetwork) == "":
+			return "spec.vcd.orgNetwork is required"
+		}
+		if r.Org != "" && pool.Spec.VCD.Org != "" && !strings.EqualFold(r.Org, pool.Spec.VCD.Org) {
+			return fmt.Sprintf("spec.vcd.org %q does not match the controller org %q (VCD_ORG)", pool.Spec.VCD.Org, r.Org)
+		}
+		if r.VDC != "" && pool.Spec.VCD.VDC != "" && !strings.EqualFold(r.VDC, pool.Spec.VCD.VDC) {
+			return fmt.Sprintf("spec.vcd.vdc %q does not match the controller VDC %q (VCD_VDC)", pool.Spec.VCD.VDC, r.VDC)
+		}
+	case cloud.ProviderVSphere:
+		return "spec.provider vsphere is a stub: the vSphere provider is not implemented yet, only vcd is"
+	default:
+		return fmt.Sprintf("spec.provider %q is not supported (vcd)", pool.Spec.Provider)
 	}
 	if pool.Spec.ScaleDown.AllowLastWorker && pool.Spec.ScaleDown.MinReplicas > 0 {
 		return "spec.scaleDown.allowLastWorker requires spec.scaleDown.minReplicas: 0: the flag could never be honoured while the floor is higher"
@@ -844,6 +911,10 @@ func (r *WorkerPoolReconciler) scaleUp(ctx context.Context, before, pool *infrav
 // so is anything the controller did not create itself.
 func (r *WorkerPoolReconciler) resumeInterruptedCreates(ctx context.Context, pool *infrav1.K8sWorkerPool, alloc *ipam.Allocator) (bool, error) {
 	logger := log.FromContext(ctx)
+	prov, perr := r.platform(pool)
+	if perr != nil {
+		return false, perr
+	}
 
 	for i := range pool.Status.Nodes {
 		n := &pool.Status.Nodes[i]
@@ -852,7 +923,7 @@ func (r *WorkerPoolReconciler) resumeInterruptedCreates(ctx context.Context, poo
 			n.BootstrapTokenID != "" {
 			continue
 		}
-		vm, err := r.Cloud.GetVM(ctx, pool.Spec.VCD.VApp, n.ProviderID)
+		vm, err := prov.GetVM(ctx, n.ProviderID)
 		if err != nil {
 			if errors.Is(err, cloud.ErrVMNotFound) {
 				// mergeMissingSlots and AutoHeal own a slot whose VM is gone.
@@ -905,6 +976,10 @@ func (r *WorkerPoolReconciler) resumeInterruptedCreates(ctx context.Context, poo
 // afternoon).
 func (r *WorkerPoolReconciler) createWorker(ctx context.Context, pool *infrav1.K8sWorkerPool, alloc *ipam.Allocator, name, ip string) (cloud.VM, string, error) {
 	logger := log.FromContext(ctx)
+	prov, perr := r.platform(pool)
+	if perr != nil {
+		return cloud.VM{}, "", perr
+	}
 
 	ttl := pool.Spec.Join.TokenTTL.Duration
 	if ttl <= 0 {
@@ -964,13 +1039,9 @@ func (r *WorkerPoolReconciler) createWorker(ctx context.Context, pool *infrav1.K
 		return release(fmt.Errorf("render bootstrap for %s: %w", name, err))
 	}
 
-	vm, err := r.Cloud.CreateVM(ctx, cloud.CreateVMSpec{
+	vm, err := prov.CreateVM(ctx, cloud.CreateVMSpec{
 		Name:       name,
 		IP:         ip,
-		VApp:       pool.Spec.VCD.VApp,
-		OrgNetwork: pool.Spec.VCD.OrgNetwork,
-		Catalog:    pool.Spec.VCD.Catalog,
-		CatalogOrg: pool.Spec.VCD.CatalogOrg,
 		Template:   pool.Spec.Flavor.Template,
 		CPUs:       pool.Spec.Flavor.CPUs,
 		MemoryMB:   pool.Spec.Flavor.MemoryMB,
@@ -1016,8 +1087,12 @@ func ownedWorkerVMs(pool *infrav1.K8sWorkerPool, vms []cloud.VM) []cloud.VM {
 // reserveUnlessGone keeps the address when a VM survived a failed create and
 // frees it otherwise, so repeated failures cannot leak the worker range.
 func (r *WorkerPoolReconciler) reserveUnlessGone(ctx context.Context, pool *infrav1.K8sWorkerPool, alloc *ipam.Allocator, ip, name string, cause error) error {
+	prov, perr := r.platform(pool)
+	if perr != nil {
+		return perr
+	}
 	exists := true // assume the worst when the lookup fails
-	if vms, err := r.Cloud.ListWorkerVMs(ctx, pool.Spec.VCD.VApp, nil); err == nil {
+	if vms, err := prov.ListWorkerVMs(ctx, nil); err == nil {
 		exists = false
 		for _, vm := range vms {
 			if vm.Name == name {
@@ -1129,12 +1204,16 @@ func buildJoinCommand(endpoint, token, caHash string) (string, error) {
 	return fmt.Sprintf("kubeadm join %s --token %s --discovery-token-ca-cert-hash %s", endpoint, token, caHash), nil
 }
 
-func toIPAMPlan(p infrav1.IPPlan, v infrav1.VCDRef) ipam.Plan {
+func toIPAMPlan(p infrav1.IPPlan, v *infrav1.VCDRef) ipam.Plan {
+	dvm := 0
+	if v != nil {
+		dvm = v.DVMOffset
+	}
 	return ipam.Plan{
 		CIDR:        p.CIDR,
 		MNodeOffset: p.MNodeOffset,
 		WNodeOffset: p.WNodeOffset,
-		DVMOffset:   v.DVMOffset,
+		DVMOffset:   dvm,
 		KubeAPILB:   p.KubeAPILB,
 		IngressLB:   p.IngressLB,
 		MasterCount: p.MasterCount,

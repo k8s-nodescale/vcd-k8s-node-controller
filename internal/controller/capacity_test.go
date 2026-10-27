@@ -15,8 +15,8 @@ import (
 )
 
 // fullMemory is a vDC with no room for another test worker.
-func fullMemory() cloud.VDCCapacity {
-	return cloud.VDCCapacity{MemoryMB: cloud.ResourceCapacity{Limit: 4096, Used: 4096}}
+func fullMemory() cloud.PlatformCapacity {
+	return cloud.PlatformCapacity{MemoryMB: cloud.ResourceCapacity{Limit: 4096, Used: 4096}}
 }
 
 func TestScaleUpQueuesWhenCapacityIsShort(t *testing.T) {
@@ -184,7 +184,7 @@ func rolloutPool(t *testing.T) (*infrav1.K8sWorkerPool, *fakeCloud, *fakeKube) {
 func TestRolloutQueuesWhenCapacityIsShort(t *testing.T) {
 	ctx := context.Background()
 	pool, fc, fk := rolloutPool(t)
-	fc.capacity = cloud.VDCCapacity{MemoryMB: cloud.ResourceCapacity{Limit: 8192, Used: 8192}}
+	fc.capacity = cloud.PlatformCapacity{MemoryMB: cloud.ResourceCapacity{Limit: 8192, Used: 8192}}
 	r := newTestReconciler(t, fc, fk, pool)
 
 	if _, err := r.Reconcile(ctx, requestFor(pool)); err != nil {
@@ -213,7 +213,7 @@ func TestRolloutChecksTheDeltaNotTheWholeFlavor(t *testing.T) {
 	ctx := context.Background()
 	pool, fc, fk := rolloutPool(t)
 	// Free memory covers the 4096 MB the resize adds, but not another 8192.
-	fc.capacity = cloud.VDCCapacity{MemoryMB: cloud.ResourceCapacity{Limit: 12288, Used: 8192}}
+	fc.capacity = cloud.PlatformCapacity{MemoryMB: cloud.ResourceCapacity{Limit: 12288, Used: 8192}}
 	r := newTestReconciler(t, fc, fk, pool)
 
 	if _, err := r.Reconcile(ctx, requestFor(pool)); err != nil {

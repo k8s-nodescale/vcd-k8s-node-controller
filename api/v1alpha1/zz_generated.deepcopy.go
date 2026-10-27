@@ -233,7 +233,11 @@ func (in *K8sWorkerPoolSpec) DeepCopyInto(out *K8sWorkerPoolSpec) {
 	*out = *in
 	in.Bootstrap.DeepCopyInto(&out.Bootstrap)
 	in.Flavor.DeepCopyInto(&out.Flavor)
-	out.VCD = in.VCD
+	if in.VCD != nil {
+		in, out := &in.VCD, &out.VCD
+		*out = new(VCDRef)
+		**out = **in
+	}
 	in.IPPlan.DeepCopyInto(&out.IPPlan)
 	in.Join.DeepCopyInto(&out.Join)
 	out.IngressPool = in.IngressPool

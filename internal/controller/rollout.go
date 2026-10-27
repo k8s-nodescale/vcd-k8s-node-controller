@@ -235,7 +235,11 @@ func (r *WorkerPoolReconciler) reconcileRollout(ctx context.Context, pool *infra
 	}
 	queuedWhy := ""
 	if len(start) > 0 && capacityPreflightEnabled(pool) {
-		capacity, err := r.Cloud.Capacity(ctx)
+		prov, perr := r.platform(pool)
+		if perr != nil {
+			return false, ctrl.Result{}, perr
+		}
+		capacity, err := prov.Capacity(ctx)
 		switch {
 		case err != nil:
 			logger.V(1).Info("capacity pre-flight skipped: the vDC capacity could not be read",
@@ -365,6 +369,10 @@ func (r *WorkerPoolReconciler) advanceResize(ctx context.Context, pool *infrav1.
 	if kubeName == "" {
 		kubeName = strings.ToLower(n.Name)
 	}
+	prov, perr := r.platform(pool)
+	if perr != nil {
+		return perr
+	}
 
 	switch n.Resize.Phase {
 	case resizePhaseCordoned, "":
@@ -421,7 +429,7 @@ func (r *WorkerPoolReconciler) advanceResize(ctx context.Context, pool *infrav1.
 		// conflict re-drove can find the resize already finished, and a VM that
 		// already carries the target shape must not be power-cycled again
 		// (I-10).
-		vm, err := r.Cloud.GetVM(ctx, pool.Spec.VCD.VApp, n.ProviderID)
+		vm, err := prov.GetVM(ctx, n.ProviderID)
 		if err != nil {
 			return fmt.Errorf("read %s: %w", n.Name, err)
 		}
@@ -429,7 +437,7 @@ func (r *WorkerPoolReconciler) advanceResize(ctx context.Context, pool *infrav1.
 		if compareFlavor(have, target) == flavorEqual {
 			n.Flavor = have
 			if !vm.PoweredOn {
-				if err := r.Cloud.PowerOnVM(ctx, pool.Spec.VCD.VApp, n.ProviderID); err != nil {
+				if err := prov.PowerOnVM(ctx, n.ProviderID); err != nil {
 					return fmt.Errorf("power on %s: %w", n.Name, err)
 				}
 			}
@@ -439,7 +447,7 @@ func (r *WorkerPoolReconciler) advanceResize(ctx context.Context, pool *infrav1.
 			return nil
 		}
 		if vm.PoweredOn {
-			if err := r.Cloud.PowerOffVM(ctx, pool.Spec.VCD.VApp, n.ProviderID); err != nil {
+			if err := prov.PowerOffVM(ctx, n.ProviderID); err != nil {
 				return fmt.Errorf("stop %s: %w", n.Name, err)
 			}
 		}
@@ -454,24 +462,24 @@ func (r *WorkerPoolReconciler) advanceResize(ctx context.Context, pool *infrav1.
 		// the target shape (I-17). vCD resizes a stopped VM only, so a VM that
 		// something started again is stopped first instead of failing the slot
 		// (I-10).
-		vm, err := r.Cloud.GetVM(ctx, pool.Spec.VCD.VApp, n.ProviderID)
+		vm, err := prov.GetVM(ctx, n.ProviderID)
 		if err != nil {
 			return fmt.Errorf("read %s: %w", n.Name, err)
 		}
 		have := &infrav1.FlavorStatus{CPUs: vm.CPU, MemoryMB: vm.MemoryMB, OSDiskGB: vm.OSDiskGB}
 		if compareFlavor(have, target) != flavorEqual {
 			if vm.PoweredOn {
-				if err := r.Cloud.PowerOffVM(ctx, pool.Spec.VCD.VApp, n.ProviderID); err != nil {
+				if err := prov.PowerOffVM(ctx, n.ProviderID); err != nil {
 					return fmt.Errorf("stop %s: %w", n.Name, err)
 				}
 				n.Resize.Message = "powered off again; resizing in the next pass"
 				n.Message = n.Resize.Message
 				return nil
 			}
-			resized, err := r.Cloud.ResizeVM(ctx, pool.Spec.VCD.VApp, n.ProviderID, target.CPUs, target.MemoryMB, target.OSDiskGB)
+			resized, err := prov.ResizeVM(ctx, n.ProviderID, target.CPUs, target.MemoryMB, target.OSDiskGB)
 			if err != nil {
 				if errors.Is(err, cloud.ErrPoweredOn) {
-					if perr := r.Cloud.PowerOffVM(ctx, pool.Spec.VCD.VApp, n.ProviderID); perr != nil {
+					if perr := prov.PowerOffVM(ctx, n.ProviderID); perr != nil {
 						return fmt.Errorf("stop %s: %w", n.Name, perr)
 					}
 					n.Resize.Message = "the VM was running; powered off and resizing in the next pass"
@@ -490,7 +498,7 @@ func (r *WorkerPoolReconciler) advanceResize(ctx context.Context, pool *infrav1.
 			}
 		}
 		if !vm.PoweredOn {
-			if err := r.Cloud.PowerOnVM(ctx, pool.Spec.VCD.VApp, n.ProviderID); err != nil {
+			if err := prov.PowerOnVM(ctx, n.ProviderID); err != nil {
 				return fmt.Errorf("power on %s: %w", n.Name, err)
 			}
 		}
@@ -556,16 +564,22 @@ func (r *WorkerPoolReconciler) finishResize(ctx context.Context, pool *infrav1.K
 	if err := r.Kube.Uncordon(ctx, kubeName); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("uncordon %s: %w", kubeName, err)
 	}
-	if err := r.Cloud.AddPoolMember(ctx, toPoolRef(pool), n.IP); err != nil && !errors.Is(err, cloud.ErrPoolNotConfigured) {
-		msg := fmt.Sprintf("resized and in service; waiting for the ingress pool: %v", err)
-		if n.Resize.Message != msg {
-			log.FromContext(ctx).Error(err, "add the worker back to the ingress pool", "worker", n.Name, "ip", n.IP)
-			r.eventf(pool, corev1.EventTypeWarning, "IngressPoolFailed",
-				fmt.Sprintf("worker %s (%s) is back in service but not in the ingress pool: %v", n.Name, n.IP, err))
+	m, merr := r.membership(pool)
+	if merr != nil {
+		return merr
+	}
+	if m != nil {
+		if err := m.AddPoolMember(ctx, toPoolRef(pool), n.IP); err != nil && !errors.Is(err, cloud.ErrPoolNotConfigured) {
+			msg := fmt.Sprintf("resized and in service; waiting for the ingress pool: %v", err)
+			if n.Resize.Message != msg {
+				log.FromContext(ctx).Error(err, "add the worker back to the ingress pool", "worker", n.Name, "ip", n.IP)
+				r.eventf(pool, corev1.EventTypeWarning, "IngressPoolFailed",
+					fmt.Sprintf("worker %s (%s) is back in service but not in the ingress pool: %v", n.Name, n.IP, err))
+			}
+			n.Resize.Message = msg
+			n.Message = msg
+			return nil
 		}
-		n.Resize.Message = msg
-		n.Message = msg
-		return nil
 	}
 	n.Resize = nil
 	n.Phase = infrav1.NodePhaseReady

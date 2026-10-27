@@ -6,6 +6,7 @@ metadata:
 spec:
   replicas: 2
   namePrefix: myorg-cluster-prod
+  provider: vcd
   bootstrap:
     osUser: ubuntu
     osPasswordHash: "$6$REPLACE_WITH_HASH"

@@ -24,7 +24,7 @@ import (
 
 type fakeCloud struct {
 	vms             []cloud.VM
-	capacity        cloud.VDCCapacity
+	capacity        cloud.PlatformCapacity
 	capacityErr     error
 	capacityCalls   int
 	created         []cloud.CreateVMSpec
@@ -44,7 +44,11 @@ type fakeCloud struct {
 	failAfterCreate bool
 }
 
-func (f *fakeCloud) ListWorkerVMs(ctx context.Context, vapp string, selector map[string]string) ([]cloud.VM, error) {
+// For makes the fake a cloud.Factory: one fake serves every pool, whatever
+// placement the pool names.
+func (f *fakeCloud) For(cloud.Placement) (cloud.Provider, error) { return f, nil }
+
+func (f *fakeCloud) ListWorkerVMs(ctx context.Context, selector map[string]string) ([]cloud.VM, error) {
 	out := make([]cloud.VM, len(f.vms))
 	copy(out, f.vms)
 	return out, nil
@@ -98,10 +102,10 @@ func (f *fakeCloud) CreateVM(ctx context.Context, spec cloud.CreateVMSpec) (clou
 
 // Capacity mirrors the provider. A zero limit means the vDC does not cap the
 // category, so a test that does not care about capacity gets an unlimited one.
-func (f *fakeCloud) Capacity(ctx context.Context) (cloud.VDCCapacity, error) {
+func (f *fakeCloud) Capacity(ctx context.Context) (cloud.PlatformCapacity, error) {
 	f.capacityCalls++
 	if f.capacityErr != nil {
-		return cloud.VDCCapacity{}, f.capacityErr
+		return cloud.PlatformCapacity{}, f.capacityErr
 	}
 	return f.capacity, nil
 }
@@ -132,7 +136,7 @@ func (f *fakeCloud) consume(spec cloud.CreateVMSpec) {
 }
 
 // GetVM mirrors the provider contract: a VM that is gone is ErrVMNotFound.
-func (f *fakeCloud) GetVM(ctx context.Context, vappName, id string) (cloud.VM, error) {
+func (f *fakeCloud) GetVM(ctx context.Context, id string) (cloud.VM, error) {
 	for i := range f.vms {
 		if f.vms[i].ID == id {
 			return f.vms[i], nil
@@ -150,7 +154,7 @@ func (f *fakeCloud) setPowered(id string, on bool) {
 	}
 }
 
-func (f *fakeCloud) PowerOffVM(ctx context.Context, vappName, id string) error {
+func (f *fakeCloud) PowerOffVM(ctx context.Context, id string) error {
 	f.poweredOff = append(f.poweredOff, id)
 	f.setPowered(id, false)
 	if f.events != nil {
@@ -159,7 +163,7 @@ func (f *fakeCloud) PowerOffVM(ctx context.Context, vappName, id string) error {
 	return nil
 }
 
-func (f *fakeCloud) DeleteVM(ctx context.Context, vappName, id string) error {
+func (f *fakeCloud) DeleteVM(ctx context.Context, id string) error {
 	f.deleted = append(f.deleted, id)
 	if f.events != nil {
 		*f.events = append(*f.events, "cloud:deletevm "+id)
@@ -173,7 +177,7 @@ func (f *fakeCloud) DeleteVM(ctx context.Context, vappName, id string) error {
 	f.vms = kept
 	return nil
 }
-func (f *fakeCloud) PowerOnVM(ctx context.Context, vappName, id string) error {
+func (f *fakeCloud) PowerOnVM(ctx context.Context, id string) error {
 	f.poweredOn = append(f.poweredOn, id)
 	f.setPowered(id, true)
 	if f.events != nil {
@@ -182,7 +186,7 @@ func (f *fakeCloud) PowerOnVM(ctx context.Context, vappName, id string) error {
 	return nil
 }
 
-func (f *fakeCloud) CycleVM(ctx context.Context, vappName, id string) error {
+func (f *fakeCloud) CycleVM(ctx context.Context, id string) error {
 	f.cycles = append(f.cycles, id)
 	if f.events != nil {
 		*f.events = append(*f.events, "cloud:cycle "+id)
@@ -190,7 +194,7 @@ func (f *fakeCloud) CycleVM(ctx context.Context, vappName, id string) error {
 	return nil
 }
 
-func (f *fakeCloud) ResizeVM(ctx context.Context, vappName, id string, cpus, memoryMB, osDiskGB int32) (cloud.VM, error) {
+func (f *fakeCloud) ResizeVM(ctx context.Context, id string, cpus, memoryMB, osDiskGB int32) (cloud.VM, error) {
 	f.resizes = append(f.resizes, id)
 	if f.failResize {
 		return cloud.VM{}, errors.New("injected resize failure")
@@ -363,7 +367,7 @@ func testPool(replicas int32) *infrav1.K8sWorkerPool {
 				Template: "ubuntu",
 				Disks:    []infrav1.DiskSpec{{SizeGB: 10, Mount: "/var", BusNumber: 1, UnitNumber: 0}},
 			},
-			VCD: infrav1.VCDRef{
+			VCD: &infrav1.VCDRef{
 				Org: "myorg", VDC: "My-VDC", VApp: "vapp",
 				OrgNetwork: "net", Catalog: "Templates", DVMOffset: -3,
 			},

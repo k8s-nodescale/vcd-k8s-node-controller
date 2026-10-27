@@ -30,7 +30,7 @@ func capacityPreflightEnabled(pool *infrav1.K8sWorkerPool) bool {
 
 // cpuMHzPerCore is the speed a vCPU is rated at. The vDC's own setting wins,
 // then the pool's assumption, then the usual 2 GHz.
-func cpuMHzPerCore(pool *infrav1.K8sWorkerPool, capacity cloud.VDCCapacity) int64 {
+func cpuMHzPerCore(pool *infrav1.K8sWorkerPool, capacity cloud.PlatformCapacity) int64 {
 	if capacity.CPUMHzPerCore > 0 {
 		return capacity.CPUMHzPerCore
 	}
@@ -50,7 +50,13 @@ func (r *WorkerPoolReconciler) capacityAllows(ctx context.Context, pool *infrav1
 	if !capacityPreflightEnabled(pool) {
 		return true, ""
 	}
-	capacity, err := r.Cloud.Capacity(ctx)
+	prov, perr := r.platform(pool)
+	if perr != nil {
+		log.FromContext(ctx).V(1).Info("capacity pre-flight skipped: no platform provider",
+			"pool", pool.Name, "error", perr)
+		return true, ""
+	}
+	capacity, err := prov.Capacity(ctx)
 	if err != nil {
 		log.FromContext(ctx).V(1).Info("capacity pre-flight skipped: the vDC capacity could not be read",
 			"pool", pool.Name, "error", err)

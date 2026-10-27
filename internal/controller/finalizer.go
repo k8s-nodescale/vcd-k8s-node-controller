@@ -51,7 +51,12 @@ func (r *WorkerPoolReconciler) reconcilePoolDeletion(ctx context.Context, pool *
 		return ctrl.Result{}, nil
 	}
 
-	all, err := r.Cloud.ListWorkerVMs(ctx, pool.Spec.VCD.VApp, nil)
+	prov, perr := r.platform(pool)
+	if perr != nil {
+		r.setCondition(pool, metav1.ConditionFalse, "CloudError", perr.Error())
+		return ctrl.Result{}, perr
+	}
+	all, err := prov.ListWorkerVMs(ctx, nil)
 	if err != nil {
 		r.setCondition(pool, metav1.ConditionFalse, "CloudError", err.Error())
 		return ctrl.Result{}, err

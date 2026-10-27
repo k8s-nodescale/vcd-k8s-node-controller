@@ -13,7 +13,9 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	infrav1 "github.com/k8s-nodescale/vcd-k8s-node-controller/api/v1alpha1"
+	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/cloud"
 	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/cloud/vcd"
+	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/cloud/vsphere"
 	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/cloudinit"
 	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/controller"
 	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/kube"
@@ -59,7 +61,7 @@ func main() {
 
 	vcdOrg := os.Getenv("VCD_ORG")
 	vcdVDC := os.Getenv("VCD_VDC")
-	cloudProvider, err := vcd.New(vcd.Config{
+	vcdFactory, err := vcd.New(vcd.Config{
 		URL:      os.Getenv("VCD_URL"),
 		User:     os.Getenv("VCD_USER"),
 		Password: os.Getenv("VCD_PASSWORD"),
@@ -70,6 +72,13 @@ func main() {
 	if err != nil {
 		setupLog.Error(err, "unable to create vCD provider")
 		os.Exit(1)
+	}
+
+	// The platform is a property of the pool (spec.provider), not of the
+	// process: the registry hands out the provider each pool asks for.
+	cloudProvider := cloud.Registry{
+		cloud.ProviderVCD:     vcdFactory,
+		cloud.ProviderVSphere: vsphere.New(),
 	}
 
 	cs, err := kubernetes.NewForConfig(cfg)

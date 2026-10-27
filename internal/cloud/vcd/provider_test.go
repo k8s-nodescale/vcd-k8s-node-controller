@@ -91,7 +91,7 @@ func TestNormalizeURL(t *testing.T) {
 }
 
 func TestUpdatePoolMemberRejectsUnaddressablePools(t *testing.T) {
-	p := &Provider{}
+	p := &Pool{Client: &Client{}}
 	cases := []struct {
 		name string
 		pool cloud.PoolRef
