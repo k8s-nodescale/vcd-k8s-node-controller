@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	infrav1 "github.com/k8s-nodescale/vcd-k8s-node-controller/api/v1alpha1"
 	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/cloud"
@@ -242,4 +243,72 @@ func TestResizeCapacityRequest(t *testing.T) {
 		t.Fatalf("unexpected delta for a shrink: %#v", req)
 	}
 	_ = kube.NodeInfo{}
+}
+
+// I-22: a dequeued slot must not keep reporting the shortfall that parked it
+// while the VM is being created, which takes minutes.
+func TestQueuedWorkerPublishesProgressBeforeTheVMCreate(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(1)
+	fc := &fakeCloud{capacity: fullMemory()}
+	r := newTestReconciler(t, fc, &fakeKube{}, pool)
+
+	if _, err := r.Reconcile(ctx, requestFor(pool)); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	fc.capacity.MemoryMB.Used = 0
+	var during *infrav1.K8sWorkerPool
+	fc.createHook = func() {
+		var p infrav1.K8sWorkerPool
+		if err := r.Get(ctx, types.NamespacedName{Name: pool.Name, Namespace: pool.Namespace}, &p); err == nil {
+			during = p.DeepCopy()
+		}
+	}
+	if _, err := r.Reconcile(ctx, requestFor(pool)); err != nil {
+		t.Fatalf("reconcile after freeing capacity: %v", err)
+	}
+
+	if during == nil {
+		t.Fatal("CreateVM never ran")
+	}
+	st := during.Status.Nodes[0]
+	if st.Phase != infrav1.NodePhaseQueued {
+		t.Fatalf("phase during the create = %s, want Queued until the VM exists", st.Phase)
+	}
+	if !strings.Contains(st.Message, "creating the VM") {
+		t.Fatalf("message during the create = %q, want the progress message", st.Message)
+	}
+
+	n := getPool(t, r, pool).Status.Nodes[0]
+	if n.Phase != infrav1.NodePhaseProvisioning || n.ProviderID == "" {
+		t.Fatalf("slot after the create = %#v, want Provisioning with a VM id", n)
+	}
+}
+
+// A create that fails after a dequeue leaves the slot queued, with the failure
+// reported, so the next pass retries it instead of parking it Failed.
+func TestQueuedWorkerStaysQueuedWhenTheCreateFails(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(1)
+	fc := &fakeCloud{capacity: fullMemory()}
+	r := newTestReconciler(t, fc, &fakeKube{}, pool)
+
+	if _, err := r.Reconcile(ctx, requestFor(pool)); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	fc.capacity.MemoryMB.Used = 0
+	fc.failAt = 1
+	if _, err := r.Reconcile(ctx, requestFor(pool)); err == nil {
+		t.Fatal("the reconcile reported success after a failed create")
+	}
+
+	n := getPool(t, r, pool).Status.Nodes[0]
+	if n.Phase != infrav1.NodePhaseQueued {
+		t.Fatalf("phase after a failed create = %s, want Queued", n.Phase)
+	}
+	if !strings.Contains(n.Message, "the create failed") {
+		t.Fatalf("message after a failed create = %q", n.Message)
+	}
 }

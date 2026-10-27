@@ -93,9 +93,9 @@ Not implemented yet:
 - NSX-T ingress pools (`ingressPool.type: nsxt` is rejected with a clear event;
   the node is still drained and deleted, but its pool member must be removed by
   hand).
-- Automatic repair of a worker that is `Failed` or `Queued`: both are reported
-  and kept, and a `Failed` drain is not retried for you. A VM that boots but
-  never joins is parked by `spec.provisioning.timeout` with the VM kept.
+- Automatic repair of a worker that is `Failed`: it is reported and kept, and
+  a `Failed` drain is not retried for you. A VM that boots but never joins is
+  parked by `spec.provisioning.timeout` with the VM kept.
 - Token renewal for joins that outlive `join.tokenTTL`; the token of a finished
   join is left to expire on its own, and its JWS entry with it. A failed create
   now revokes its token (the earlier leak left one usable credential per failed
@@ -407,9 +407,13 @@ parked as `Queued`, its name and address stay reserved, and the pool reports
 `status.observedReplicas` counts the queued slots, so a scale-out is accepted and
 visible instead of being retried as a failing create. Every pass retries the
 queue: as soon as the vDC has room, the VM is created under the same name and
-address. A `Queued` slot costs nothing to remove - a scale-in or
-`deleteWorkers` drops it and releases the address (`WorkerDropped`), and it
-never counts as a serving worker for `scaleDown.minReplicas`.
+address. That create takes minutes, so the slot reports
+`capacity is available; creating the VM` and keeps the `Queued` phase until the
+VM exists: a restart in the middle of it retries the create (which converges)
+instead of parking the slot as missing. A `Queued` slot costs nothing to
+remove - a scale-in or `deleteWorkers` drops it and releases the address
+(`WorkerDropped`), and it never counts as a serving worker for
+`scaleDown.minReplicas`.
 
 A capacity read that fails never blocks the pool: the controller logs it at
 verbosity 1 and attempts the create, which is the behaviour without the
@@ -915,7 +919,7 @@ What this means in practice:
 ## Terraform integration contract
 
 - The Terraform module installs this chart behind a `node_controller.enabled`
-  toggle and pins `chart_version` / `image_tag` (currently `0.7.7`).
+  toggle and pins `chart_version` / `image_tag` (currently `0.7.8`).
 - **Once the controller is enabled, do not use Terraform to manage worker count
   or worker LB pool membership.** Use the CRD instead. The Terraform module's
   README must state this explicitly.
@@ -946,7 +950,7 @@ Build locally (the Dockerfile uses `golang:1.27.1-alpine` and
 `gcr.io/distroless/static:nonroot`):
 
 ```
-docker build -t docker.io/werton13/vcd-k8s-node-controller:0.7.7 .
+docker build -t docker.io/werton13/vcd-k8s-node-controller:0.7.8 .
 ```
 
 Public module defaults are used inside the build. On a restricted network,
@@ -956,14 +960,14 @@ override them:
 docker build \
   --build-arg GOPROXY=https://nexus.example.com/repository/golang/ \
   --build-arg GOSUMDB=off \
-  -t docker.io/werton13/vcd-k8s-node-controller:0.7.7 .
+  -t docker.io/werton13/vcd-k8s-node-controller:0.7.8 .
 ```
 
 Push (or use `make image-push`):
 
 ```
 docker login docker.io
-docker push docker.io/werton13/vcd-k8s-node-controller:0.7.7
+docker push docker.io/werton13/vcd-k8s-node-controller:0.7.8
 docker push docker.io/werton13/vcd-k8s-node-controller:latest
 ```
 

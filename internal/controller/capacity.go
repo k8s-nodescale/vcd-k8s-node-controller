@@ -212,6 +212,18 @@ func (r *WorkerPoolReconciler) resumeQueuedCreates(ctx context.Context, before, 
 			}
 			return handled, nil
 		}
+		// A queued slot is published as creating before the VM exists: the
+		// create takes minutes, and the slot would otherwise keep reporting
+		// the shortfall that parked it. The phase stays Queued, so a crash
+		// mid-create is retried by the next pass instead of reading Missing.
+		n.Message = "capacity is available; creating the VM"
+		if err := r.flush(ctx, before, pool); err != nil {
+			return true, err
+		}
+		// The write above replaced status.nodes, so the pointer into it is
+		// stale: take it again before recording the VM.
+		n = &pool.Status.Nodes[i]
+
 		vm, tokID, err := r.createWorker(ctx, pool, alloc, n.Name, n.IP)
 		if err != nil {
 			n.Message = "the create failed: " + err.Error()
