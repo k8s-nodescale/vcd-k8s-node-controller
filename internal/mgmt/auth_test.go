@@ -258,3 +258,19 @@ func TestActionIsAnnotatedWithTheActor(t *testing.T) {
 		t.Fatalf("annotation %q", note)
 	}
 }
+
+// Ansible's password_hash('bcrypt') writes $2b$ and htpasswd writes $2y$; the
+// library's own GenerateFromPassword writes $2a$. All three must sign in.
+func TestBcryptVariantsAreAccepted(t *testing.T) {
+	base := cheapHash(t, "pw")
+	for _, prefix := range []string{"$2a$", "$2b$", "$2y$"} {
+		hash := prefix + base[4:]
+		a := loadedAuth(t, &Users{Admins: []Account{{Username: "u", PasswordHash: hash}}})
+		if _, ok := a.Lookup("u", "pw"); !ok {
+			t.Errorf("%s: rejected", prefix)
+		}
+		if _, ok := a.Lookup("u", "wrong"); ok {
+			t.Errorf("%s: accepted a wrong password", prefix)
+		}
+	}
+}
