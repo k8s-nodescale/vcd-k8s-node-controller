@@ -20,6 +20,11 @@ import (
 	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/kube"
 )
 
+// errRolloutDrainBlocked means the drain budget is spent and the pool asks a
+// PodDisruptionBudget to win (scaleDown.waitForPDB): the roll pauses with the
+// worker untouched instead of evicting past a budget the owner asked to keep.
+var errRolloutDrainBlocked = errors.New("the drain budget is spent and scaleDown.waitForPDB is set")
+
 // Per-worker rollout phases, persisted in status.nodes[].resize.phase so a
 // controller restart resumes where the previous pass stopped.
 const (
@@ -285,7 +290,18 @@ func (r *WorkerPoolReconciler) reconcileRollout(ctx context.Context, pool *infra
 			// A drain that cannot finish yet is progress, not a failure: the
 			// pass retries and the PDB is what decides.
 			if errors.Is(err, kube.ErrDrainIncomplete) {
-				n.Resize.Message = "drain in progress (a PodDisruptionBudget or an unmovable pod is holding the node)"
+				n.Resize.Message = "drain in progress (a PodDisruptionBudget or an unmovable pod is holding the node; the drain budget is still running)"
+				continue
+			}
+			if errors.Is(err, errRolloutDrainBlocked) {
+				// The owner asked the budget to win: pause the roll with the
+				// worker untouched and say which switch did it.
+				n.Resize.Phase = resizePhaseFailed
+				n.Resize.Message = err.Error()
+				n.Message = err.Error()
+				failed = true
+				r.eventf(pool, corev1.EventTypeWarning, "RolloutBlocked",
+					fmt.Sprintf("worker %s: %v", n.Name, err))
 				continue
 			}
 			n.Resize.Phase = resizePhaseFailed
@@ -358,7 +374,44 @@ func (r *WorkerPoolReconciler) advanceResize(ctx context.Context, pool *infrav1.
 		if err := r.removeFromIngressPool(ctx, pool, n.IP); err != nil && !errors.Is(err, cloud.ErrPoolNotConfigured) {
 			return fmt.Errorf("remove %s from the ingress pool: %w", n.IP, err)
 		}
-		if err := r.Kube.Drain(ctx, kubeName, budgetFor(pool)); err != nil {
+		// The drain spends one budget, the same one a scale-down uses. Without
+		// a deadline of its own each pass would get a fresh 20 s window, and a
+		// budget with no possible disruption would pin the roll forever (I-21).
+		budget := budgetFor(pool)
+		if n.Resize.DrainStartedAt == nil {
+			now := metav1.Now()
+			n.Resize.DrainStartedAt = &now
+		}
+		if time.Since(n.Resize.DrainStartedAt.Time) > budget {
+			if pool.Spec.ScaleDown.WaitForPDB {
+				msg := fmt.Sprintf("%s did not drain within %s and scaleDown.waitForPDB is set", n.Name, budget)
+				n.Resize.Message = msg
+				n.Message = msg
+				return fmt.Errorf("%w: %s", errRolloutDrainBlocked, msg)
+			}
+			report, err := r.Kube.ForceEvict(ctx, kubeName)
+			if err != nil {
+				return fmt.Errorf("remove the pods left on %s: %w", kubeName, err)
+			}
+			if len(report.Pods) > 0 {
+				// A fresh budget: the next pass must see the pods actually
+				// leave before the VM is powered off.
+				now := metav1.Now()
+				n.Resize.DrainStartedAt = &now
+				msg := fmt.Sprintf("drain budget spent after %s: deleted %d pod(s) to free %s",
+					budget, len(report.Pods), n.Name)
+				if len(report.Budgets) > 0 {
+					msg += "; bypassed PodDisruptionBudget(s): " + strings.Join(report.Budgets, ", ")
+				}
+				n.Resize.Message = msg
+				n.Message = msg
+				r.eventf(pool, corev1.EventTypeWarning, "DrainEscalated", msg)
+				return nil
+			}
+			// Nothing was left to force out (the pods are already terminating):
+			// fall through to the regular drain so this pass can move on.
+		}
+		if err := r.Kube.Drain(ctx, kubeName, time.Until(n.Resize.DrainStartedAt.Time.Add(budget))); err != nil {
 			return err
 		}
 		if err := r.Kube.WaitVolumesDetached(ctx, kubeName, volumeWaitTimeout); err != nil {

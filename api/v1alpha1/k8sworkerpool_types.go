@@ -479,7 +479,12 @@ type ResizeStatus struct {
 	// Done or Failed.
 	Phase     string       `json:"phase,omitempty"`
 	StartedAt *metav1.Time `json:"startedAt,omitempty"`
-	Message   string       `json:"message,omitempty"`
+	// DrainStartedAt is when the drain of this worker began. The roll spends
+	// scaleDown.drainTimeout from here and then escalates the way a scale-down
+	// does, so a PodDisruptionBudget with no possible disruption cannot pin a
+	// compute change forever (I-21).
+	DrainStartedAt *metav1.Time `json:"drainStartedAt,omitempty"`
+	Message        string       `json:"message,omitempty"`
 }
 
 // RolloutStatus is the pool-wide rollout state.

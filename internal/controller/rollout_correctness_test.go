@@ -2,6 +2,8 @@ package controller
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -9,6 +11,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	infrav1 "github.com/k8s-nodescale/vcd-k8s-node-controller/api/v1alpha1"
+	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/kube"
 )
 
 // stoppingPoint puts a worker into the middle of a resize, as a pass that was
@@ -199,5 +202,92 @@ func TestScaleUpPublishesTheSlotBeforeTheVMCreate(t *testing.T) {
 	n := nodeByName(getPool(t, r, pool), "pool-wrk-01")
 	if n == nil || n.ProviderID == "" {
 		t.Fatalf("pool-wrk-01 = %#v, want the VM id persisted", n)
+	}
+}
+
+// I-21: a roll spends the same drain budget a scale-down does and then
+// escalates, so a PodDisruptionBudget with no possible disruption cannot pin a
+// compute change forever.
+func TestRolloutEscalatesPastABlockingBudget(t *testing.T) {
+	pool := testPool(1)
+	fc := &fakeCloud{}
+	fk := &fakeKube{
+		nodes: readyNodes("pool-wrk-01"),
+		drainErr: fmt.Errorf("%w: 1 pod(s) still on pool-wrk-01; blocked by PodDisruptionBudget(s): ingress-nginx-controller",
+			kube.ErrDrainIncomplete),
+		forceEvictPDBs: []string{"ingress-nginx-controller"},
+	}
+	r := newTestReconciler(t, fc, fk, pool)
+	reconcileOnce(t, r, pool)
+
+	updateSpec(t, r, pool, func(p *infrav1.K8sWorkerPool) { p.Spec.Flavor.CPUs = 4 })
+	reconcileOnce(t, r, pool)
+
+	n := nodeByName(getPool(t, r, pool), "pool-wrk-01")
+	if n == nil || n.Resize == nil || n.Resize.DrainStartedAt == nil {
+		t.Fatalf("the roll did not start a drain with a deadline: %#v", n)
+	}
+	if len(fk.forcedEvictions) != 0 {
+		t.Fatalf("escalated before the drain budget was spent: %v", fk.forcedEvictions)
+	}
+
+	updateSpec(t, r, pool, func(p *infrav1.K8sWorkerPool) {
+		p.Spec.ScaleDown.DrainTimeout = metav1.Duration{Duration: time.Millisecond}
+	})
+	reconcileOnce(t, r, pool)
+
+	if len(fk.forcedEvictions) != 1 || fk.forcedEvictions[0] != "pool-wrk-01" {
+		t.Fatalf("forced evictions = %v, want [pool-wrk-01]", fk.forcedEvictions)
+	}
+	n = nodeByName(getPool(t, r, pool), "pool-wrk-01")
+	if n == nil || n.Resize == nil || n.Resize.Phase != resizePhaseCordoned {
+		t.Fatalf("pool-wrk-01 = %#v, want it still cordoned with a fresh budget", n)
+	}
+	if !strings.Contains(n.Message, "bypassed PodDisruptionBudget(s): ingress-nginx-controller") {
+		t.Fatalf("message does not name the bypassed budget: %q", n.Message)
+	}
+	if len(fc.poweredOff) != 0 {
+		t.Fatalf("the VM was stopped before the pods left: %v", fc.poweredOff)
+	}
+}
+
+// I-21 opt-out: scaleDown.waitForPDB asks the budget to win, so the roll pauses
+// with the worker untouched and names the switch instead of evicting past it.
+func TestRolloutWaitForPDBPausesInsteadOfEvicting(t *testing.T) {
+	pool := testPool(1)
+	pool.Spec.ScaleDown.WaitForPDB = true
+	fc := &fakeCloud{}
+	fk := &fakeKube{
+		nodes: readyNodes("pool-wrk-01"),
+		drainErr: fmt.Errorf("%w: 1 pod(s) still on pool-wrk-01; blocked by PodDisruptionBudget(s): ingress-nginx-controller",
+			kube.ErrDrainIncomplete),
+	}
+	r := newTestReconciler(t, fc, fk, pool)
+	reconcileOnce(t, r, pool)
+
+	updateSpec(t, r, pool, func(p *infrav1.K8sWorkerPool) { p.Spec.Flavor.CPUs = 4 })
+	reconcileOnce(t, r, pool)
+
+	updateSpec(t, r, pool, func(p *infrav1.K8sWorkerPool) {
+		p.Spec.ScaleDown.DrainTimeout = metav1.Duration{Duration: time.Millisecond}
+	})
+	reconcileOnce(t, r, pool)
+
+	if len(fk.forcedEvictions) != 0 {
+		t.Fatalf("evicted past a budget the pool asked to keep: %v", fk.forcedEvictions)
+	}
+	got := getPool(t, r, pool)
+	if got.Status.Rollout.Phase != infrav1.RolloutPhasePaused {
+		t.Fatalf("rollout phase = %q, want Paused", got.Status.Rollout.Phase)
+	}
+	n := nodeByName(got, "pool-wrk-01")
+	if n == nil || n.Resize == nil || n.Resize.Phase != resizePhaseFailed {
+		t.Fatalf("worker = %#v, want a failed resize step", n)
+	}
+	if !strings.Contains(n.Resize.Message, "waitForPDB") {
+		t.Fatalf("message does not name the switch: %q", n.Resize.Message)
+	}
+	if len(fc.poweredOff) != 0 {
+		t.Fatalf("the VM was touched: %v", fc.poweredOff)
 	}
 }

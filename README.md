@@ -133,8 +133,8 @@ One `K8sWorkerPool` describes the worker set of a single cluster. You own
 | `join.labels` / `join.taints` | no | Pool-wide, applied to every Ready worker (`taints` in `key[=value]:Effect` form). |
 | `ingressPool` | no | `type` (`nsxv`/`nsxt`), `name`, `port`, `edge`. `port` is the **node port** the pool forwards to, not the virtual-server port; `edge` is the NSX-V edge that owns the pool. Workers are added on Ready and removed before a drain. |
 | `scaleDown.minReplicas` | no | Floor for the workers that can serve traffic (default `1`). A removal that would leave fewer is refused. Writing off a `Missing` slot takes nothing out of service, so the floor never blocks that cleanup. `0` disables the floor. |
-| `scaleDown.drainTimeout` | no | Budget for cordon+drain of one worker (default `10m`). When it expires the removal escalates past a blocking PodDisruptionBudget: the pods left on the node are deleted, the budget is named in `status`, and the removal continues with a fresh budget. |
-| `scaleDown.waitForPDB` | no | Refuse to bypass a PodDisruptionBudget (default `false`). With `true` a drain that cannot finish within `drainTimeout` parks the worker `Failed` and keeps its VM for a human instead of escalating. |
+| `scaleDown.drainTimeout` | no | Budget for cordon+drain of one worker (default `10m`), and for the drain a rollout performs. When it expires the removal escalates past a blocking PodDisruptionBudget: the pods left on the node are deleted, the budget is named in `status`, and the removal continues with a fresh budget. |
+| `scaleDown.waitForPDB` | no | Refuse to bypass a PodDisruptionBudget (default `false`). With `true` a drain that cannot finish within `drainTimeout` parks the worker `Failed` and keeps its VM for a human instead of escalating. A rollout drain honours the same switch: the roll pauses with a `RolloutBlocked` warning and the worker untouched. |
 | `scaleDown.deleteWorkers[]` | no | Worker names to remove regardless of their position. Each entry is drained and deleted, then removed from this list and `spec.replicas` is decremented so the worker is **not** recreated. |
 | `scaleDown.force` | no | Skip the node-local volume guard. Per-node override: annotation `k8s-nodescale.github.io/force-delete=true`. Never bypasses a PodDisruptionBudget on its own and never skips the detach wait. |
 | `scaleDown.allowLastWorker` | no | Permit a request that leaves the pool with zero workers. Needs `scaleDown.minReplicas: 0`; a higher floor is rejected as `InvalidSpec` instead of accepting a flag that could never be honoured. Refused anyway on the worker the controller runs on and on node-local volumes. |
@@ -574,7 +574,7 @@ allowed to strand a worker the pool was told to remove:
 
 | Blocker | Handling |
 | --- | --- |
-| `PodDisruptionBudget` with no disruptions allowed | Honoured for `scaleDown.drainTimeout`. When the budget is spent the pods left on the node are deleted through the API - the only way past `minAvailable` equal to the replica count - and the status message and the `DrainEscalated` event name the budget. |
+| `PodDisruptionBudget` with no disruptions allowed | Honoured for `scaleDown.drainTimeout`. When the budget is spent the pods left on the node are deleted through the API - the only way past `minAvailable` equal to the replica count - and the status message and the `DrainEscalated` event name the budget. A rollout drain spends the same budget and escalates the same way, or pauses under `scaleDown.waitForPDB`. |
 | Pod without a controller (bare pod) | Evicted like any other: removing the node is the point, and there is nowhere else for it to go. |
 | DaemonSet and mirror (static) pods | Skipped by design: they belong to the node, and deleting the Node object is what reaps them. |
 | Pod that tolerates `node.kubernetes.io/unschedulable` | Left to go with the node (`tigera-operator` is the classic case). Evicting it is a loop: it is rescheduled onto the cordoned node it was evicted from. |
@@ -658,6 +658,16 @@ lets a batch be out of service together; PDBs remain the real brake, and a batch
 whose drain cannot finish keeps retrying with the reason in
 `status.nodes[].resize.message`. `rollout.order: Ascending` rolls `wrk-01`
 first instead of last.
+
+The drain in that pipeline spends the same `scaleDown.drainTimeout` budget a
+removal does, counted from `status.nodes[].resize.drainStartedAt`. When it is
+spent the roll escalates exactly like a scale-down: the pods left on the worker
+are deleted through the API, the status message and a `DrainEscalated` warning
+name the budgets that were bypassed, and the worker keeps draining with a fresh
+budget before it is powered off. `scaleDown.waitForPDB: true` is the opt-out:
+the roll pauses instead - `status.rollout.phase: Paused`, the worker's
+`resize.phase: Failed` with the reason, and a `RolloutBlocked` warning - and
+nothing on the worker is touched, so the operator decides when it may go.
 
 A roll checks capacity too, before it takes anyone out of service: the delta the
 resize adds (CPU, memory, system disk) has to fit, not the whole target flavor.
@@ -919,7 +929,7 @@ What this means in practice:
 ## Terraform integration contract
 
 - The Terraform module installs this chart behind a `node_controller.enabled`
-  toggle and pins `chart_version` / `image_tag` (currently `0.7.8`).
+  toggle and pins `chart_version` / `image_tag` (currently `0.7.9`).
 - **Once the controller is enabled, do not use Terraform to manage worker count
   or worker LB pool membership.** Use the CRD instead. The Terraform module's
   README must state this explicitly.
@@ -950,7 +960,7 @@ Build locally (the Dockerfile uses `golang:1.27.1-alpine` and
 `gcr.io/distroless/static:nonroot`):
 
 ```
-docker build -t docker.io/werton13/vcd-k8s-node-controller:0.7.8 .
+docker build -t docker.io/werton13/vcd-k8s-node-controller:0.7.9 .
 ```
 
 Public module defaults are used inside the build. On a restricted network,
@@ -960,14 +970,14 @@ override them:
 docker build \
   --build-arg GOPROXY=https://nexus.example.com/repository/golang/ \
   --build-arg GOSUMDB=off \
-  -t docker.io/werton13/vcd-k8s-node-controller:0.7.8 .
+  -t docker.io/werton13/vcd-k8s-node-controller:0.7.9 .
 ```
 
 Push (or use `make image-push`):
 
 ```
 docker login docker.io
-docker push docker.io/werton13/vcd-k8s-node-controller:0.7.8
+docker push docker.io/werton13/vcd-k8s-node-controller:0.7.9
 docker push docker.io/werton13/vcd-k8s-node-controller:latest
 ```
 
