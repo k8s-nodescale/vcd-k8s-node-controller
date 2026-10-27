@@ -126,7 +126,10 @@ ui:
     path: /nodescale-ui
     annotations: {}
     tls:
-      # ssl-redirect sends plain HTTP to HTTPS on the controller's default
-      # certificate. A named secret needs a host as well.
-      enabled: true
+      # A certificate is matched by SNI, so a named Secret needs a host: a
+      # catch-all rule has no name to match. Leave both empty to serve HTTPS
+      # with the ingress controller's own (self-signed) certificate.
       secretName: ""
+      # Redirect plain HTTP to HTTPS. Off by default: behind NodePorts the
+      # redirect drops the port and points at :443, which is not open here.
+      redirect: false

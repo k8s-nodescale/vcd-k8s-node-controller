@@ -8,18 +8,20 @@ metadata:
     app.kubernetes.io/name: {{ include "vcd-nodescale.name" . }}
     app.kubernetes.io/instance: {{ .Release.Name }}
     app.kubernetes.io/component: ui
+  {{- if or .Values.ui.ingress.tls.redirect .Values.ui.ingress.annotations }}
   annotations:
-    {{- if .Values.ui.ingress.tls.enabled }}
+    {{- if .Values.ui.ingress.tls.redirect }}
     nginx.ingress.kubernetes.io/ssl-redirect: "true"
     {{- end }}
     {{- with .Values.ui.ingress.annotations }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
+  {{- end }}
 spec:
   {{- with .Values.ui.ingress.className }}
   ingressClassName: {{ . }}
   {{- end }}
-  {{- if and .Values.ui.ingress.tls.enabled .Values.ui.ingress.tls.secretName .Values.ui.ingress.host }}
+  {{- if and .Values.ui.ingress.tls.secretName .Values.ui.ingress.host }}
   tls:
     - hosts:
         - {{ .Values.ui.ingress.host | quote }}
