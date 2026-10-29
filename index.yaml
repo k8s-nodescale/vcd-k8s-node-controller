@@ -2,8 +2,19 @@ apiVersion: v1
 entries:
   vcd-nodescale:
   - apiVersion: v2
+    appVersion: 0.11.1
+    created: "2026-10-29T13:39:53.461535854+03:00"
+    description: Kubernetes worker-node scaling controller for VMware Cloud Director
+    digest: 588d3c238fda9a51a1e636dd8cdb0bc120c06256874cc9c09440a32f04d9fac7
+    kubeVersion: '>=1.28.0-0'
+    name: vcd-nodescale
+    type: application
+    urls:
+    - https://k8s-nodescale.github.io/vcd-k8s-node-controller/vcd-nodescale-0.11.1.tgz
+    version: 0.11.1
+  - apiVersion: v2
     appVersion: 0.11.0
-    created: "2026-10-29T13:34:09.824007266+03:00"
+    created: "2026-10-29T13:39:53.459377577+03:00"
     description: Kubernetes worker-node scaling controller for VMware Cloud Director
     digest: 23eca31521de62150cc850ecf534281fb93b5d3d79a4dfa3d5487829089ea110
     kubeVersion: '>=1.28.0-0'
@@ -14,7 +25,7 @@ entries:
     version: 0.11.0
   - apiVersion: v2
     appVersion: 0.10.1
-    created: "2026-10-29T13:34:09.823010358+03:00"
+    created: "2026-10-29T13:39:53.457219675+03:00"
     description: Kubernetes worker-node scaling controller for VMware Cloud Director
     digest: ce0904a71a38df7bb2018cdcec0a9d97f817843b76279c8c2f84ac2fd623557b
     kubeVersion: '>=1.28.0-0'
@@ -25,7 +36,7 @@ entries:
     version: 0.10.1
   - apiVersion: v2
     appVersion: 0.10.0
-    created: "2026-10-29T13:34:09.821997247+03:00"
+    created: "2026-10-29T13:39:53.452273306+03:00"
     description: Kubernetes worker-node scaling controller for VMware Cloud Director
     digest: 55ffc175230702eb1b8e9b6624f346b6ade29ad5e23b75c37d5158721edffdb4
     kubeVersion: '>=1.28.0-0'
@@ -36,7 +47,7 @@ entries:
     version: 0.10.0
   - apiVersion: v2
     appVersion: 0.9.0
-    created: "2026-10-29T13:34:09.837874433+03:00"
+    created: "2026-10-29T13:39:53.487171659+03:00"
     description: Kubernetes worker-node scaling controller for VMware Cloud Director
     digest: e4ef7cf6be9e46320486478c632b50820d76c12f5dc37ae8c4f2dbdfd58df311
     kubeVersion: '>=1.28.0-0'
@@ -47,7 +58,7 @@ entries:
     version: 0.9.0
   - apiVersion: v2
     appVersion: 0.8.0
-    created: "2026-10-29T13:34:09.837208235+03:00"
+    created: "2026-10-29T13:39:53.486247402+03:00"
     description: Kubernetes worker-node scaling controller for VMware Cloud Director
     digest: 0ed301e636ab4d89990be63a86f7d64419efe49dbdb35c9ff77bc8ccc1c12dfb
     kubeVersion: '>=1.28.0-0'
@@ -58,7 +69,7 @@ entries:
     version: 0.8.0
   - apiVersion: v2
     appVersion: 0.7.9
-    created: "2026-10-29T13:34:09.836565846+03:00"
+    created: "2026-10-29T13:39:53.485380093+03:00"
     description: Kubernetes worker-node scaling controller for VMware Cloud Director
     digest: c01f52596101f296e55c0e06818ba596c9184fda67b3270ff2f76f173bf08645
     kubeVersion: '>=1.28.0-0'
@@ -69,7 +80,7 @@ entries:
     version: 0.7.9
   - apiVersion: v2
     appVersion: 0.7.8
-    created: "2026-10-29T13:34:09.8359152+03:00"
+    created: "2026-10-29T13:39:53.484336051+03:00"
     description: Kubernetes worker-node scaling controller for VMware Cloud Director
     digest: deb01e115198e0572cc8ea51ecc62c5f4b0bbe418f58b524f80888f8f59e6af9
     kubeVersion: '>=1.28.0-0'
@@ -80,7 +91,7 @@ entries:
     version: 0.7.8
   - apiVersion: v2
     appVersion: 0.7.7
-    created: "2026-10-29T13:34:09.835212516+03:00"
+    created: "2026-10-29T13:39:53.481651014+03:00"
     description: Kubernetes worker-node scaling controller for VMware Cloud Director
     digest: b338abc5b3cf361ca3b977f608d4f77647904e2bef79462e7adee207f35705cb
     kubeVersion: '>=1.28.0-0'
@@ -91,7 +102,7 @@ entries:
     version: 0.7.7
   - apiVersion: v2
     appVersion: 0.7.6
-    created: "2026-10-29T13:34:09.834440585+03:00"
+    created: "2026-10-29T13:39:53.479186344+03:00"
     description: Kubernetes worker-node scaling controller for VMware Cloud Director
     digest: 987eaedb41e8dac060b1199bae5db0ee36d2391986a5e861346f6d9f6e9ec4fc
     kubeVersion: '>=1.28.0-0'
@@ -102,7 +113,7 @@ entries:
     version: 0.7.6
   - apiVersion: v2
     appVersion: 0.7.5
-    created: "2026-10-29T13:34:09.833818643+03:00"
+    created: "2026-10-29T13:39:53.478202517+03:00"
     description: Kubernetes worker-node scaling controller for VMware Cloud Director
     digest: 5b8d710b04436d8b0d0e41feaefbdf0940cebb35147e3270d9a1cdc8fe553b9c
     kubeVersion: '>=1.28.0-0'
@@ -113,7 +124,7 @@ entries:
     version: 0.7.5
   - apiVersion: v2
     appVersion: 0.7.4
-    created: "2026-10-29T13:34:09.833176834+03:00"
+    created: "2026-10-29T13:39:53.476491509+03:00"
     description: Kubernetes worker-node scaling controller for VMware Cloud Director
     digest: 983eb766cfbacac127b11778bc561e063d606d4010834f041c495b43622dfa10
     kubeVersion: '>=1.28.0-0'
@@ -124,7 +135,7 @@ entries:
     version: 0.7.4
   - apiVersion: v2
     appVersion: 0.7.3
-    created: "2026-10-29T13:34:09.832465563+03:00"
+    created: "2026-10-29T13:39:53.475389596+03:00"
     description: Kubernetes worker-node scaling controller for VMware Cloud Director
     digest: f483a8bd0ec0c06e6e62c61f8682f7f82392858caf46a48e6ad5d91f1592719b
     kubeVersion: '>=1.28.0-0'
@@ -135,7 +146,7 @@ entries:
     version: 0.7.3
   - apiVersion: v2
     appVersion: 0.7.2
-    created: "2026-10-29T13:34:09.831599332+03:00"
+    created: "2026-10-29T13:39:53.474583545+03:00"
     description: Kubernetes worker-node scaling controller for VMware Cloud Director
     digest: 5e5bfdc55bfa6afda4f0080eef5e4408c31266b20eea79dbb069499e86621e6c
     kubeVersion: '>=1.28.0-0'
@@ -146,7 +157,7 @@ entries:
     version: 0.7.2
   - apiVersion: v2
     appVersion: 0.7.1
-    created: "2026-10-29T13:34:09.830836777+03:00"
+    created: "2026-10-29T13:39:53.473685598+03:00"
     description: Kubernetes worker-node scaling controller for VMware Cloud Director
     digest: 3e1b646b6909274283b9efb764416a357560b6ad6fb890688dd717830f32c062
     kubeVersion: '>=1.28.0-0'
@@ -157,7 +168,7 @@ entries:
     version: 0.7.1
   - apiVersion: v2
     appVersion: 0.7.0
-    created: "2026-10-29T13:34:09.829627736+03:00"
+    created: "2026-10-29T13:39:53.472376128+03:00"
     description: Kubernetes worker-node scaling controller for VMware Cloud Director
     digest: e5e0e0a1d6d05d5c71f3cfc347a9947674a48243d55b95caa8515b74b17dd25b
     kubeVersion: '>=1.28.0-0'
@@ -168,7 +179,7 @@ entries:
     version: 0.7.0
   - apiVersion: v2
     appVersion: 0.6.0
-    created: "2026-10-29T13:34:09.82870774+03:00"
+    created: "2026-10-29T13:39:53.470829843+03:00"
     description: Kubernetes worker-node scaling controller for VMware Cloud Director
     digest: 7a41ce64f86766eda3053dcd1dc7470c4a5e6f8adeaaf95d06a6b4a6ac5a9dc2
     kubeVersion: '>=1.28.0-0'
@@ -179,7 +190,7 @@ entries:
     version: 0.6.0
   - apiVersion: v2
     appVersion: 0.5.1
-    created: "2026-10-29T13:34:09.828113944+03:00"
+    created: "2026-10-29T13:39:53.46945043+03:00"
     description: Kubernetes worker-node scaling controller for VMware Cloud Director
     digest: 8f7191ff7b56dd064db243c8ae5ee2079c221d6fd5655c24798a18cebb74f2ba
     kubeVersion: '>=1.28.0-0'
@@ -190,7 +201,7 @@ entries:
     version: 0.5.1
   - apiVersion: v2
     appVersion: 0.5.0
-    created: "2026-10-29T13:34:09.827181456+03:00"
+    created: "2026-10-29T13:39:53.467324983+03:00"
     description: Kubernetes worker-node scaling controller for VMware Cloud Director
     digest: bf210b25621e5813c9e1466067f7cc72f59a9c61ea97c4c512955d2fbafb880a
     kubeVersion: '>=1.28.0-0'
@@ -201,7 +212,7 @@ entries:
     version: 0.5.0
   - apiVersion: v2
     appVersion: 0.3.2
-    created: "2026-10-29T13:34:09.826330459+03:00"
+    created: "2026-10-29T13:39:53.46598594+03:00"
     description: Kubernetes worker-node scaling controller for VMware Cloud Director
     digest: 935cf18ecfe804dba47e2fd27b2111dc6d2f465dddadecd5c0856651d43b59e9
     kubeVersion: '>=1.28.0-0'
@@ -212,7 +223,7 @@ entries:
     version: 0.3.2
   - apiVersion: v2
     appVersion: 0.3.1
-    created: "2026-10-29T13:34:09.825668029+03:00"
+    created: "2026-10-29T13:39:53.465010545+03:00"
     description: Kubernetes worker-node scaling controller for VMware Cloud Director
     digest: 13df5124cfd0879a55830a0f0ab7a59785faaaac489c2a9a7b75d065b7f81022
     kubeVersion: '>=1.28.0-0'
@@ -223,7 +234,7 @@ entries:
     version: 0.3.1
   - apiVersion: v2
     appVersion: 0.3.0
-    created: "2026-10-29T13:34:09.825191654+03:00"
+    created: "2026-10-29T13:39:53.4642948+03:00"
     description: Kubernetes worker-node scaling controller for VMware Cloud Director
     digest: 081aeb62ef5ee38664486417e4cd9f6d1e2a20dcb9215408a3e6ed64661fca27
     kubeVersion: '>=1.28.0-0'
@@ -234,7 +245,7 @@ entries:
     version: 0.3.0
   - apiVersion: v2
     appVersion: 0.2.0
-    created: "2026-10-29T13:34:09.824642674+03:00"
+    created: "2026-10-29T13:39:53.463006548+03:00"
     description: Kubernetes worker-node scaling controller for VMware Cloud Director
     digest: 8f7f16aa127147bcca60784862beae560c86d82c0488e70b3aea49f9aab261db
     kubeVersion: '>=1.28.0-0'
@@ -245,7 +256,7 @@ entries:
     version: 0.2.0
   - apiVersion: v2
     appVersion: 0.1.5
-    created: "2026-10-29T13:34:09.82074952+03:00"
+    created: "2026-10-29T13:39:53.450756467+03:00"
     description: Kubernetes worker-node scaling controller for VMware Cloud Director
     digest: 0e8ad978c10060b5613a056e156ceb8a08433693272dc804f7f3b4f934b7d8ec
     kubeVersion: '>=1.28.0-0'
@@ -256,7 +267,7 @@ entries:
     version: 0.1.5
   - apiVersion: v2
     appVersion: 0.1.4
-    created: "2026-10-29T13:34:09.820048015+03:00"
+    created: "2026-10-29T13:39:53.449899982+03:00"
     description: Kubernetes worker-node scaling controller for VMware Cloud Director
     digest: 8da2f18d8caa30c2e590efcaaf24267f9643f84e5356bae5fc6f93119689eb09
     kubeVersion: '>=1.28.0-0'
@@ -267,7 +278,7 @@ entries:
     version: 0.1.4
   - apiVersion: v2
     appVersion: 0.1.3
-    created: "2026-10-29T13:34:09.819465886+03:00"
+    created: "2026-10-29T13:39:53.449217179+03:00"
     description: Kubernetes worker-node scaling controller for VMware Cloud Director
     digest: 1afb3dfcf6f774535ce9571745706d084a70199a7bfae6641934c50b4ccef86e
     kubeVersion: '>=1.28.0-0'
@@ -278,7 +289,7 @@ entries:
     version: 0.1.3
   - apiVersion: v2
     appVersion: 0.1.2
-    created: "2026-10-29T13:34:09.818827347+03:00"
+    created: "2026-10-29T13:39:53.448470352+03:00"
     description: Kubernetes worker-node scaling controller for VMware Cloud Director
     digest: cc7a58fd76a93293fd960f5886c7e303665ad99e3468afa844783df3259c51f5
     kubeVersion: '>=1.28.0-0'
@@ -289,7 +300,7 @@ entries:
     version: 0.1.2
   - apiVersion: v2
     appVersion: 0.1.1
-    created: "2026-10-29T13:34:09.816480073+03:00"
+    created: "2026-10-29T13:39:53.447682487+03:00"
     description: Kubernetes worker-node scaling controller for VMware Cloud Director
     digest: 42447fb50c9226419430507c759f69dfc3ed6dd05043510e482bd56782ec4c8e
     kubeVersion: '>=1.28.0-0'
@@ -300,7 +311,7 @@ entries:
     version: 0.1.1
   - apiVersion: v2
     appVersion: 0.1.0
-    created: "2026-10-29T13:34:09.815942104+03:00"
+    created: "2026-10-29T13:39:53.446818268+03:00"
     description: Kubernetes worker-node scaling controller for VMware Cloud Director
     digest: bb64f05dd88cde75465d3f76e5728d3dc5e1569adccdf62f730130ebccaa5d24
     kubeVersion: '>=1.28.0-0'
@@ -309,4 +320,4 @@ entries:
     urls:
     - https://k8s-nodescale.github.io/vcd-k8s-node-controller/vcd-nodescale-0.1.0.tgz
     version: 0.1.0
-generated: "2026-10-29T13:34:09.814997339+03:00"
+generated: "2026-10-29T13:39:53.445826909+03:00"
