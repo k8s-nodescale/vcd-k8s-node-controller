@@ -1059,18 +1059,30 @@ viewers:
 
 The chart creates the Secret on install when it does not exist yet
 (`ui.auth.createSecret`), with the accounts `admin` (admins) and `viewer`
-(viewers) and 24-character generated passwords. Read them once, then delete the
-key so they stop existing:
+(viewers) and 24-character generated passwords. The plaintext is written once,
+next to the hashes, under the key `initial-passwords`; `helm install` prints the
+same command in its notes:
 
 ```
-kubectl -n vcd-nodescale-system get secret nodescale-ui-auth   -o jsonpath='{.data.initial-passwords}' | base64 -d
-kubectl -n vcd-nodescale-system patch secret nodescale-ui-auth   --type=json -p '[{"op":"remove","path":"/data/initial-passwords"}]'
+kubectl -n vcd-nodescale-system get secret nodescale-ui-auth \
+  -o jsonpath='{.data.initial-passwords}' | base64 -d
+```
+
+`users.yaml` holds only bcrypt hashes, so a password that was never read from
+that key cannot be recovered, only reset (see above). Once both are stored
+somewhere safe, remove the plaintext so it stops existing:
+
+```
+kubectl -n vcd-nodescale-system patch secret nodescale-ui-auth \
+  --type=json -p '[{"op":"remove","path":"/data/initial-passwords"}]'
 ```
 
 `helm upgrade` never rotates the accounts and `helm uninstall` keeps the Secret
 (`helm.sh/resource-policy: keep`). Where Ansible installs the chart it generates
 the passwords itself, keeps them on the control host and creates the Secret
-once, in which case the values set `ui.auth.createSecret: false`.
+once, in which case the values set `ui.auth.createSecret: false`. They are then
+in `<playbook_dir>/.credentials/<inventory_hostname>/nodescale-ui-admin` and
+`nodescale-ui-viewer` (mode `0600`), not in the cluster at all.
 
 The API is HTTP Basic; the page has no session and no logout, so the browser's
 dialog is the session. Writes additionally require the header
