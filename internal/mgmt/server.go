@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -33,6 +34,10 @@ type Server struct {
 	// default. Everything the server answers lives under it, so the ingress
 	// needs no rewrite.
 	PathPrefix string
+
+	// cluster is the kubeadm cluster name, read once.
+	clusterOnce sync.Once
+	cluster     string
 }
 
 // prefix is the path prefix in the one form the mux accepts.
@@ -86,6 +91,7 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 		"username": actor.Username,
 		"role":     role,
 		"auth":     auth,
+		"cluster":  s.clusterName(r.Context()),
 	})
 }
 

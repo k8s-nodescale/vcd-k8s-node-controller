@@ -6,7 +6,7 @@
 <title>nodescale-ui</title>
 <style>
   :root {
-    color-scheme: light dark;
+    color-scheme: light;
     --bg: #f6f7f9;
     --card: #ffffff;
     --fg: #1b1f24;
@@ -17,20 +17,23 @@
     --high: #b3261e;
     --accent: #14539a;
     --chip: #eef1f5;
+    --ipfg: steelblue;
+    --ipbg: rgba(70, 130, 180, .15);
   }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #14171a;
-      --card: #1c2024;
-      --fg: #e6e9ee;
-      --muted: #9aa4b0;
-      --line: #2b3138;
-      --ok: #4ec26a;
-      --warn: #f0a03c;
-      --high: #f2695e;
-      --accent: #6aa9f0;
-      --chip: #232a31;
-    }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #14171a;
+    --card: #1c2024;
+    --fg: #e6e9ee;
+    --muted: #9aa4b0;
+    --line: #2b3138;
+    --ok: #4ec26a;
+    --warn: #f0a03c;
+    --high: #f2695e;
+    --accent: #6aa9f0;
+    --chip: #232a31;
+    --ipfg: #8fc0e8;
+    --ipbg: rgba(120, 170, 210, .20);
   }
   * { box-sizing: border-box; }
   body {
@@ -43,7 +46,8 @@
     display: flex; flex-wrap: wrap; gap: 12px; align-items: center;
     padding: 14px 18px; border-bottom: 1px solid var(--line); background: var(--card);
   }
-  header h1 { font-size: 15px; margin: 0; letter-spacing: .02em; }
+  header h1 { font-size: 15px; margin: 0; letter-spacing: .02em; line-height: 1.25; }
+  header h1 small { display: block; font-size: 11px; font-weight: 400; color: var(--muted); }
   header .spacer { flex: 1 1 auto; }
   .muted { color: var(--muted); }
   .small { font-size: 12px; }
@@ -64,7 +68,9 @@
      numbers stay next to each other and the actions stay on the right */
   th, td { width: 1%; }
   th.grow, td.grow { width: auto; }
-  .ip { color: steelblue; }
+  /* req, lim and real get twice the room their text needs */
+  td:nth-child(n+3):nth-child(-n+8), thead tr:nth-child(2) th { width: 96px; }
+  .chip.ip { color: var(--ipfg); background: var(--ipbg); margin-left: 12px; }
   thead th { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); font-weight: 600; }
   tbody tr:hover { background: var(--chip); }
   .lv-ok { color: var(--ok); font-weight: 600; }
@@ -112,13 +118,32 @@
             padding: 10px 12px; background: rgba(179, 92, 0, .10); }
   .banner strong { display: block; margin-bottom: 3px; color: var(--warn); }
   .banner code { font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+  /* one block per K8sWorkerPool, stacked when there is more than one */
+  .poolblock { margin-top: 14px; }
+  .poolblock + .poolblock { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--line); }
+  .poolhead { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 8px; }
+  .poolhead b { font-size: 13px; letter-spacing: .01em; }
+  .gate { border-bottom: 1px dotted var(--muted); cursor: help; }
+  .confirm { color: var(--warn); }
+  button.icon { padding: 5px 10px; font-size: 14px; line-height: 1; }
 </style>
+<script>
+  // The toggle at the end of the body follows this choice; deciding here keeps
+  // the first paint from flashing the wrong colours.
+  try {
+    var saved = localStorage.getItem("nodescale-ui-theme");
+    document.documentElement.setAttribute("data-theme",
+      saved === "light" || saved === "dark" ? saved :
+      (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"));
+  } catch (e) {}
+</script>
 </head>
 <body>
 <header>
-  <h1>nodescale-ui</h1>
+  <h1>nodescale-ui<small id="clusterName"></small></h1>
   <select id="poolPick" class="muted" style="background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:4px 6px;font:inherit"></select>
   <span class="spacer"></span>
+  <button class="ghost icon" id="theme" title="colors: day / night">&#9789;</button>
   <span class="chip" id="whoami" title="signed-in account"></span>
   <button class="ghost" id="signOut" title="sign out" style="display:none">sign out</button>
   <span class="small muted" id="stamp">loading…</span>
@@ -158,6 +183,7 @@
           <button id="setReplicas" title="send this number to the controller">set replicas</button>
         </div>
         <div class="small muted" id="replicasHint" style="margin-top:6px"></div>
+        <div class="small muted" id="gates" style="margin-top:4px"></div>
       </div>
     </div>
     <div class="banner" id="warning" role="alert">
@@ -176,27 +202,7 @@
         <span>requests · limits · real, each on its own</span>
       </div>
     </div>
-    <div class="scroll">
-      <table>
-        <thead>
-          <tr>
-            <th rowspan="2">node</th>
-            <th rowspan="2" class="grp">phase</th>
-            <th colspan="3" class="grp" style="text-align:center">CPU</th>
-            <th colspan="3" class="grp" style="text-align:center">memory</th>
-            <th rowspan="2" class="grow"></th>
-            <th rowspan="2"></th>
-          </tr>
-          <tr>
-            <th class="grp">req</th><th>lim</th><th>real</th>
-            <th class="grp">req</th><th>lim</th><th>real</th>
-          </tr>
-        </thead>
-        <tbody id="rows">
-          <tr><td colspan="10" class="muted small">loading…</td></tr>
-        </tbody>
-      </table>
-    </div>
+    <div id="pools"><div class="muted small">loading…</div></div>
     <div class="small muted" id="realSource" style="margin-top:8px"></div>
   </section>
 </main>
@@ -206,7 +212,8 @@
 (function () {
   "use strict";
   var BASE = "__PREFIX__";
-  var state = { pools: [], current: null, stamp: "", stale: false, me: null, draft: null, flavorDraft: null };
+  var state = { pools: [], current: null, stamp: "", stale: false, me: null, draft: null,
+                flavorDraft: null, pendingDelete: null };
   var pick = document.getElementById("poolPick");
 
   function esc(s) {
@@ -254,8 +261,9 @@
     });
   }
 
-  function post(action, body) {
-    var p = state.current;
+  function post(action, body, pool) {
+    var p = pool || state.current;
+    if (!p) { return Promise.resolve(); }
     return api("/api/pools/" + encodeURIComponent(p.namespace) + "/" + encodeURIComponent(p.name) + "/" + action, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Requested-With": "nodescale-ui" },
@@ -270,9 +278,13 @@
     return api("/api/me").then(function (me) {
       state.me = me;
       var chip = document.getElementById("whoami");
-      chip.textContent = me.auth ? me.username + " · " + me.role : "no auth";
+      // The account and the group it belongs to: "admin · admins" reads right,
+      // "admin · admin" looks like a bug.
+      chip.textContent = me.auth ? me.username + " · " + (me.role === "admin" ? "admins" : "viewers") : "no auth";
+      chip.title = me.auth ? "signed in as " + me.username + ", role " + me.role : "authentication is off";
       chip.className = "chip " + (me.role === "admin" ? "ok" : "warn");
       document.getElementById("signOut").style.display = me.auth ? "" : "none";
+      document.getElementById("clusterName").textContent = me.cluster || "";
     }).catch(function () {
       state.me = null;
     });
@@ -318,7 +330,7 @@
     var stamp = document.getElementById("stamp");
     if (!p) {
       stamp.textContent = "no K8sWorkerPool in this cluster";
-      document.getElementById("rows").innerHTML = '<tr><td colspan="10" class="muted small">nothing to show</td></tr>';
+      renderWorkers();
       return;
     }
     stamp.textContent = (state.stale ? "stale · " : "") + (state.stamp ? new Date(state.stamp).toLocaleTimeString() : "");
@@ -351,28 +363,89 @@
     document.getElementById("scaleActions").style.display = admin ? "" : "none";
     document.getElementById("flavorActions").style.display = admin ? "" : "none";
 
-    var rows = p.nodes.map(function (n) {
-      var act = n.deleting
-        ? '<span class="small muted">removing…</span>'
-        : admin
-          ? '<button class="danger" data-del="' + esc(n.name) + '">delete</button>'
-          : '<span class="small muted">view only</span>';
-      return "<tr>" +
-        "<td>" + esc(n.name) + (n.ip ? ' <span class="small ip">' + esc(n.ip) + "</span>" : "") + "</td>" +
-        '<td class="grp"><span class="chip' + (n.phase === "Ready" ? " ok" : "") + '">' + esc(n.phase) + "</span></td>" +
-        '<td class="grp">' + cpuCell(n.requests) + "</td><td>" + cpuCell(n.limits) + "</td><td>" + cpuCell(n.real) + "</td>" +
-        '<td class="grp">' + memCell(n.requests) + "</td><td>" + memCell(n.limits) + "</td><td>" + memCell(n.real) + "</td>" +
-        '<td class="grow"></td>' +
-        "<td>" + act + "</td></tr>";
-    }).join("");
-    document.getElementById("rows").innerHTML = rows ||
-      '<tr><td colspan="10" class="muted small">no workers in this pool</td></tr>';
+    // scaleDown.allowLastWorker is a kubectl-only gate: show its state, explain
+    // it on hover, never offer to change it here.
+    var gates = document.getElementById("gates");
+    gates.innerHTML = "minReplicas <b>" + p.minReplicas + "</b> · " +
+      '<span class="gate" title="' + esc(allowLastWorkerTip(p)) + '">allowLastWorker: ' + p.allowLastWorker + "</span>";
+
+    renderWorkers();
+  }
+
+  function allowLastWorkerTip(p) {
+    return "allowLastWorker: " + p.allowLastWorker + " - read only here. A pool may only go to zero " +
+      "workers when this is true, and it can only be changed with kubectl: " +
+      "kubectl -n " + p.namespace + " patch k8sworkerpool " + p.name +
+      " --type=merge -p '{\"spec\":{\"scaleDown\":{\"allowLastWorker\":true}}}'";
+  }
+
+  function poolKey(p) { return p.namespace + "/" + p.name; }
+
+  function workerRow(p, n, admin) {
+    var act;
+    if (n.deleting) {
+      act = '<span class="small muted">removing…</span>';
+    } else if (!admin) {
+      act = '<span class="small muted">view only</span>';
+    } else if (state.pendingDelete && state.pendingDelete.pool === poolKey(p) && state.pendingDelete.worker === n.name) {
+      // A second click on the same row, not a native dialog a browser may
+      // suppress: this is the confirmation.
+      act = '<span class="small confirm">delete it?</span> ' +
+        '<button class="danger" data-yes="' + esc(n.name) + '" data-pool="' + esc(poolKey(p)) + '">yes</button> ' +
+        '<button class="ghost" data-no="1">no</button>';
+    } else {
+      act = '<button class="danger" data-del="' + esc(n.name) + '" data-pool="' + esc(poolKey(p)) + '">delete</button>';
+    }
+    return "<tr>" +
+      "<td>" + esc(n.name) + (n.ip ? '<span class="chip ip">' + esc(n.ip) + "</span>" : "") + "</td>" +
+      '<td class="grp"><span class="chip' + (n.phase === "Ready" ? " ok" : "") + '">' + esc(n.phase) + "</span></td>" +
+      '<td class="grp">' + cpuCell(n.requests) + "</td><td>" + cpuCell(n.limits) + "</td><td>" + cpuCell(n.real) + "</td>" +
+      '<td class="grp">' + memCell(n.requests) + "</td><td>" + memCell(n.limits) + "</td><td>" + memCell(n.real) + "</td>" +
+      '<td class="grow"></td>' +
+      "<td>" + act + "</td></tr>";
+  }
+
+  function poolBlock(p, admin) {
+    var rows = p.nodes.map(function (n) { return workerRow(p, n, admin); }).join("");
+    return '<div class="poolblock">' +
+      '<div class="poolhead">' +
+        "<b>" + esc(p.name) + "</b>" +
+        '<span class="small muted">' + esc(p.namespace) + "</span>" +
+        '<span class="chip">' + p.nodes.length + (p.nodes.length === 1 ? " worker" : " workers") + "</span>" +
+        '<span class="chip' + (p.readyReplicas >= p.replicas ? " ok" : " warn") + '">' +
+          p.readyReplicas + "/" + p.replicas + " ready</span>" +
+        (p.warning ? '<span class="chip warn" title="' + esc(p.warning) + '">not reconciled</span>' : "") +
+      "</div>" +
+      '<div class="scroll"><table>' +
+        "<thead><tr>" +
+          '<th rowspan="2">node</th>' +
+          '<th rowspan="2" class="grp">phase</th>' +
+          '<th colspan="3" class="grp" style="text-align:center">CPU</th>' +
+          '<th colspan="3" class="grp" style="text-align:center">memory</th>' +
+          '<th rowspan="2" class="grow"></th><th rowspan="2"></th>' +
+        "</tr><tr>" +
+          '<th class="grp">req</th><th>lim</th><th>real</th>' +
+          '<th class="grp">req</th><th>lim</th><th>real</th>' +
+        "</tr></thead><tbody>" +
+        (rows || '<tr><td colspan="10" class="muted small">no workers in this pool</td></tr>') +
+        "</tbody></table></div></div>";
+  }
+
+  function renderWorkers() {
+    var box = document.getElementById("pools");
+    var admin = !state.me || state.me.role === "admin";
+    box.innerHTML = state.pools.length
+      ? state.pools.map(function (p) { return poolBlock(p, admin); }).join("")
+      : '<div class="muted small">no K8sWorkerPool in this cluster</div>';
 
     var sources = {};
-    p.nodes.forEach(function (n) { if (n.realSource) { sources[n.realSource] = (sources[n.realSource] || 0) + 1; } });
+    state.pools.forEach(function (p) {
+      p.nodes.forEach(function (n) { if (n.realSource) { sources[n.realSource] = (sources[n.realSource] || 0) + 1; } });
+    });
     var parts = Object.keys(sources).map(function (k) { return sources[k] + " × " + k; });
-    document.getElementById("realSource").textContent =
-      parts.length ? "real utilisation from " + parts.join(", ") : "real utilisation unavailable: no node-exporter and no metrics-server answer";
+    document.getElementById("realSource").textContent = parts.length
+      ? "real utilisation from " + parts.join(", ")
+      : "real utilisation unavailable: no node-exporter and no metrics-server answer";
   }
 
   // The buttons edit a draft in the field; nothing reaches the pool until the
@@ -441,12 +514,11 @@
   function renderFlavorDraft() {
     var p = state.current;
     var hint = document.getElementById("flavorHint");
-    var floor = p ? "minReplicas " + p.minReplicas + (p.allowLastWorker ? " · last worker allowed" : "") : "";
     var d = state.flavorDraft;
-    if (!d || !p) { hint.textContent = floor; return; }
+    if (!d || !p) { hint.textContent = ""; return; }
     if (d.cpus === p.flavor.cpus && d.memoryMB === p.flavor.memoryMB &&
         (d.osDiskGB || 0) === (p.flavor.osDiskGB || 0)) {
-      hint.textContent = floor;
+      hint.textContent = "";
       return;
     }
     hint.textContent = "draft " + (d.cpus || "?") + " vCPU / " + (d.memoryMB || "?") + " MB / " +
@@ -470,11 +542,43 @@
     state.flavorDraft = null;
     post("flavor", body);
   });
-  document.getElementById("rows").addEventListener("click", function (ev) {
-    var name = ev.target && ev.target.getAttribute && ev.target.getAttribute("data-del");
-    if (!name) { return; }
-    if (!window.confirm("Remove " + name + "? It is drained and deleted, and the pool loses one worker.")) { return; }
-    post("delete-workers", { workers: [name] });
+  document.getElementById("pools").addEventListener("click", function (ev) {
+    var t = ev.target;
+    if (!t || !t.getAttribute) { return; }
+    if (t.getAttribute("data-no") !== null) {
+      state.pendingDelete = null;
+      renderWorkers();
+      return;
+    }
+    var key = t.getAttribute("data-pool");
+    var parts = key ? key.split("/") : null;
+    var pool = parts ? findPool(parts[0], parts.slice(1).join("/")) : null;
+    if (!pool) { return; }
+    var yes = t.getAttribute("data-yes");
+    if (yes) {
+      state.pendingDelete = null;
+      post("delete-workers", { workers: [yes] }, pool);
+      return;
+    }
+    var del = t.getAttribute("data-del");
+    if (del) {
+      // First click only asks; the row then carries yes / no.
+      state.pendingDelete = { pool: key, worker: del };
+      renderWorkers();
+    }
+  });
+
+  var themeBtn = document.getElementById("theme");
+  function applyTheme(mode) {
+    document.documentElement.setAttribute("data-theme", mode);
+    themeBtn.textContent = mode === "dark" ? "\u2600" : "\u263e";
+    themeBtn.title = mode === "dark" ? "switch to day colors" : "switch to night colors";
+  }
+  applyTheme(document.documentElement.getAttribute("data-theme") === "dark" ? "dark" : "light");
+  themeBtn.addEventListener("click", function () {
+    var next = document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark";
+    try { localStorage.setItem("nodescale-ui-theme", next); } catch (e) {}
+    applyTheme(next);
   });
   pick.addEventListener("change", function () {
     var parts = pick.value.split("/");
