@@ -60,6 +60,9 @@
   table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
   th, td { padding: 7px 9px; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; }
   th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: left; }
+  /* the node column is as wide as "name + ip", never wider */
+  th:first-child, td:first-child, th:last-child, td:last-child { width: 1%; }
+  .ip { color: steelblue; }
   thead th { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); font-weight: 600; }
   tbody tr:hover { background: var(--chip); }
   .lv-ok { color: var(--ok); font-weight: 600; }
@@ -88,16 +91,24 @@
   th, td { border-left: 1px solid var(--line); }
   th:first-child, td:first-child { border-left: 0; }
   th.grp, td.grp { border-left: 2px solid var(--line); }
+  /* the upper card is two panes: scale-up/down on the left, scale-in/out on
+     the right, each with its own contour */
+  .split { display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-start; }
+  .pane { flex: 1 1 340px; border: 1px solid var(--line); border-radius: 8px; padding: 12px; }
+  .pane-title { margin-bottom: 10px; font-size: 11px; text-transform: uppercase;
+                letter-spacing: .04em; color: var(--muted); font-weight: 600; }
   /* the flavour, one value per line so it reads as a spec sheet */
-  .flavor { display: flex; flex-direction: column; gap: 2px; min-width: 240px; }
+  .flavor { display: flex; flex-direction: column; gap: 2px; min-width: 220px;
+            border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
+            background: var(--bg); }
   .flavor .fl { display: flex; gap: 10px; font-size: 13px; }
   .flavor .fl span { color: var(--muted); min-width: 68px; }
   .flavor .fl b { font-weight: 600; font-variant-numeric: tabular-nums; }
   /* the pool is not being reconciled: impossible to miss */
-  .banner { margin-top: 12px; display: none; border: 1px solid var(--high);
-            border-left: 4px solid var(--high); border-radius: 8px;
-            padding: 10px 12px; background: rgba(179, 38, 30, .07); }
-  .banner strong { display: block; margin-bottom: 3px; color: var(--high); }
+  .banner { margin-top: 12px; display: none; border: 1px solid var(--warn);
+            border-left: 4px solid var(--warn); border-radius: 8px;
+            padding: 10px 12px; background: rgba(179, 92, 0, .10); }
+  .banner strong { display: block; margin-bottom: 3px; color: var(--warn); }
   .banner code { font-size: 12px; white-space: pre-wrap; word-break: break-word; }
 </style>
 </head>
@@ -113,35 +124,39 @@
 
 <main>
   <section class="card" id="summary">
-    <div class="row" style="justify-content:space-between">
-      <div class="kpi">
-        <div><span class="small muted" title="spec.replicas: what you asked for">desired</span><b id="kReplicas">–</b></div>
-        <div><span class="small muted" title="status.observedReplicas: what the controller sees in vCD">in vCD</span><b id="kObserved">–</b></div>
-        <div><span class="small muted" title="status.readyReplicas: how many of them are Ready">ready</span><b id="kReady">–</b></div>
-        <div><span class="small muted" title="status.rollout.phase">rollout</span><b id="kPhase">–</b></div>
+    <div class="split">
+      <div class="pane">
+        <div class="pane-title">flavor &middot; scale-up / down</div>
+        <div class="flavor">
+          <div class="fl"><span>vCPU</span><b id="kCpus">&ndash;</b></div>
+          <div class="fl"><span>RAM</span><b id="kMem">&ndash;</b></div>
+          <div class="fl"><span>OS Disk</span><b id="kDisk">&ndash;</b></div>
+          <div class="fl"><span>Template</span><b id="kTemplate">&ndash;</b></div>
+        </div>
+        <div class="row" id="flavorActions" style="margin-top:10px">
+          <input type="number" id="fCpus" min="1" step="1" placeholder="cpus" title="vCPU">
+          <input type="number" id="fMem" min="512" step="512" placeholder="memory MB" title="RAM, MB">
+          <input type="number" id="fDisk" min="0" step="1" placeholder="os disk GB" title="OS disk, GB">
+          <button id="setFlavor" title="send this flavor to the controller">apply flavor</button>
+        </div>
+        <div class="small muted" id="flavorHint" style="margin-top:6px"></div>
       </div>
-      <div class="row" id="scaleActions">
-        <button class="ghost" id="minus" title="one fewer worker: changes the number only">−1</button>
-        <button class="ghost" id="plus" title="one more worker: changes the number only">+1</button>
-        <input type="number" id="replicasInput" min="0" step="1" title="desired workers">
-        <button id="setReplicas" title="send this number to the controller">set replicas</button>
-        <span class="small muted" id="replicasHint"></span>
+      <div class="pane">
+        <div class="pane-title">replicas &middot; scale-in / out</div>
+        <div class="kpi">
+          <div><span class="small muted" title="spec.replicas: what you asked for">desired</span><b id="kReplicas">&ndash;</b></div>
+          <div><span class="small muted" title="status.observedReplicas: what the controller sees in vCD">in vCD</span><b id="kObserved">&ndash;</b></div>
+          <div><span class="small muted" title="status.readyReplicas: how many of them are Ready">ready</span><b id="kReady">&ndash;</b></div>
+          <div><span class="small muted" title="status.rollout.phase">rollout</span><b id="kPhase">&ndash;</b></div>
+        </div>
+        <div class="row" id="scaleActions" style="margin-top:10px">
+          <button class="ghost" id="minus" title="one fewer worker: changes the number only">&minus;1</button>
+          <button class="ghost" id="plus" title="one more worker: changes the number only">+1</button>
+          <input type="number" id="replicasInput" min="0" step="1" title="desired workers">
+          <button id="setReplicas" title="send this number to the controller">set replicas</button>
+        </div>
+        <div class="small muted" id="replicasHint" style="margin-top:6px"></div>
       </div>
-    </div>
-    <div class="flavor" style="margin-top:12px">
-      <span class="small muted">flavor</span>
-      <div class="fl"><span>vCPU</span><b id="kCpus">–</b></div>
-      <div class="fl"><span>RAM</span><b id="kMem">–</b></div>
-      <div class="fl"><span>OS Disk</span><b id="kDisk">–</b></div>
-      <div class="fl"><span>Template</span><b id="kTemplate">–</b></div>
-    </div>
-    <div class="row" id="flavorActions" style="margin-top:12px">
-      <span class="small muted">scale-up / down</span>
-      <input type="number" id="fCpus" min="1" step="1" placeholder="cpus">
-      <input type="number" id="fMem" min="512" step="512" placeholder="memory MB">
-      <input type="number" id="fDisk" min="0" step="1" placeholder="os disk GB">
-      <button id="setFlavor">apply flavor</button>
-      <span class="small muted" id="flavorHint"></span>
     </div>
     <div class="banner" id="warning" role="alert">
       <strong>the pool is not being reconciled</strong>
@@ -170,8 +185,8 @@
             <th rowspan="2"></th>
           </tr>
           <tr>
-            <th>req</th><th>lim</th><th>real</th>
-            <th>req</th><th>lim</th><th>real</th>
+            <th class="grp">req</th><th>lim</th><th>real</th>
+            <th class="grp">req</th><th>lim</th><th>real</th>
           </tr>
         </thead>
         <tbody id="rows">
@@ -188,7 +203,7 @@
 (function () {
   "use strict";
   var BASE = "__PREFIX__";
-  var state = { pools: [], current: null, stamp: "", stale: false, me: null, draft: null };
+  var state = { pools: [], current: null, stamp: "", stale: false, me: null, draft: null, flavorDraft: null };
   var pick = document.getElementById("poolPick");
 
   function esc(s) {
@@ -322,11 +337,12 @@
       document.getElementById("replicasInput").value = p.replicas;
     }
     renderDraftHint();
-    document.getElementById("fCpus").value = p.flavor.cpus;
-    document.getElementById("fMem").value = p.flavor.memoryMB;
-    document.getElementById("fDisk").value = p.flavor.osDiskGB || "";
-    document.getElementById("flavorHint").textContent =
-      "minReplicas " + p.minReplicas + (p.allowLastWorker ? " · last worker allowed" : "");
+    if (state.flavorDraft === null) {
+      document.getElementById("fCpus").value = p.flavor.cpus;
+      document.getElementById("fMem").value = p.flavor.memoryMB;
+      document.getElementById("fDisk").value = p.flavor.osDiskGB || "";
+    }
+    renderFlavorDraft();
 
     var admin = !state.me || state.me.role === "admin";
     document.getElementById("scaleActions").style.display = admin ? "" : "none";
@@ -339,7 +355,7 @@
           ? '<button class="danger" data-del="' + esc(n.name) + '">delete</button>'
           : '<span class="small muted">view only</span>';
       return "<tr>" +
-        "<td>" + esc(n.name) + (n.ip ? ' <span class="small muted">' + esc(n.ip) + "</span>" : "") + "</td>" +
+        "<td>" + esc(n.name) + (n.ip ? ' <span class="small ip">' + esc(n.ip) + "</span>" : "") + "</td>" +
         '<td class="grp"><span class="chip' + (n.phase === "Ready" ? " ok" : "") + '">' + esc(n.phase) + "</span></td>" +
         '<td class="grp">' + cpuCell(n.requests) + "</td><td>" + cpuCell(n.limits) + "</td><td>" + cpuCell(n.real) + "</td>" +
         '<td class="grp">' + memCell(n.requests) + "</td><td>" + memCell(n.limits) + "</td><td>" + memCell(n.real) + "</td>" +
@@ -408,12 +424,46 @@
     state.draft = null;
     post("replicas", { replicas: v });
   });
-  document.getElementById("setFlavor").addEventListener("click", function () {
-    var body = {
-      cpus: parseInt(document.getElementById("fCpus").value, 10) || 0,
-      memoryMB: parseInt(document.getElementById("fMem").value, 10) || 0,
-      osDiskGB: parseInt(document.getElementById("fDisk").value, 10) || 0
+  // Same rule as the replicas buttons: the fields are a draft, and only
+  // apply flavor sends them to the pool.
+  function readFlavor() {
+    return {
+      cpus: parseInt(document.getElementById("fCpus").value, 10),
+      memoryMB: parseInt(document.getElementById("fMem").value, 10),
+      osDiskGB: parseInt(document.getElementById("fDisk").value, 10)
     };
+  }
+
+  function renderFlavorDraft() {
+    var p = state.current;
+    var hint = document.getElementById("flavorHint");
+    var floor = p ? "minReplicas " + p.minReplicas + (p.allowLastWorker ? " · last worker allowed" : "") : "";
+    var d = state.flavorDraft;
+    if (!d || !p) { hint.textContent = floor; return; }
+    if (d.cpus === p.flavor.cpus && d.memoryMB === p.flavor.memoryMB &&
+        (d.osDiskGB || 0) === (p.flavor.osDiskGB || 0)) {
+      hint.textContent = floor;
+      return;
+    }
+    hint.textContent = "draft " + (d.cpus || "?") + " vCPU / " + (d.memoryMB || "?") + " MB / " +
+      (d.osDiskGB || 0) + " GB - press apply flavor";
+  }
+
+  ["fCpus", "fMem", "fDisk"].forEach(function (id) {
+    document.getElementById(id).addEventListener("input", function () {
+      state.flavorDraft = readFlavor();
+      renderFlavorDraft();
+    });
+  });
+
+  document.getElementById("setFlavor").addEventListener("click", function () {
+    var body = readFlavor();
+    if (!body.cpus || !body.memoryMB) {
+      toast("vCPU and RAM are required", true);
+      return;
+    }
+    body.osDiskGB = body.osDiskGB || 0;
+    state.flavorDraft = null;
     post("flavor", body);
   });
   document.getElementById("rows").addEventListener("click", function (ev) {
@@ -426,6 +476,7 @@
     var parts = pick.value.split("/");
     state.current = findPool(parts[0], parts.slice(1).join("/"));
     state.draft = null;
+    state.flavorDraft = null;
     render();
   });
 
