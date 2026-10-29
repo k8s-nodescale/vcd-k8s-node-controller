@@ -48,6 +48,9 @@
   }
   header h1 { font-size: 15px; margin: 0; letter-spacing: .02em; line-height: 1.25; }
   header h1 small { display: block; font-size: 11px; font-weight: 400; color: var(--muted); }
+  #whoami { font-size: 13px; white-space: nowrap; }
+  .chip.group.ok { background: rgba(30, 123, 52, .16); }
+  .chip.group.warn { background: rgba(179, 92, 0, .16); }
   header .spacer { flex: 1 1 auto; }
   .muted { color: var(--muted); }
   .small { font-size: 12px; }
@@ -68,8 +71,10 @@
      numbers stay next to each other and the actions stay on the right */
   th, td { width: 1%; }
   th.grow, td.grow { width: auto; }
-  /* req, lim and real get twice the room their text needs */
-  td:nth-child(n+3):nth-child(-n+8), thead tr:nth-child(2) th { width: 96px; }
+  /* phase, req, lim and real take a share of the card instead of a fixed
+     width, so they widen with the window and never leave a gap */
+  td:nth-child(2), thead tr:first-child th:nth-child(2) { width: 8%; }
+  td:nth-child(n+3):nth-child(-n+8), thead tr:nth-child(2) th { width: 12%; }
   .chip.ip { color: var(--ipfg); background: var(--ipbg); margin-left: 12px; }
   thead th { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); font-weight: 600; }
   tbody tr:hover { background: var(--chip); }
@@ -145,7 +150,7 @@
   <select id="poolPick" class="muted" style="background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:4px 6px;font:inherit"></select>
   <span class="spacer"></span>
   <button class="ghost icon" id="theme" title="switch the colours">night</button>
-  <span class="chip" id="whoami" title="signed-in account"></span>
+  <span id="whoami" title="signed-in account"></span>
   <button class="ghost" id="signOut" title="sign out" style="display:none">sign out</button>
   <span class="small muted" id="stamp">loading…</span>
 </header>
@@ -279,11 +284,14 @@
     return api("/api/me").then(function (me) {
       state.me = me;
       var chip = document.getElementById("whoami");
-      // The account and the group it belongs to: "admin · admins" reads right,
-      // "admin · admin" looks like a bug.
-      chip.textContent = me.auth ? me.username + " · " + (me.role === "admin" ? "admins" : "viewers") : "no auth";
-      chip.title = me.auth ? "signed in as " + me.username + ", role " + me.role : "authentication is off";
-      chip.className = "chip " + (me.role === "admin" ? "ok" : "warn");
+      // The account, then the group it belongs to in brackets on its own
+      // colour: "admin - [admins]".
+      var group = me.role === "admin" ? "admins" : "viewers";
+      chip.innerHTML = me.auth
+        ? esc(me.username) + ' <span class="muted">-</span> <span class="chip group ' +
+            (me.role === "admin" ? "ok" : "warn") + '">[' + group + "]</span>"
+        : '<span class="chip">no auth</span>';
+      chip.title = me.auth ? "signed in as " + me.username + ", group " + group : "authentication is off";
       document.getElementById("signOut").style.display = me.auth ? "" : "none";
       document.getElementById("clusterName").textContent = me.cluster || "";
     }).catch(function () {
