@@ -121,10 +121,11 @@
         <div><span class="small muted" title="status.rollout.phase">rollout</span><b id="kPhase">–</b></div>
       </div>
       <div class="row" id="scaleActions">
-        <button class="ghost" id="minus" title="scale-in: spec.replicas - 1">−1</button>
-        <button class="ghost" id="plus" title="scale-out: spec.replicas + 1">+1</button>
-        <input type="number" id="replicasInput" min="0" step="1">
-        <button id="setReplicas">set replicas</button>
+        <button class="ghost" id="minus" title="one fewer worker: changes the number only">−1</button>
+        <button class="ghost" id="plus" title="one more worker: changes the number only">+1</button>
+        <input type="number" id="replicasInput" min="0" step="1" title="desired workers">
+        <button id="setReplicas" title="send this number to the controller">set replicas</button>
+        <span class="small muted" id="replicasHint"></span>
       </div>
     </div>
     <div class="flavor" style="margin-top:12px">
@@ -187,7 +188,7 @@
 (function () {
   "use strict";
   var BASE = "__PREFIX__";
-  var state = { pools: [], current: null, stamp: "", stale: false, me: null };
+  var state = { pools: [], current: null, stamp: "", stale: false, me: null, draft: null };
   var pick = document.getElementById("poolPick");
 
   function esc(s) {
@@ -317,7 +318,10 @@
     document.getElementById("warningText").textContent = p.warning || "";
     warn.style.display = p.warning ? "" : "none";
 
-    document.getElementById("replicasInput").value = p.replicas;
+    if (state.draft === null) {
+      document.getElementById("replicasInput").value = p.replicas;
+    }
+    renderDraftHint();
     document.getElementById("fCpus").value = p.flavor.cpus;
     document.getElementById("fMem").value = p.flavor.memoryMB;
     document.getElementById("fDisk").value = p.flavor.osDiskGB || "";
@@ -351,22 +355,57 @@
       parts.length ? "real utilisation from " + parts.join(", ") : "real utilisation unavailable: no node-exporter and no metrics-server answer";
   }
 
+  // The buttons edit a draft in the field; nothing reaches the pool until the
+  // operator presses set replicas, so a mis-click never rolls a VM.
+  function draftValue() {
+    if (state.draft !== null) { return state.draft; }
+    return state.current ? state.current.replicas : 0;
+  }
+
+  function setDraft(next) {
+    if (next < 0) { next = 0; }
+    state.draft = next;
+    document.getElementById("replicasInput").value = next;
+    renderDraftHint();
+  }
+
+  function renderDraftHint() {
+    var input = document.getElementById("replicasInput");
+    var hint = document.getElementById("replicasHint");
+    var desired = state.current ? state.current.replicas : null;
+    if (state.draft !== null && state.draft !== desired) {
+      hint.textContent = "draft " + state.draft + " (desired " + desired + ") - press set replicas";
+      input.style.borderColor = "var(--accent)";
+    } else {
+      hint.textContent = "";
+      input.style.borderColor = "";
+    }
+  }
+
   document.getElementById("plus").addEventListener("click", function () {
-    if (state.current) { post("replicas", { replicas: state.current.replicas + 1 }); }
+    if (state.current) { setDraft(draftValue() + 1); }
   });
   document.getElementById("minus").addEventListener("click", function () {
+    if (state.current) { setDraft(draftValue() - 1); }
+  });
+  document.getElementById("replicasInput").addEventListener("input", function () {
+    var v = parseInt(this.value, 10);
+    state.draft = isNaN(v) || v < 0 ? null : v;
+    renderDraftHint();
+  });
+  document.getElementById("setReplicas").addEventListener("click", function () {
     if (!state.current) { return; }
-    var next = state.current.replicas - 1;
-    if (next < 0) { return; }
-    if (next === 0 && !state.current.allowLastWorker) {
+    var v = parseInt(document.getElementById("replicasInput").value, 10);
+    if (isNaN(v) || v < 0) { toast("replicas must be a number >= 0", true); return; }
+    if (v < state.current.minReplicas) {
+      toast("the pool floor is minReplicas: " + state.current.minReplicas, true);
+      return;
+    }
+    if (v === 0 && !state.current.allowLastWorker) {
       toast("scale-in to 0 needs scaleDown.allowLastWorker: true on the pool", true);
       return;
     }
-    post("replicas", { replicas: next });
-  });
-  document.getElementById("setReplicas").addEventListener("click", function () {
-    var v = parseInt(document.getElementById("replicasInput").value, 10);
-    if (isNaN(v) || v < 0) { toast("replicas must be a number >= 0", true); return; }
+    state.draft = null;
     post("replicas", { replicas: v });
   });
   document.getElementById("setFlavor").addEventListener("click", function () {
@@ -386,6 +425,7 @@
   pick.addEventListener("change", function () {
     var parts = pick.value.split("/");
     state.current = findPool(parts[0], parts.slice(1).join("/"));
+    state.draft = null;
     render();
   });
 
