@@ -125,7 +125,8 @@
   .poolhead b { font-size: 13px; letter-spacing: .01em; }
   .gate { border-bottom: 1px dotted var(--muted); cursor: help; }
   .confirm { color: var(--warn); }
-  button.icon { padding: 5px 10px; font-size: 14px; line-height: 1; }
+  button.icon { padding: 5px 10px; font-size: 12px; line-height: 1.2; }
+  button.small { padding: 3px 9px; font-size: 12px; }
 </style>
 <script>
   // The toggle at the end of the body follows this choice; deciding here keeps
@@ -143,7 +144,7 @@
   <h1>nodescale-ui<small id="clusterName"></small></h1>
   <select id="poolPick" class="muted" style="background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:4px 6px;font:inherit"></select>
   <span class="spacer"></span>
-  <button class="ghost icon" id="theme" title="colors: day / night">&#9789;</button>
+  <button class="ghost icon" id="theme" title="switch the colours">night</button>
   <span class="chip" id="whoami" title="signed-in account"></span>
   <button class="ghost" id="signOut" title="sign out" style="display:none">sign out</button>
   <span class="small muted" id="stamp">loading…</span>
@@ -392,7 +393,7 @@
       // suppress: this is the confirmation.
       act = '<span class="small confirm">delete it?</span> ' +
         '<button class="danger" data-yes="' + esc(n.name) + '" data-pool="' + esc(poolKey(p)) + '">yes</button> ' +
-        '<button class="ghost" data-no="1">no</button>';
+        '<button class="ghost small" data-no="1">no</button>';
     } else {
       act = '<button class="danger" data-del="' + esc(n.name) + '" data-pool="' + esc(poolKey(p)) + '">delete</button>';
     }
@@ -571,8 +572,8 @@
   var themeBtn = document.getElementById("theme");
   function applyTheme(mode) {
     document.documentElement.setAttribute("data-theme", mode);
-    themeBtn.textContent = mode === "dark" ? "\u2600" : "\u263e";
-    themeBtn.title = mode === "dark" ? "switch to day colors" : "switch to night colors";
+    themeBtn.textContent = mode === "dark" ? "day" : "night";
+    themeBtn.title = mode === "dark" ? "switch to the day colours" : "switch to the night colours";
   }
   applyTheme(document.documentElement.getAttribute("data-theme") === "dark" ? "dark" : "light");
   themeBtn.addEventListener("click", function () {
