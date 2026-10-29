@@ -37,12 +37,13 @@ func main() {
 	flag.DurationVar(&refresh, "refresh-interval", 15*time.Second, "how often the snapshot is rebuilt")
 
 	var authSecret, authKey, authNamespace string
-	var authRefresh time.Duration
+	var authRefresh, authSessionTTL time.Duration
 	var authDisabled bool
 	flag.StringVar(&authSecret, "auth-secret", "nodescale-ui-auth", "Secret that holds the accounts")
 	flag.StringVar(&authKey, "auth-secret-key", "users.yaml", "key of the accounts file inside the Secret")
 	flag.StringVar(&authNamespace, "auth-namespace", podNamespace(), "namespace of the Secret (default: the pod's own)")
 	flag.DurationVar(&authRefresh, "auth-refresh", time.Minute, "how often the Secret is re-read")
+	flag.DurationVar(&authSessionTTL, "auth-session-ttl", mgmt.DefaultSessionTTL, "how long a sign-in lasts")
 	flag.BoolVar(&authDisabled, "auth-disabled", false, "serve without authentication (local use only)")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
@@ -84,6 +85,7 @@ func main() {
 		SecretName: authSecret,
 		SecretKey:  authKey,
 		Refresh:    authRefresh,
+		SessionTTL: authSessionTTL,
 		Disabled:   authDisabled,
 	}
 	if authDisabled {

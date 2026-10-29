@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nodescale-ui - sign in</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f6f7f9; --card: #ffffff; --fg: #1b1f24; --muted: #5c6672;
+    --line: #dfe3e8; --accent: #14539a; --high: #b3261e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14171a; --card: #1c2024; --fg: #e6e9ee; --muted: #9aa4b0;
+      --line: #2b3138; --accent: #6aa9f0; --high: #f2695e;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; align-items: center;
+    justify-content: center; background: var(--bg); color: var(--fg);
+    font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  }
+  form {
+    width: 320px; max-width: calc(100vw - 32px); background: var(--card);
+    border: 1px solid var(--line); border-radius: 10px; padding: 24px;
+  }
+  h1 { margin: 0 0 4px; font-size: 18px; letter-spacing: .2px; }
+  p.sub { margin: 0 0 16px; color: var(--muted); font-size: 13px; }
+  p.err { margin: 0 0 12px; color: var(--high); font-size: 13px; }
+  p.err:empty { display: none; }
+  label { display: block; margin-bottom: 12px; }
+  label span { display: block; margin-bottom: 4px; color: var(--muted); font-size: 12px; }
+  input {
+    width: 100%; padding: 8px 10px; font: inherit; color: var(--fg);
+    background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
+  }
+  input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  button {
+    width: 100%; margin-top: 4px; padding: 9px 10px; font: inherit; font-weight: 600;
+    color: #ffffff; background: var(--accent); border: 0; border-radius: 6px; cursor: pointer;
+  }
+</style>
+</head>
+<body>
+<form method="post" action="__PREFIX__/api/login">
+  <h1>nodescale-ui</h1>
+  <p class="sub">Sign in to manage the worker pools.</p>
+  <p class="err" role="alert">__ERROR__</p>
+  <input type="hidden" name="next" value="__NEXT__">
+  <label><span>User name</span><input name="username" autocomplete="username" autofocus required></label>
+  <label><span>Password</span><input name="password" type="password" autocomplete="current-password" required></label>
+  <button type="submit">Sign in</button>
+</form>
+</body>
+</html>

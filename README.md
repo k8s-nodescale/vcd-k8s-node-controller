@@ -1084,18 +1084,33 @@ once, in which case the values set `ui.auth.createSecret: false`. They are then
 in `<playbook_dir>/.credentials/<inventory_hostname>/nodescale-ui-admin` and
 `nodescale-ui-viewer` (mode `0600`), not in the cluster at all.
 
-The API is HTTP Basic; the page has no session and no logout, so the browser's
-dialog is the session. Writes additionally require the header
-`X-Requested-With: nodescale-ui`, which a cross-site form cannot set:
+Signing in happens on a form at `/nodescale-ui/login`, not in the browser's
+Basic dialog: the page sets a signed cookie (`HttpOnly`, `SameSite=Strict`,
+`Secure` when the request is HTTPS, lifetime `ui.auth.sessionTTL`, 12h by
+default) and `sign out` in the header clears it. An unauthenticated visitor is
+redirected to the form; only the API answers `401`.
+
+The cookie is signed with a key derived from `users.yaml`, so any change to the
+accounts - a rotated password, an added or removed user - ends every session at
+once, without a restart and without waiting for the cookie to expire.
+
+HTTP Basic is still accepted, so a script or `curl` does not have to keep a
+cookie. Writes additionally require the header `X-Requested-With:
+nodescale-ui`, which a cross-site form cannot set:
 
 ```
-curl -u admin:'<password>' -X POST   -H 'Content-Type: application/json' -H 'X-Requested-With: nodescale-ui'   -d '{"replicas":3}'   http://<node>:<port>/nodescale-ui/api/pools/default/kion-web-dev/replicas
+curl -u admin:'<password>' -X POST \
+  -H 'Content-Type: application/json' \
+  -H 'X-Requested-With: nodescale-ui' \
+  -d '{"replicas":3}' \
+  http://<node>:<port>/nodescale-ui/api/pools/default/kion-web-dev/replicas
 ```
 
 Every accepted change is logged with the account and recorded on the pool:
 
 ```
-kubectl -n default get k8sworkerpool kion-web-dev   -o jsonpath='{.metadata.annotations.k8s-nodescale\.github\.io/last-action-by}'
+kubectl -n default get k8sworkerpool kion-web-dev \
+  -o jsonpath='{.metadata.annotations.k8s-nodescale\.github\.io/last-action-by}'
 ```
 
 ### Turning it off
@@ -1106,7 +1121,7 @@ Service, no Ingress, no Secret.
 ## Terraform integration contract
 
 - The Terraform module installs this chart behind a `node_controller.enabled`
-  toggle and pins `chart_version` / `image_tag` (currently `0.10.1`).
+  toggle and pins `chart_version` / `image_tag` (currently `0.11.0`).
 - **Once the controller is enabled, do not use Terraform to manage worker count
   or worker LB pool membership.** Use the CRD instead. The Terraform module's
   README must state this explicitly.
@@ -1137,7 +1152,7 @@ Build locally (the Dockerfile uses `golang:1.27.1-alpine` and
 `gcr.io/distroless/static:nonroot`):
 
 ```
-docker build -t docker.io/werton13/vcd-k8s-node-controller:0.10.1 .
+docker build -t docker.io/werton13/vcd-k8s-node-controller:0.11.0 .
 ```
 
 Public module defaults are used inside the build. On a restricted network,
@@ -1147,14 +1162,14 @@ override them:
 docker build \
   --build-arg GOPROXY=https://nexus.example.com/repository/golang/ \
   --build-arg GOSUMDB=off \
-  -t docker.io/werton13/vcd-k8s-node-controller:0.10.1 .
+  -t docker.io/werton13/vcd-k8s-node-controller:0.11.0 .
 ```
 
 Push (or use `make image-push`):
 
 ```
 docker login docker.io
-docker push docker.io/werton13/vcd-k8s-node-controller:0.10.1
+docker push docker.io/werton13/vcd-k8s-node-controller:0.11.0
 docker push docker.io/werton13/vcd-k8s-node-controller:latest
 ```
 

@@ -2,10 +2,12 @@ package mgmt
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -100,12 +102,16 @@ type Authenticator struct {
 	// without a restart.
 	Refresh time.Duration
 
+	// SessionTTL is how long the login cookie lasts.
+	SessionTTL time.Duration
+
 	// Disabled turns authentication off. It exists for a laptop run; the chart
 	// sets it only when ui.auth.enabled is false.
 	Disabled bool
 
 	mu    sync.RWMutex
 	users *Users
+	raw   []byte
 	at    time.Time
 	err   error
 }
@@ -154,8 +160,10 @@ func (a *Authenticator) Load(ctx context.Context) error {
 	key := client.ObjectKey{Namespace: a.namespace(), Name: a.SecretName}
 	err := a.Client.Get(ctx, key, secret)
 	var users *Users
+	var raw []byte
 	if err == nil {
-		raw, ok := secret.Data[a.secretKey()]
+		var ok bool
+		raw, ok = secret.Data[a.secretKey()]
 		if !ok {
 			err = fmt.Errorf("secret %s/%s has no key %q", a.namespace(), a.SecretName, a.secretKey())
 		} else {
@@ -163,13 +171,62 @@ func (a *Authenticator) Load(ctx context.Context) error {
 		}
 	}
 
+	var payload []byte
+	if users != nil {
+		payload = raw
+	}
+
 	a.mu.Lock()
-	a.users, a.at, a.err = users, time.Now(), err
+	a.users, a.raw, a.at, a.err = users, payload, time.Now(), err
 	a.mu.Unlock()
 	if err != nil {
 		logf("auth: %v", err)
 	}
 	return err
+}
+
+// TTL is the login cookie lifetime, with the default filled in.
+func (a *Authenticator) TTL() time.Duration {
+	if a.SessionTTL > 0 {
+		return a.SessionTTL
+	}
+	return DefaultSessionTTL
+}
+
+// SessionKey signs the login cookie. It is derived from the account file, so a
+// session survives a restart but ends the moment any account changes - which is
+// exactly when a signed-in browser should be asked again.
+func (a *Authenticator) SessionKey() []byte {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if len(a.raw) == 0 {
+		return nil
+	}
+	h := sha256.New()
+	h.Write([]byte("nodescale-ui-session-v1\n"))
+	h.Write(a.raw)
+	return h.Sum(nil)
+}
+
+// account returns the role and the password hash currently on file for a name.
+// The session path uses it to notice a removed account or a rotated password.
+func (a *Authenticator) account(username string) (Role, string, bool) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.users == nil || username == "" {
+		return "", "", false
+	}
+	for _, acc := range a.users.Admins {
+		if subtle.ConstantTimeCompare([]byte(acc.Username), []byte(username)) == 1 {
+			return RoleAdmin, acc.PasswordHash, true
+		}
+	}
+	for _, acc := range a.users.Viewers {
+		if subtle.ConstantTimeCompare([]byte(acc.Username), []byte(username)) == 1 {
+			return RoleViewer, acc.PasswordHash, true
+		}
+	}
+	return "", "", false
 }
 
 // Run reloads the Secret until ctx is done.
@@ -247,17 +304,20 @@ const (
 	csrfValue  = "nodescale-ui"
 )
 
-// withAuth wraps the mux. The health probe stays open; everything else needs
-// credentials, a write needs the CSRF header and the admin role.
+// withAuth wraps the mux. The health probe and the login form stay open;
+// everything else needs a signed-in browser, and a write needs the CSRF header
+// and the admin role. HTTP Basic is still accepted, so curl and a script do not
+// have to hold a cookie.
 func (s *Server) withAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := s.prefix()
+		if s.isOpen(r, p) {
+			next.ServeHTTP(w, r)
+			return
+		}
 		if s.Auth == nil || s.Auth.Disabled {
 			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), actorKey{},
 				Actor{Username: "", Role: RoleAdmin})))
-			return
-		}
-		if strings.HasSuffix(r.URL.Path, "/healthz") {
-			next.ServeHTTP(w, r)
 			return
 		}
 		if !s.Auth.Ready() {
@@ -265,30 +325,85 @@ func (s *Server) withAuth(next http.Handler) http.Handler {
 				fmt.Errorf("authentication is not configured: %v", s.Auth.Err()))
 			return
 		}
-		name, password, ok := r.BasicAuth()
+
+		actor, ok := Actor{}, false
+		if name, password, hasBasic := r.BasicAuth(); hasBasic {
+			var role Role
+			if role, ok = s.Auth.Lookup(name, password); ok {
+				actor = Actor{Username: name, Role: role}
+			}
+		} else {
+			actor, ok = s.actorFromSession(r)
+		}
 		if !ok {
-			unauthorized(w)
+			s.refuse(w, r)
 			return
 		}
-		role, ok := s.Auth.Lookup(name, password)
-		if !ok {
-			logf("auth: rejected a sign-in as %q", name)
-			unauthorized(w)
-			return
-		}
+
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			if r.Header.Get(csrfHeader) != csrfValue {
 				writeError(w, http.StatusForbidden, fmt.Errorf("missing %s: %s header", csrfHeader, csrfValue))
 				return
 			}
-			if role != RoleAdmin {
-				writeError(w, http.StatusForbidden, fmt.Errorf("%q is a %s and may not change the pool", name, role))
+			if actor.Role != RoleAdmin {
+				writeError(w, http.StatusForbidden,
+					fmt.Errorf("%q is a %s and may not change the pool", actor.Username, actor.Role))
 				return
 			}
 		}
-		ctx := context.WithValue(r.Context(), actorKey{}, Actor{Username: name, Role: role})
-		next.ServeHTTP(w, r.WithContext(ctx))
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), actorKey{}, actor)))
 	})
+}
+
+// isOpen reports whether a path is served without credentials: the probe cannot
+// authenticate, and the form is how credentials arrive in the first place.
+func (s *Server) isOpen(r *http.Request, prefix string) bool {
+	switch r.URL.Path {
+	case prefix + "/healthz", prefix + "/login", prefix + "/api/login":
+		return true
+	}
+	return false
+}
+
+// actorFromSession validates the cookie and then re-reads the account list, so
+// a removed user or a rotated password ends the session immediately.
+func (s *Server) actorFromSession(r *http.Request) (Actor, bool) {
+	key := s.Auth.SessionKey()
+	if len(key) == 0 {
+		return Actor{}, false
+	}
+	c, err := r.Cookie(sessionCookie)
+	if err != nil || c.Value == "" {
+		return Actor{}, false
+	}
+	data, err := readSession(key, c.Value)
+	if err != nil {
+		return Actor{}, false
+	}
+	role, hash, ok := s.Auth.account(data.Username)
+	if !ok || fingerprint(hash) != data.Fingerprint {
+		return Actor{}, false
+	}
+	return Actor{Username: data.Username, Role: role}, true
+}
+
+// refuse answers a request with no usable credentials: the page is sent to the
+// form, the API gets the 401 it reports.
+func (s *Server) refuse(w http.ResponseWriter, r *http.Request) {
+	if wantsJSON(r) {
+		unauthorized(w)
+		return
+	}
+	target := s.prefix() + "/login?next=" + url.QueryEscape(r.URL.RequestURI())
+	http.Redirect(w, r, target, http.StatusFound)
+}
+
+// wantsJSON separates the page from the API behind it.
+func wantsJSON(r *http.Request) bool {
+	if strings.Contains(r.URL.Path, "/api/") {
+		return true
+	}
+	return strings.Contains(r.Header.Get("Accept"), "application/json")
 }
 
 func unauthorized(w http.ResponseWriter) {

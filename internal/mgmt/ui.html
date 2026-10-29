@@ -84,6 +84,21 @@
   .legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--muted); }
   .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; }
   .scroll { overflow-x: auto; }
+  /* a rule between every column, a stronger one where a group starts */
+  th, td { border-left: 1px solid var(--line); }
+  th:first-child, td:first-child { border-left: 0; }
+  th.grp, td.grp { border-left: 2px solid var(--line); }
+  /* the flavour, one value per line so it reads as a spec sheet */
+  .flavor { display: flex; flex-direction: column; gap: 2px; min-width: 240px; }
+  .flavor .fl { display: flex; gap: 10px; font-size: 13px; }
+  .flavor .fl span { color: var(--muted); min-width: 68px; }
+  .flavor .fl b { font-weight: 600; font-variant-numeric: tabular-nums; }
+  /* the pool is not being reconciled: impossible to miss */
+  .banner { margin-top: 12px; display: none; border: 1px solid var(--high);
+            border-left: 4px solid var(--high); border-radius: 8px;
+            padding: 10px 12px; background: rgba(179, 38, 30, .07); }
+  .banner strong { display: block; margin-bottom: 3px; color: var(--high); }
+  .banner code { font-size: 12px; white-space: pre-wrap; word-break: break-word; }
 </style>
 </head>
 <body>
@@ -92,6 +107,7 @@
   <select id="poolPick" class="muted" style="background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:4px 6px;font:inherit"></select>
   <span class="spacer"></span>
   <span class="chip" id="whoami" title="signed-in account"></span>
+  <button class="ghost" id="signOut" title="sign out" style="display:none">sign out</button>
   <span class="small muted" id="stamp">loading…</span>
 </header>
 
@@ -99,11 +115,10 @@
   <section class="card" id="summary">
     <div class="row" style="justify-content:space-between">
       <div class="kpi">
-        <div><span class="small muted">replicas</span><b id="kReplicas">–</b></div>
-        <div><span class="small muted">observed</span><b id="kObserved">–</b></div>
-        <div><span class="small muted">ready</span><b id="kReady">–</b></div>
-        <div><span class="small muted">rollout</span><b id="kPhase">–</b></div>
-        <div><span class="small muted">flavor</span><b id="kFlavor" style="font-size:14px">–</b></div>
+        <div><span class="small muted" title="spec.replicas: what you asked for">desired</span><b id="kReplicas">–</b></div>
+        <div><span class="small muted" title="status.observedReplicas: what the controller sees in vCD">in vCD</span><b id="kObserved">–</b></div>
+        <div><span class="small muted" title="status.readyReplicas: how many of them are Ready">ready</span><b id="kReady">–</b></div>
+        <div><span class="small muted" title="status.rollout.phase">rollout</span><b id="kPhase">–</b></div>
       </div>
       <div class="row" id="scaleActions">
         <button class="ghost" id="minus" title="scale-in: spec.replicas - 1">−1</button>
@@ -111,6 +126,13 @@
         <input type="number" id="replicasInput" min="0" step="1">
         <button id="setReplicas">set replicas</button>
       </div>
+    </div>
+    <div class="flavor" style="margin-top:12px">
+      <span class="small muted">flavor</span>
+      <div class="fl"><span>vCPU</span><b id="kCpus">–</b></div>
+      <div class="fl"><span>RAM</span><b id="kMem">–</b></div>
+      <div class="fl"><span>OS Disk</span><b id="kDisk">–</b></div>
+      <div class="fl"><span>Template</span><b id="kTemplate">–</b></div>
     </div>
     <div class="row" id="flavorActions" style="margin-top:12px">
       <span class="small muted">scale-up / down</span>
@@ -120,7 +142,10 @@
       <button id="setFlavor">apply flavor</button>
       <span class="small muted" id="flavorHint"></span>
     </div>
-    <div class="small" id="warning" style="margin-top:10px;color:var(--warn);display:none"></div>
+    <div class="banner" id="warning" role="alert">
+      <strong>the pool is not being reconciled</strong>
+      <code id="warningText"></code>
+    </div>
   </section>
 
   <section class="card">
@@ -138,9 +163,9 @@
         <thead>
           <tr>
             <th rowspan="2">node</th>
-            <th rowspan="2">phase</th>
-            <th colspan="3" style="text-align:center">CPU</th>
-            <th colspan="3" style="text-align:center">memory</th>
+            <th rowspan="2" class="grp">phase</th>
+            <th colspan="3" class="grp" style="text-align:center">CPU</th>
+            <th colspan="3" class="grp" style="text-align:center">memory</th>
             <th rowspan="2"></th>
           </tr>
           <tr>
@@ -195,6 +220,12 @@
 
   function api(path, opts) {
     return fetch(BASE + path, opts).then(function (r) {
+      if (r.status === 401) {
+        // The session expired or the account changed: the form is the answer.
+        location.href = BASE + "/login?next=" +
+          encodeURIComponent(location.pathname + location.search);
+        return new Promise(function () {});
+      }
       return r.json().catch(function () { return {}; }).then(function (body) {
         if (!r.ok) {
           throw new Error((body && body.error) || ("HTTP " + r.status));
@@ -222,6 +253,7 @@
       var chip = document.getElementById("whoami");
       chip.textContent = me.auth ? me.username + " · " + me.role : "no auth";
       chip.className = "chip " + (me.role === "admin" ? "ok" : "warn");
+      document.getElementById("signOut").style.display = me.auth ? "" : "none";
     }).catch(function () {
       state.me = null;
     });
@@ -276,14 +308,14 @@
     document.getElementById("kObserved").textContent = p.observedReplicas;
     document.getElementById("kReady").textContent = p.readyReplicas;
     document.getElementById("kPhase").textContent = p.phase || "Idle";
-    document.getElementById("kFlavor").textContent =
-      p.flavor.cpus + " vCPU · " + p.flavor.memoryMB + " MB" +
-      (p.flavor.osDiskGB ? " · " + p.flavor.osDiskGB + " GB" : "") +
-      (p.flavor.template ? " · " + p.flavor.template : "");
+    document.getElementById("kCpus").textContent = p.flavor.cpus;
+    document.getElementById("kMem").textContent = p.flavor.memoryMB + " MB";
+    document.getElementById("kDisk").textContent = p.flavor.osDiskGB ? p.flavor.osDiskGB + " GB" : "–";
+    document.getElementById("kTemplate").textContent = p.flavor.template || "–";
 
     var warn = document.getElementById("warning");
-    if (p.warning) { warn.textContent = p.warning; warn.style.display = ""; }
-    else { warn.style.display = "none"; }
+    document.getElementById("warningText").textContent = p.warning || "";
+    warn.style.display = p.warning ? "" : "none";
 
     document.getElementById("replicasInput").value = p.replicas;
     document.getElementById("fCpus").value = p.flavor.cpus;
@@ -304,9 +336,9 @@
           : '<span class="small muted">view only</span>';
       return "<tr>" +
         "<td>" + esc(n.name) + (n.ip ? ' <span class="small muted">' + esc(n.ip) + "</span>" : "") + "</td>" +
-        '<td><span class="chip' + (n.phase === "Ready" ? " ok" : "") + '">' + esc(n.phase) + "</span></td>" +
-        "<td>" + cpuCell(n.requests) + "</td><td>" + cpuCell(n.limits) + "</td><td>" + cpuCell(n.real) + "</td>" +
-        "<td>" + memCell(n.requests) + "</td><td>" + memCell(n.limits) + "</td><td>" + memCell(n.real) + "</td>" +
+        '<td class="grp"><span class="chip' + (n.phase === "Ready" ? " ok" : "") + '">' + esc(n.phase) + "</span></td>" +
+        '<td class="grp">' + cpuCell(n.requests) + "</td><td>" + cpuCell(n.limits) + "</td><td>" + cpuCell(n.real) + "</td>" +
+        '<td class="grp">' + memCell(n.requests) + "</td><td>" + memCell(n.limits) + "</td><td>" + memCell(n.real) + "</td>" +
         "<td>" + act + "</td></tr>";
     }).join("");
     document.getElementById("rows").innerHTML = rows ||
@@ -355,6 +387,13 @@
     var parts = pick.value.split("/");
     state.current = findPool(parts[0], parts.slice(1).join("/"));
     render();
+  });
+
+  document.getElementById("signOut").addEventListener("click", function () {
+    fetch(BASE + "/api/logout", {
+      method: "POST",
+      headers: { "X-Requested-With": "nodescale-ui" }
+    }).then(function () { location.href = BASE + "/login"; });
   });
 
   refresh();

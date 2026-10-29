@@ -119,6 +119,7 @@ spec:
             - --auth-secret={{ .Values.ui.auth.secretName }}
             - --auth-secret-key={{ .Values.ui.auth.key }}
             - --auth-refresh={{ .Values.ui.auth.refreshInterval }}
+            - --auth-session-ttl={{ .Values.ui.auth.sessionTTL }}
             {{- if not .Values.ui.auth.enabled }}
             - --auth-disabled=true
             {{- end }}

@@ -4,6 +4,7 @@ import (
 	"embed"
 	"encoding/json"
 	"errors"
+	"html"
 	"io"
 	"net/http"
 	"strings"
@@ -15,6 +16,9 @@ import (
 
 //go:embed ui.html
 var uiFS embed.FS
+
+//go:embed login.html
+var loginFS embed.FS
 
 // Server is the HTTP surface. It only ever edits the K8sWorkerPool object, so
 // the page can do nothing an operator could not do with kubectl - and the
@@ -51,6 +55,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET "+p+"/healthz", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, "ok\n")
 	})
+	mux.HandleFunc("GET "+p+"/login", s.loginPage)
+	mux.HandleFunc("POST "+p+"/api/login", s.postLogin)
+	mux.HandleFunc("POST "+p+"/api/logout", s.postLogout)
 	mux.HandleFunc("GET "+p+"/api/me", s.me)
 	mux.HandleFunc("GET "+p+"/api/pools", s.listPools)
 	mux.HandleFunc("GET "+p+"/api/pools/{ns}/{name}", s.getPool)
@@ -93,6 +100,71 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
+	_, _ = io.WriteString(w, out)
+}
+
+// loginPage serves the form. A browser that already holds a session goes back
+// to the page instead of signing in twice.
+func (s *Server) loginPage(w http.ResponseWriter, r *http.Request) {
+	if s.Auth != nil && !s.Auth.Disabled {
+		if _, ok := s.actorFromSession(r); ok {
+			http.Redirect(w, r, s.prefix()+"/", http.StatusFound)
+			return
+		}
+	}
+	s.renderLogin(w, http.StatusOK, safeNext(s.prefix(), r.URL.Query().Get("next")), "")
+}
+
+// postLogin checks the form, sets the cookie and sends the browser on to the
+// page it asked for. The password never appears in a URL or a log.
+func (s *Server) postLogin(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		s.renderLogin(w, http.StatusBadRequest, s.prefix()+"/", "The form could not be read.")
+		return
+	}
+	name := strings.TrimSpace(r.PostFormValue("username"))
+	next := safeNext(s.prefix(), r.PostFormValue("next"))
+	if s.Auth == nil || s.Auth.Disabled {
+		http.Redirect(w, r, next, http.StatusSeeOther)
+		return
+	}
+	role, ok := s.Auth.Lookup(name, r.PostFormValue("password"))
+	if !ok {
+		logf("auth: rejected a sign-in as %q from %s", name, r.RemoteAddr)
+		s.renderLogin(w, http.StatusUnauthorized, next, "Wrong user name or password.")
+		return
+	}
+	_, hash, _ := s.Auth.account(name)
+	setSessionCookie(w, r, s.prefix(), issueSession(s.Auth.SessionKey(), name, hash, s.Auth.TTL()), s.Auth.TTL())
+	logf("auth: %q signed in as %s", name, role)
+	http.Redirect(w, r, next, http.StatusSeeOther)
+}
+
+// postLogout drops the cookie. The token stays valid until it expires, but the
+// browser no longer sends it.
+func (s *Server) postLogout(w http.ResponseWriter, r *http.Request) {
+	clearSessionCookie(w, s.prefix())
+	if actor, ok := actorFrom(r.Context()); ok {
+		logf("auth: %q signed out", actor.Username)
+	}
+	http.Redirect(w, r, s.prefix()+"/login", http.StatusSeeOther)
+}
+
+// renderLogin writes the form with the prefix, the next hop and any error.
+func (s *Server) renderLogin(w http.ResponseWriter, status int, next, message string) {
+	page, err := loginFS.ReadFile("login.html")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	out := strings.ReplaceAll(string(page), "__PREFIX__", s.prefix())
+	out = strings.Replace(out, "__NEXT__", html.EscapeString(next), 1)
+	out = strings.Replace(out, "__ERROR__", html.EscapeString(message), 1)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.WriteHeader(status)
 	_, _ = io.WriteString(w, out)
 }
 

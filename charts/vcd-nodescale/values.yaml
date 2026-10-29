@@ -104,6 +104,9 @@ ui:
     key: users.yaml
     # A rotated password works without a restart.
     refreshInterval: 60s
+    # How long a sign-in through the login form lasts. The cookie is signed with
+    # a key derived from users.yaml, so changing any account ends every session.
+    sessionTTL: 12h
     # createSecret writes the Secret on install when it does not exist yet: two
     # bcrypt hashes in users.yaml and the generated passwords in
     # initial-passwords for the operator to read once. An upgrade never
