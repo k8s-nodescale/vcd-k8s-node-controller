@@ -139,14 +139,24 @@
   .poolhead b { font-size: 13px; letter-spacing: .01em; }
   .gate { border-bottom: 1px dotted var(--muted); cursor: help; }
   .confirm { color: var(--warn); }
-  /* the per-node expander and the detail row it opens */
-  button.tiny { padding: 0 5px; font-size: 11px; line-height: 1.5; color: var(--muted);
-                border: 1px solid var(--line); margin-right: 6px; }
-  tbody tr.detail td { background: var(--bg); border-top: 0; }
-  .detailgrid { display: flex; gap: 24px; flex-wrap: wrap; padding: 3px 2px 6px; }
-  .detailgrid > div { min-width: 190px; }
+  /* the pool head and the switches that decide how much a row shows */
+  .pooltop { display: flex; justify-content: space-between; align-items: flex-start;
+             gap: 14px; flex-wrap: wrap; }
+  .flags { border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px;
+           display: flex; flex-direction: column; gap: 5px; }
+  .flags .flag { display: flex; align-items: center; justify-content: space-between;
+                 gap: 16px; font-size: 12px; color: var(--muted); cursor: pointer; }
+  .flags input { accent-color: var(--accent); margin: 0; }
+  /* the two lines a row grows when a switch is on */
+  .nodemeta { margin-top: 3px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .nodemeta.tnode { color: var(--warn); font-size: 11px; }
+  .nodemeta.stsline { color: var(--muted); font-size: 11px; }
+  tbody tr.detail td { background: var(--bg); border-top: 0; padding-top: 4px; }
   .dlbl { font-size: 10px; text-transform: uppercase; letter-spacing: .05em;
-          color: var(--muted); margin-bottom: 5px; font-weight: 600; }
+          color: var(--muted); margin-bottom: 4px; font-weight: 600; }
+  /* five lines, then a scrollbar: the detail cannot make the table jump */
+  .volbox { max-height: 104px; overflow-y: auto; }
+  .volrow { font-size: 12px; line-height: 20.8px; white-space: nowrap; }
   button.icon { padding: 5px 10px; font-size: 12px; line-height: 1.2; }
   button.small { padding: 3px 9px; font-size: 12px; }
 </style>
@@ -245,8 +255,17 @@
   // second pool exists. It changes nothing else, and a normal visit (no query
   // parameter) hides the bar exactly as before.
   var DEV = /[?&]dev=1(&|$)/.test(location.search);
+  try {
+    var savedFlags = JSON.parse(localStorage.getItem("nodescale-ui-nodeinfo") || "{}");
+    if (savedFlags && typeof savedFlags === "object") {
+      ["taints", "volumes", "sts"].forEach(function (k) {
+        if (typeof savedFlags[k] === "boolean") { state.flags[k] = savedFlags[k]; }
+      });
+    }
+  } catch (e) {}
   var state = { pools: [], current: null, stamp: "", stale: false, me: null, draft: null,
-                flavorDraft: null, pendingDelete: null, expanded: {} };
+                flavorDraft: null, pendingDelete: null,
+                flags: { taints: false, volumes: false, sts: false } };
   var pick = document.getElementById("poolPick");
 
   function esc(s) {
@@ -437,8 +456,6 @@
   function poolKey(p) { return p.namespace + "/" + p.name; }
 
   function workerRow(p, n, admin) {
-    var key = poolKey(p) + "/" + n.name;
-    var open = !!state.expanded[key];
     var act;
     if (n.deleting) {
       act = '<span class="small muted">removing…</span>';
@@ -453,57 +470,76 @@
     } else {
       act = '<button class="danger" data-del="' + esc(n.name) + '" data-pool="' + esc(poolKey(p)) + '">delete</button>';
     }
-    // The expander answers the question the delete button raises: what does
-    // this node hold that would have to move?
+
+    // The switches under the pool name decide what a row carries beyond its
+    // numbers: taints and StatefulSets under the name, volumes in a row of
+    // their own.
+    var cell = esc(n.name) + (n.ip ? '<span class="chip ip">' + esc(n.ip) + "</span>" : "");
+    if (state.flags.taints && n.taints && n.taints.length) {
+      cell += '<div class="nodemeta tnode">' + n.taints.map(esc).join(" · ") + "</div>";
+    }
+    if (state.flags.sts && n.statefulSets && n.statefulSets.length) {
+      cell += '<div class="nodemeta stsline">' +
+        n.statefulSets.map(function (st) { return esc(st.name) + " ×" + st.pods; }).join(" · ") + "</div>";
+    }
+
     var row = "<tr>" +
-      '<td><button class="ghost tiny" data-exp="' + esc(key) + '" title="' +
-        (open ? "hide what this node holds" : "what this node holds: volumes, statefulsets, taints") + '">' +
-        (open ? "▾" : "▸") + "</button>" +
-      esc(n.name) + (n.ip ? '<span class="chip ip">' + esc(n.ip) + "</span>" : "") + "</td>" +
+      "<td>" + cell + "</td>" +
       '<td class="grp"><span class="chip' + (n.phase === "Ready" ? " ok" : "") + '">' + esc(n.phase) + "</span></td>" +
       '<td class="grp">' + cpuCell(n.requests) + "</td><td>" + cpuCell(n.limits) + "</td><td>" + cpuCell(n.real) + "</td>" +
       '<td class="grp">' + memCell(n.requests) + "</td><td>" + memCell(n.limits) + "</td><td>" + memCell(n.real) + "</td>" +
       '<td class="grow"></td>' +
       "<td>" + act + "</td></tr>";
-    return open ? row + detailRow(n) : row;
+    return state.flags.volumes ? row + volumeRow(n) : row;
   }
 
-  // detailRow is the answer to "may I delete this worker": the volumes it
-  // mounts, the StatefulSets that would have to reschedule, and its taints.
-  function detailRow(n) {
-    function list(items, fmt, empty) {
-      if (!items || !items.length) { return '<span class="small muted">' + empty + "</span>"; }
-      return items.map(fmt).join(" ");
+  // volumeRow is one row under the worker: the claims it mounts, five lines
+  // high and scrollable, so a node with thirty volumes does not stretch the
+  // table.
+  function volumeRow(n) {
+    var list = n.persistentVolumes || [];
+    var body;
+    if (!list.length) {
+      body = '<div class="small muted">no persistent volumes</div>';
+    } else {
+      body = '<div class="volbox">' + list.map(function (v) {
+        var line = esc(v.claim || v.name);
+        if (v.name && v.claim) { line += ' <span class="muted">· ' + esc(v.name) + "</span>"; }
+        if (v.capacity) { line += ' <span class="muted">· ' + esc(v.capacity) + "</span>"; }
+        if (v.storageClass) { line += ' <span class="muted">· ' + esc(v.storageClass) + "</span>"; }
+        return '<div class="volrow">' + line + "</div>";
+      }).join("") + "</div>";
     }
-    var pvs = list(n.persistentVolumes, function (v) {
-      var label = (v.name || v.claim) + (v.capacity ? " · " + v.capacity : "") +
-        (v.storageClass ? " · " + v.storageClass : "");
-      return '<span class="chip" title="' + esc(v.claim || "") + '">' + esc(label) + "</span>";
-    }, "no persistent volumes");
-    var sts = list(n.statefulSets, function (s) {
-      return '<span class="chip' + (s.pods > 0 ? " warn" : "") + '">' + esc(s.name) + " × " + s.pods + "</span>";
-    }, "no statefulset pods");
-    var taints = list(n.taints, function (t) {
-      return '<span class="chip warn">' + esc(t) + "</span>";
-    }, "no taints");
-    return '<tr class="detail"><td colspan="10"><div class="detailgrid">' +
-      '<div><div class="dlbl">volume mounts</div>' + pvs + "</div>" +
-      '<div><div class="dlbl">statefulsets on this node</div>' + sts + "</div>" +
-      '<div><div class="dlbl">taints</div>' + taints + "</div>" +
-      "</div></td></tr>";
+    return '<tr class="detail"><td colspan="10">' +
+      '<div class="dlbl">persistent volume claims on this node</div>' + body + "</td></tr>";
+  }
+
+  // flagsPanel is the three switches the operator asked for: what a row shows
+  // beyond its numbers. The choice outlives a reload.
+  function flagsPanel() {
+    var f = state.flags;
+    function box(key, label) {
+      return '<label class="flag"><span>' + label + "</span>" +
+        '<input type="checkbox" data-flag="' + key + '"' + (f[key] ? " checked" : "") + "></label>";
+    }
+    return '<div class="flags">' +
+      box("taints", "display kubernetes taints") +
+      box("volumes", "display persistent volumes") +
+      box("sts", "display stateful set pods") +
+      "</div>";
   }
 
   function poolBlock(p, admin) {
     var rows = p.nodes.map(function (n) { return workerRow(p, n, admin); }).join("");
     var head = '<div class="poolblock">' +
-      '<div class="poolhead">' +
+      '<div class="pooltop"><div class="poolhead">' +
         "<b>" + esc(p.name) + "</b>" +
         '<span class="small muted">' + esc(p.namespace) + "</span>" +
         '<span class="chip">' + p.nodes.length + (p.nodes.length === 1 ? " worker" : " workers") + "</span>" +
         '<span class="chip' + (p.readyReplicas >= p.replicas ? " ok" : " warn") + '">' +
           p.readyReplicas + "/" + p.replicas + " ready</span>" +
         (p.warning ? '<span class="chip warn" title="' + esc(p.warning) + '">not reconciled</span>' : "") +
-      "</div>";
+      "</div>" + flagsPanel() + "</div>";
     // An empty pool still shows the legend and one empty line: "no workers" is
     // a state of the pool, not a reason to hide its table.
     var body = rows ||
@@ -639,15 +675,17 @@
     state.flavorDraft = null;
     post("flavor", body);
   });
+  document.getElementById("pools").addEventListener("change", function (ev) {
+    var t = ev.target;
+    if (!t || !t.getAttribute || !t.getAttribute("data-flag")) { return; }
+    state.flags[t.getAttribute("data-flag")] = t.checked;
+    try { localStorage.setItem("nodescale-ui-nodeinfo", JSON.stringify(state.flags)); } catch (e) {}
+    renderWorkers();
+  });
+
   document.getElementById("pools").addEventListener("click", function (ev) {
     var t = ev.target;
     if (!t || !t.getAttribute) { return; }
-    var exp = t.getAttribute("data-exp");
-    if (exp) {
-      state.expanded[exp] = !state.expanded[exp];
-      renderWorkers();
-      return;
-    }
     if (t.getAttribute("data-no") !== null) {
       state.pendingDelete = null;
       renderWorkers();
