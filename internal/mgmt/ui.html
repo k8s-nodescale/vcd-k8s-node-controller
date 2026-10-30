@@ -452,7 +452,7 @@
   function poolBlock(p, admin) {
     var rows = p.nodes.map(function (n) { return workerRow(p, n, admin); }).join("");
     var selected = state.current && poolKey(state.current) === poolKey(p) ? " selected" : "";
-    return '<div class="poolblock' + selected + '">' +
+    var head = '<div class="poolblock' + selected + '">' +
       '<div class="poolhead">' +
         "<b>" + esc(p.name) + "</b>" +
         '<span class="small muted">' + esc(p.namespace) + "</span>" +
@@ -460,20 +460,25 @@
         '<span class="chip' + (p.readyReplicas >= p.replicas ? " ok" : " warn") + '">' +
           p.readyReplicas + "/" + p.replicas + " ready</span>" +
         (p.warning ? '<span class="chip warn" title="' + esc(p.warning) + '">not reconciled</span>' : "") +
-      "</div>" +
-      '<div class="scroll"><table>' +
-        "<thead><tr>" +
-          '<th rowspan="2">node</th>' +
-          '<th rowspan="2" class="grp">phase</th>' +
-          '<th colspan="3" class="grp" style="text-align:center">CPU</th>' +
-          '<th colspan="3" class="grp" style="text-align:center">memory</th>' +
-          '<th rowspan="2" class="grow"></th><th rowspan="2"></th>' +
-        "</tr><tr>" +
-          '<th class="grp">req</th><th>lim</th><th>real</th>' +
-          '<th class="grp">req</th><th>lim</th><th>real</th>' +
-        "</tr></thead><tbody>" +
-        (rows || '<tr><td colspan="10" class="muted small">no workers in this pool</td></tr>') +
-        "</tbody></table></div></div>";
+      "</div>";
+    // An empty pool has no table to draw: a header row with nothing under it
+    // reads as a broken table, and a pool at zero replicas is a normal state.
+    if (!p.nodes.length) {
+      return head + '<div class="small muted" style="padding:4px 2px">' +
+        (p.replicas > 0 ? p.replicas + " desired - waiting for the first worker" : "no workers in this pool") +
+        "</div></div>";
+    }
+    return head + '<div class="scroll"><table>' +
+      "<thead><tr>" +
+        '<th rowspan="2">node</th>' +
+        '<th rowspan="2" class="grp">phase</th>' +
+        '<th colspan="3" class="grp" style="text-align:center">CPU</th>' +
+        '<th colspan="3" class="grp" style="text-align:center">memory</th>' +
+        '<th rowspan="2" class="grow"></th><th rowspan="2"></th>' +
+      "</tr><tr>" +
+        '<th class="grp">req</th><th>lim</th><th>real</th>' +
+        '<th class="grp">req</th><th>lim</th><th>real</th>' +
+      "</tr></thead><tbody>" + rows + "</tbody></table></div></div>";
   }
 
   function renderWorkers() {
