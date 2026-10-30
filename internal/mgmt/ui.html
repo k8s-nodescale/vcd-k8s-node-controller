@@ -19,6 +19,7 @@
     --chip: #eef1f5;
     --ipfg: steelblue;
     --ipbg: rgba(70, 130, 180, .15);
+    --shade: rgba(15, 30, 50, .035);
   }
   :root[data-theme="dark"] {
     color-scheme: dark;
@@ -34,6 +35,7 @@
     --chip: #232a31;
     --ipfg: #8fc0e8;
     --ipbg: rgba(120, 170, 210, .20);
+    --shade: rgba(255, 255, 255, .045);
   }
   * { box-sizing: border-box; }
   body {
@@ -79,7 +81,11 @@
   td:nth-child(n+3):nth-child(-n+11), thead tr:nth-child(2) th { width: 6.5%; }
   .chip.ip { color: var(--ipfg); background: var(--ipbg); margin-left: 12px; }
   thead th { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); font-weight: 600; }
+  /* Alternating groups: CPU plain, MEMORY tinted, DISKS plain again. The tint
+     carries no meaning; the colour of a number still does. */
+  td.g-b, th.g-b { background: var(--shade); }
   tbody tr:hover { background: var(--chip); }
+  tbody tr:hover td.g-b { background: var(--chip); }
   /* the column titles are a legend, not a row: a stronger rule and an empty
      row below them keep the names away from the data */
   thead tr:last-child th, thead th[rowspan="2"] { border-bottom: 2px solid var(--line); }
@@ -88,6 +94,20 @@
   .lv-warn { color: var(--warn); font-weight: 600; }
   .lv-high { color: var(--high); font-weight: 600; }
   .dash { color: var(--muted); }
+  /* a disk: track is the whole filesystem, the fill is what is used */
+  .dcell { display: flex; align-items: center; gap: 6px; }
+  /* the bar takes the column it is given, so the same markup reads well at
+     900 px and at 1600 px */
+  .dbar { position: relative; flex: 1 1 auto; min-width: 34px; height: 15px;
+          border-radius: 4px; background: var(--chip); overflow: hidden; }
+  .dbar i { position: absolute; left: 0; top: 0; bottom: 0; display: block; }
+  .dbar b { position: relative; display: block; text-align: center; font-size: 10px;
+            font-weight: 600; line-height: 15px; color: var(--fg);
+            font-variant-numeric: tabular-nums; }
+  .d-ok i { background: rgba(30, 123, 52, .40); }
+  .d-warn i { background: rgba(179, 92, 0, .45); }
+  .d-high i { background: rgba(179, 38, 30, .45); }
+  .dsize { flex: none; font-size: 11px; color: var(--muted); }
   input[type=number], input[type=text] {
     background: var(--bg); color: var(--fg); border: 1px solid var(--line);
     border-radius: 6px; padding: 5px 7px; width: 84px; font: inherit;
@@ -305,11 +325,17 @@
     return null;
   }
 
+  // diskCell is the whole disk in one cell: a bar as wide as the filesystem,
+  // filled to what is used, the percentage inside the bar, and the total
+  // capacity after it - the size the colour alone never told.
   function diskCell(d) {
     if (!d || d.percent == null) { return '<span class="dash">–</span>'; }
-    var cls = d.level === "high" ? "lv-high" : d.level === "warn" ? "lv-warn" : "lv-ok";
+    var fill = d.level === "high" ? "high" : d.level === "warn" ? "warn" : "ok";
+    var pct = d.percent.toFixed(0) + "%";
     var title = d.usedGB + " of " + d.sizeGB + " GB";
-    return '<span class="' + cls + '" title="' + esc(title) + '">' + d.percent.toFixed(0) + "%</span>";
+    return '<span class="dcell" title="' + esc(title) + '">' +
+      '<span class="dbar d-' + fill + '"><i style="width:' + d.percent.toFixed(0) + '%"></i><b>' + pct + "</b></span>" +
+      '<span class="dsize">' + d.sizeGB + "G</span></span>";
   }
 
   function cpuCell(u) { return pct(u && u.cpu, u && u.millicores, "m"); }
@@ -506,7 +532,7 @@
       "<td>" + cell + "</td>" +
       '<td class="grp"><span class="chip' + (n.phase === "Ready" ? " ok" : "") + '">' + esc(n.phase) + "</span></td>" +
       '<td class="grp">' + cpuCell(n.requests) + "</td><td>" + cpuCell(n.limits) + "</td><td>" + cpuCell(n.real) + "</td>" +
-      '<td class="grp">' + memCell(n.requests) + "</td><td>" + memCell(n.limits) + "</td><td>" + memCell(n.real) + "</td>" +
+      '<td class="grp g-b">' + memCell(n.requests) + '</td><td class="g-b">' + memCell(n.limits) + '</td><td class="g-b">' + memCell(n.real) + "</td>" +
       '<td class="grp">' + diskCell(diskAt(n, "/")) + "</td><td>" + diskCell(diskAt(n, "/var")) + "</td><td>" + diskCell(diskAt(n, "/var/lib")) + "</td>" +
       '<td class="grow"></td>' +
       "<td>" + act + "</td></tr>";
@@ -572,12 +598,12 @@
         '<th rowspan="2">node</th>' +
         '<th rowspan="2" class="grp">phase</th>' +
         '<th colspan="3" class="grp" style="text-align:center">CPU</th>' +
-        '<th colspan="3" class="grp" style="text-align:center">memory</th>' +
+        '<th colspan="3" class="grp g-b" style="text-align:center">memory</th>' +
         '<th colspan="3" class="grp" style="text-align:center">disks</th>' +
         '<th rowspan="2" class="grow"></th><th rowspan="2"></th>' +
       "</tr><tr>" +
         '<th class="grp">req</th><th>lim</th><th>real</th>' +
-        '<th class="grp">req</th><th>lim</th><th>real</th>' +
+        '<th class="grp g-b">req</th><th class="g-b">lim</th><th class="g-b">real</th>' +
         '<th class="grp">os</th><th>/var</th><th>/var/lib</th>' +
       "</tr></thead>" +
       '<tbody><tr class="gap"><td colspan="13"></td></tr>' + body + "</tbody>" +
