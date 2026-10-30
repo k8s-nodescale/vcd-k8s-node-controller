@@ -81,6 +81,31 @@ type Node struct {
 	// Deleting is true while the pool is already removing this worker, so the
 	// page does not offer the action twice.
 	Deleting bool `json:"deleting,omitempty"`
+
+	// The facts that decide whether removing this worker is safe. They come
+	// from the API server, not from the platform: a node knows nothing about
+	// its volumes, and the platform knows nothing about taints.
+	Taints            []string            `json:"taints,omitempty"`
+	StatefulSets      []StatefulSetOnNode `json:"statefulSets,omitempty"`
+	PersistentVolumes []Volume            `json:"persistentVolumes,omitempty"`
+}
+
+// StatefulSetOnNode is how many pods of one StatefulSet run on a worker. A
+// StatefulSet is the workload that notices a node leaving: its replicas are
+// pinned to volumes, so they come back one at a time and only after the
+// volume is free again.
+type StatefulSetOnNode struct {
+	Name string `json:"name"`
+	Pods int32  `json:"pods"`
+}
+
+// Volume is one PersistentVolume bound to a claim that a pod on this node
+// mounts. The claim is what has to be free before the pod can start elsewhere.
+type Volume struct {
+	Name         string `json:"name"`
+	Claim        string `json:"claim,omitempty"`
+	Capacity     string `json:"capacity,omitempty"`
+	StorageClass string `json:"storageClass,omitempty"`
 }
 
 // Flavor is the shape the pool asks for.

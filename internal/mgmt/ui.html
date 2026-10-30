@@ -139,6 +139,14 @@
   .poolhead b { font-size: 13px; letter-spacing: .01em; }
   .gate { border-bottom: 1px dotted var(--muted); cursor: help; }
   .confirm { color: var(--warn); }
+  /* the per-node expander and the detail row it opens */
+  button.tiny { padding: 0 5px; font-size: 11px; line-height: 1.5; color: var(--muted);
+                border: 1px solid var(--line); margin-right: 6px; }
+  tbody tr.detail td { background: var(--bg); border-top: 0; }
+  .detailgrid { display: flex; gap: 24px; flex-wrap: wrap; padding: 3px 2px 6px; }
+  .detailgrid > div { min-width: 190px; }
+  .dlbl { font-size: 10px; text-transform: uppercase; letter-spacing: .05em;
+          color: var(--muted); margin-bottom: 5px; font-weight: 600; }
   button.icon { padding: 5px 10px; font-size: 12px; line-height: 1.2; }
   button.small { padding: 3px 9px; font-size: 12px; }
 </style>
@@ -238,7 +246,7 @@
   // parameter) hides the bar exactly as before.
   var DEV = /[?&]dev=1(&|$)/.test(location.search);
   var state = { pools: [], current: null, stamp: "", stale: false, me: null, draft: null,
-                flavorDraft: null, pendingDelete: null };
+                flavorDraft: null, pendingDelete: null, expanded: {} };
   var pick = document.getElementById("poolPick");
 
   function esc(s) {
@@ -429,6 +437,8 @@
   function poolKey(p) { return p.namespace + "/" + p.name; }
 
   function workerRow(p, n, admin) {
+    var key = poolKey(p) + "/" + n.name;
+    var open = !!state.expanded[key];
     var act;
     if (n.deleting) {
       act = '<span class="small muted">removing…</span>';
@@ -443,13 +453,44 @@
     } else {
       act = '<button class="danger" data-del="' + esc(n.name) + '" data-pool="' + esc(poolKey(p)) + '">delete</button>';
     }
-    return "<tr>" +
-      "<td>" + esc(n.name) + (n.ip ? '<span class="chip ip">' + esc(n.ip) + "</span>" : "") + "</td>" +
+    // The expander answers the question the delete button raises: what does
+    // this node hold that would have to move?
+    var row = "<tr>" +
+      '<td><button class="ghost tiny" data-exp="' + esc(key) + '" title="' +
+        (open ? "hide what this node holds" : "what this node holds: volumes, statefulsets, taints") + '">' +
+        (open ? "▾" : "▸") + "</button>" +
+      esc(n.name) + (n.ip ? '<span class="chip ip">' + esc(n.ip) + "</span>" : "") + "</td>" +
       '<td class="grp"><span class="chip' + (n.phase === "Ready" ? " ok" : "") + '">' + esc(n.phase) + "</span></td>" +
       '<td class="grp">' + cpuCell(n.requests) + "</td><td>" + cpuCell(n.limits) + "</td><td>" + cpuCell(n.real) + "</td>" +
       '<td class="grp">' + memCell(n.requests) + "</td><td>" + memCell(n.limits) + "</td><td>" + memCell(n.real) + "</td>" +
       '<td class="grow"></td>' +
       "<td>" + act + "</td></tr>";
+    return open ? row + detailRow(n) : row;
+  }
+
+  // detailRow is the answer to "may I delete this worker": the volumes it
+  // mounts, the StatefulSets that would have to reschedule, and its taints.
+  function detailRow(n) {
+    function list(items, fmt, empty) {
+      if (!items || !items.length) { return '<span class="small muted">' + empty + "</span>"; }
+      return items.map(fmt).join(" ");
+    }
+    var pvs = list(n.persistentVolumes, function (v) {
+      var label = (v.name || v.claim) + (v.capacity ? " · " + v.capacity : "") +
+        (v.storageClass ? " · " + v.storageClass : "");
+      return '<span class="chip" title="' + esc(v.claim || "") + '">' + esc(label) + "</span>";
+    }, "no persistent volumes");
+    var sts = list(n.statefulSets, function (s) {
+      return '<span class="chip' + (s.pods > 0 ? " warn" : "") + '">' + esc(s.name) + " × " + s.pods + "</span>";
+    }, "no statefulset pods");
+    var taints = list(n.taints, function (t) {
+      return '<span class="chip warn">' + esc(t) + "</span>";
+    }, "no taints");
+    return '<tr class="detail"><td colspan="10"><div class="detailgrid">' +
+      '<div><div class="dlbl">volume mounts</div>' + pvs + "</div>" +
+      '<div><div class="dlbl">statefulsets on this node</div>' + sts + "</div>" +
+      '<div><div class="dlbl">taints</div>' + taints + "</div>" +
+      "</div></td></tr>";
   }
 
   function poolBlock(p, admin) {
@@ -601,6 +642,12 @@
   document.getElementById("pools").addEventListener("click", function (ev) {
     var t = ev.target;
     if (!t || !t.getAttribute) { return; }
+    var exp = t.getAttribute("data-exp");
+    if (exp) {
+      state.expanded[exp] = !state.expanded[exp];
+      renderWorkers();
+      return;
+    }
     if (t.getAttribute("data-no") !== null) {
       state.pendingDelete = null;
       renderWorkers();

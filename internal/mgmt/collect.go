@@ -104,6 +104,25 @@ func (c *Collector) collectPools(ctx context.Context) ([]Pool, error) {
 		addPod(used, &pods.Items[i])
 	}
 
+	// Volumes are the one thing a node cannot tell us about itself. A failure
+	// to list them degrades the detail view, not the page.
+	volumes := map[string][]Volume{}
+	pvs := &corev1.PersistentVolumeList{}
+	if err := c.Client.List(ctx, pvs); err == nil {
+		for i := range pvs.Items {
+			pv := &pvs.Items[i]
+			if pv.Spec.ClaimRef == nil {
+				continue
+			}
+			key := pv.Spec.ClaimRef.Namespace + "/" + pv.Spec.ClaimRef.Name
+			v := Volume{Name: pv.Name, Claim: key, StorageClass: pv.Spec.StorageClassName}
+			if q, ok := pv.Spec.Capacity[corev1.ResourceStorage]; ok {
+				v.Capacity = q.String()
+			}
+			volumes[key] = append(volumes[key], v)
+		}
+	}
+
 	exporters := c.exporterEndpoints(ctx)
 	var real map[string]realUsage
 	if c.Metrics != nil {
@@ -112,7 +131,7 @@ func (c *Collector) collectPools(ctx context.Context) ([]Pool, error) {
 
 	out := make([]Pool, 0, len(pools.Items))
 	for i := range pools.Items {
-		out = append(out, c.poolView(ctx, &pools.Items[i], byNode, used, exporters, real))
+		out = append(out, c.poolView(ctx, &pools.Items[i], byNode, used, volumes, exporters, real))
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Namespace != out[j].Namespace {
@@ -124,7 +143,7 @@ func (c *Collector) collectPools(ctx context.Context) ([]Pool, error) {
 }
 
 func (c *Collector) poolView(ctx context.Context, p *infrav1.K8sWorkerPool, byNode map[string]*corev1.Node,
-	used map[string]*nodeUsage, exporters map[string]string, real map[string]realUsage) Pool {
+	used map[string]*nodeUsage, volumes map[string][]Volume, exporters map[string]string, real map[string]realUsage) Pool {
 
 	view := Pool{
 		Namespace:       p.Namespace,
@@ -170,10 +189,41 @@ func (c *Collector) poolView(ctx context.Context, p *infrav1.K8sWorkerPool, byNo
 		if kn != nil {
 			row.Ready = isNodeReady(kn)
 			row.Allocatable = allocatableOf(kn)
+			for _, t := range kn.Spec.Taints {
+				row.Taints = append(row.Taints, formatTaint(t))
+			}
 		}
 		if u := used[strings.ToLower(nodeKey(n))]; u != nil {
 			row.Requests = u.requests
 			row.Limits = u.limits
+			names := make([]string, 0, len(u.statefulSets))
+			for name := range u.statefulSets {
+				names = append(names, name)
+			}
+			sort.Strings(names)
+			for _, name := range names {
+				row.StatefulSets = append(row.StatefulSets, StatefulSetOnNode{Name: name, Pods: u.statefulSets[name]})
+			}
+			keys := make([]string, 0, len(u.claims))
+			for key := range u.claims {
+				keys = append(keys, key)
+			}
+			sort.Strings(keys)
+			seen := map[string]bool{}
+			for _, key := range keys {
+				if len(volumes[key]) == 0 {
+					// A claim whose PV this account cannot see (RBAC, or a
+					// volume the API server does not bind) still holds data.
+					row.PersistentVolumes = append(row.PersistentVolumes, Volume{Claim: key})
+					continue
+				}
+				for _, v := range volumes[key] {
+					if !seen[v.Name] {
+						seen[v.Name] = true
+						row.PersistentVolumes = append(row.PersistentVolumes, v)
+					}
+				}
+			}
 		}
 		row.Requests.CPU = NewShare(row.Requests.Millicores, row.Allocatable.Millicores)
 		row.Requests.Memory = NewShare(row.Requests.MemoryMB, row.Allocatable.MemoryMB)
@@ -194,6 +244,14 @@ func readyCount(nodes []infrav1.WorkerNodeStatus) int32 {
 		}
 	}
 	return n
+}
+
+// formatTaint is a taint the way kubectl describes it.
+func formatTaint(t corev1.Taint) string {
+	if t.Value == "" {
+		return t.Key + ":" + string(t.Effect)
+	}
+	return t.Key + "=" + t.Value + ":" + string(t.Effect)
 }
 
 // nodeKey is the Kubernetes node name of a slot. The pool lowercases it when it
@@ -226,6 +284,11 @@ func allocatableOf(n *corev1.Node) Allocatable {
 type nodeUsage struct {
 	requests Usage
 	limits   Usage
+	// statefulSets counts the StatefulSet pods on the node, by name.
+	statefulSets map[string]int32
+	// claims are the PersistentVolumeClaims the node's pods mount, by
+	// namespace/name.
+	claims map[string]bool
 }
 
 // addPod adds one pod to its node. A finished pod holds nothing; an init
@@ -238,6 +301,20 @@ func addPod(m map[string]*nodeUsage, p *corev1.Pod) {
 	if u == nil {
 		u = &nodeUsage{}
 		m[p.Spec.NodeName] = u
+	}
+	if u.statefulSets == nil {
+		u.statefulSets = map[string]int32{}
+		u.claims = map[string]bool{}
+	}
+	for i := range p.OwnerReferences {
+		if p.OwnerReferences[i].Kind == "StatefulSet" {
+			u.statefulSets[p.OwnerReferences[i].Name]++
+		}
+	}
+	for i := range p.Spec.Volumes {
+		if pvc := p.Spec.Volumes[i].PersistentVolumeClaim; pvc != nil {
+			u.claims[p.Namespace+"/"+pvc.ClaimName] = true
+		}
 	}
 
 	var reqCPU, reqMem, limCPU, limMem int64
