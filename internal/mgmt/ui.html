@@ -20,6 +20,7 @@
     --ipfg: steelblue;
     --ipbg: rgba(70, 130, 180, .15);
     --shade: rgba(15, 30, 50, .035);
+    --shade2: rgba(15, 30, 50, .075);
   }
   :root[data-theme="dark"] {
     color-scheme: dark;
@@ -36,6 +37,7 @@
     --ipfg: #8fc0e8;
     --ipbg: rgba(120, 170, 210, .20);
     --shade: rgba(255, 255, 255, .045);
+    --shade2: rgba(255, 255, 255, .09);
   }
   * { box-sizing: border-box; }
   body {
@@ -81,11 +83,14 @@
   td:nth-child(n+3):nth-child(-n+11), thead tr:nth-child(2) th { width: 6.5%; }
   .chip.ip { color: var(--ipfg); background: var(--ipbg); margin-left: 12px; }
   thead th { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); font-weight: 600; }
-  /* Alternating groups: CPU plain, MEMORY tinted, DISKS plain again. The tint
-     carries no meaning; the colour of a number still does. */
-  td.g-b, th.g-b { background: var(--shade); }
+  /* Alternating columns: node light, phase dark, CPU light, MEMORY dark, DISKS
+     light, the spacer dark. The tint carries no meaning - the colour of a
+     number still says how loaded the node is - it only lets the eye follow a
+     column down the table. */
+  td.g-a, th.g-a { background: var(--shade); }
+  td.g-b, th.g-b { background: var(--shade2); }
   tbody tr:hover { background: var(--chip); }
-  tbody tr:hover td.g-b { background: var(--chip); }
+  tbody tr:hover td.g-a, tbody tr:hover td.g-b { background: var(--chip); }
   /* the column titles are a legend, not a row: a stronger rule and an empty
      row below them keep the names away from the data */
   thead tr:last-child th, thead th[rowspan="2"] { border-bottom: 2px solid var(--line); }
@@ -529,13 +534,13 @@
     }
 
     var row = "<tr>" +
-      "<td>" + cell + "</td>" +
-      '<td class="grp"><span class="chip' + (n.phase === "Ready" ? " ok" : "") + '">' + esc(n.phase) + "</span></td>" +
-      '<td class="grp">' + cpuCell(n.requests) + "</td><td>" + cpuCell(n.limits) + "</td><td>" + cpuCell(n.real) + "</td>" +
+      '<td class="g-a">' + cell + "</td>" +
+      '<td class="grp g-b"><span class="chip' + (n.phase === "Ready" ? " ok" : "") + '">' + esc(n.phase) + "</span></td>" +
+      '<td class="grp g-a">' + cpuCell(n.requests) + '</td><td class="g-a">' + cpuCell(n.limits) + '</td><td class="g-a">' + cpuCell(n.real) + "</td>" +
       '<td class="grp g-b">' + memCell(n.requests) + '</td><td class="g-b">' + memCell(n.limits) + '</td><td class="g-b">' + memCell(n.real) + "</td>" +
-      '<td class="grp">' + diskCell(diskAt(n, "/")) + "</td><td>" + diskCell(diskAt(n, "/var")) + "</td><td>" + diskCell(diskAt(n, "/var/lib")) + "</td>" +
-      '<td class="grow"></td>' +
-      "<td>" + act + "</td></tr>";
+      '<td class="grp g-a">' + diskCell(diskAt(n, "/")) + '</td><td class="g-a">' + diskCell(diskAt(n, "/var")) + '</td><td class="g-a">' + diskCell(diskAt(n, "/var/lib")) + "</td>" +
+      '<td class="grow g-b"></td>' +
+      '<td class="g-a">' + act + "</td></tr>";
     return state.flags.volumes ? row + volumeRow(n) : row;
   }
 
@@ -595,16 +600,16 @@
       "</td></tr>";
     return head + '<div class="scroll"><table>' +
       "<thead><tr>" +
-        '<th rowspan="2">node</th>' +
-        '<th rowspan="2" class="grp">phase</th>' +
-        '<th colspan="3" class="grp" style="text-align:center">CPU</th>' +
+        '<th rowspan="2" class="g-a">node</th>' +
+        '<th rowspan="2" class="grp g-b">phase</th>' +
+        '<th colspan="3" class="grp g-a" style="text-align:center">CPU</th>' +
         '<th colspan="3" class="grp g-b" style="text-align:center">memory</th>' +
-        '<th colspan="3" class="grp" style="text-align:center">disks</th>' +
-        '<th rowspan="2" class="grow"></th><th rowspan="2"></th>' +
+        '<th colspan="3" class="grp g-a" style="text-align:center">disks</th>' +
+        '<th rowspan="2" class="grow g-b"></th><th rowspan="2" class="g-a"></th>' +
       "</tr><tr>" +
-        '<th class="grp">req</th><th>lim</th><th>real</th>' +
+        '<th class="grp g-a">req</th><th class="g-a">lim</th><th class="g-a">real</th>' +
         '<th class="grp g-b">req</th><th class="g-b">lim</th><th class="g-b">real</th>' +
-        '<th class="grp">os</th><th>/var</th><th>/var/lib</th>' +
+        '<th class="grp g-a">os</th><th class="g-a">/var</th><th class="g-a">/var/lib</th>' +
       "</tr></thead>" +
       '<tbody><tr class="gap"><td colspan="13"></td></tr>' + body + "</tbody>" +
       "</table></div></div>";
