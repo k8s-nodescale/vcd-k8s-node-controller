@@ -104,6 +104,11 @@
   th, td { border-left: 1px solid var(--line); }
   th:first-child, td:first-child { border-left: 0; }
   th.grp, td.grp { border-left: 2px solid var(--line); }
+  /* the pool picker is the parent of both panes: it says what they act on */
+  .poolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+             margin-bottom: 12px; padding-bottom: 10px; border-bottom: 1px solid var(--line); }
+  .poolbar select { background: var(--bg); color: var(--fg); border: 1px solid var(--line);
+                    border-radius: 6px; padding: 5px 8px; font: inherit; }
   /* the upper card is two panes: scale-up/down on the left, scale-in/out on
      the right, each with its own contour */
   .split { display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-start; }
@@ -125,6 +130,7 @@
   .banner code { font-size: 12px; white-space: pre-wrap; word-break: break-word; }
   /* one block per K8sWorkerPool, stacked when there is more than one */
   .poolblock { margin-top: 14px; }
+  .poolblock.selected { border-left: 3px solid var(--accent); padding-left: 10px; }
   .poolblock + .poolblock { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--line); }
   .poolhead { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 8px; }
   .poolhead b { font-size: 13px; letter-spacing: .01em; }
@@ -147,7 +153,6 @@
 <body>
 <header>
   <h1>nodescale-ui<small id="clusterName"></small></h1>
-  <select id="poolPick" class="muted" style="background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:4px 6px;font:inherit"></select>
   <span class="spacer"></span>
   <span class="small muted" id="viewerNote" style="display:none">read only</span>
   <button class="ghost icon" id="theme" title="switch the colours">night</button>
@@ -158,6 +163,11 @@
 
 <main>
   <section class="card" id="summary">
+    <div class="poolbar" id="poolBar" style="display:none">
+      <span class="pane-title" style="margin:0">pool</span>
+      <select id="poolPick"></select>
+      <span class="small muted">the flavour and replicas actions below apply to this pool</span>
+    </div>
     <div class="split">
       <div class="pane">
         <div class="pane-title">flavor &middot; scale-up / down</div>
@@ -345,7 +355,8 @@
     if (state.current) {
       pick.value = state.current.namespace + "/" + state.current.name;
     }
-    pick.style.display = state.pools.length > 1 ? "" : "none";
+    // One pool needs no picker: the bar only appears when there is a choice.
+    document.getElementById("poolBar").style.display = state.pools.length > 1 ? "" : "none";
   }
 
   function render() {
@@ -432,7 +443,8 @@
 
   function poolBlock(p, admin) {
     var rows = p.nodes.map(function (n) { return workerRow(p, n, admin); }).join("");
-    return '<div class="poolblock">' +
+    var selected = state.current && poolKey(state.current) === poolKey(p) ? " selected" : "";
+    return '<div class="poolblock' + selected + '">' +
       '<div class="poolhead">' +
         "<b>" + esc(p.name) + "</b>" +
         '<span class="small muted">' + esc(p.namespace) + "</span>" +
