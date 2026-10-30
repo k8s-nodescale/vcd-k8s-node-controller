@@ -88,6 +88,10 @@ type Node struct {
 	Taints            []string            `json:"taints,omitempty"`
 	StatefulSets      []StatefulSetOnNode `json:"statefulSets,omitempty"`
 	PersistentVolumes []Volume            `json:"persistentVolumes,omitempty"`
+
+	// Disks is the storage a worker can fill, one entry per mount, always in
+	// the same order so the columns line up.
+	Disks []Disk `json:"disks,omitempty"`
 }
 
 // StatefulSetOnNode is how many pods of one StatefulSet run on a worker. A
@@ -133,4 +137,15 @@ type Pool struct {
 	// Warning carries the first condition message when the pool is not
 	// converged, so the page can say why without the operator opening kubectl.
 	Warning string `json:"warning,omitempty"`
+}
+
+// Disk is one filesystem on a worker: the mount, how big it is and how full.
+// The size comes from the filesystem, not from spec.flavor, because the OS
+// disk is an LVM volume that is smaller than the disk vCD was given.
+type Disk struct {
+	Mount   string   `json:"mount"`
+	SizeGB  float64  `json:"sizeGB,omitempty"`
+	UsedGB  float64  `json:"usedGB,omitempty"`
+	Percent *float64 `json:"percent,omitempty"`
+	Level   string   `json:"level,omitempty"`
 }

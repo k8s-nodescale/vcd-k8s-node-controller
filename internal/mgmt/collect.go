@@ -229,7 +229,7 @@ func (c *Collector) poolView(ctx context.Context, p *infrav1.K8sWorkerPool, byNo
 		row.Requests.Memory = NewShare(row.Requests.MemoryMB, row.Allocatable.MemoryMB)
 		row.Limits.CPU = NewShare(row.Limits.Millicores, row.Allocatable.Millicores)
 		row.Limits.Memory = NewShare(row.Limits.MemoryMB, row.Allocatable.MemoryMB)
-		row.Real, row.RealSource = c.realUsage(ctx, kn, row.Allocatable, exporters, real)
+		row.Real, row.RealSource, row.Disks = c.realUsage(ctx, kn, row.Allocatable, exporters, real)
 		view.Nodes = append(view.Nodes, row)
 	}
 	return view

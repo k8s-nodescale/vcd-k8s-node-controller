@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -32,6 +33,18 @@ type exporterSample struct {
 	avail   float64
 	total   float64
 	haveMem bool
+	// fs is the filesystems worth a column: the OS root and the two data
+	// mounts, by mountpoint.
+	fs map[string]fsSample
+}
+
+// diskMounts are the columns the page shows. The order is the column order.
+var diskMounts = []string{"/", "/var", "/var/lib"}
+
+// fsSample is one filesystem: total and available bytes.
+type fsSample struct {
+	size  float64
+	avail float64
 }
 
 // realUsage is absolute usage as metrics.k8s.io reports it.
@@ -98,7 +111,7 @@ func (c *Collector) scrape(ctx context.Context, url string) (exporterSample, err
 	if resp.StatusCode != http.StatusOK {
 		return exporterSample{}, fmt.Errorf("%s: %s", url, resp.Status)
 	}
-	s := exporterSample{at: c.now()}
+	s := exporterSample{at: c.now(), fs: map[string]fsSample{}}
 	if err := parseExporter(resp.Body, &s); err != nil {
 		return s, err
 	}
@@ -107,6 +120,9 @@ func (c *Collector) scrape(ctx context.Context, url string) (exporterSample, err
 
 // parseExporter keeps three series and ignores the rest of the page.
 func parseExporter(r io.Reader, s *exporterSample) error {
+	if s.fs == nil {
+		s.fs = map[string]fsSample{}
+	}
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 64*1024), 1024*1024)
 	for sc.Scan() {
@@ -135,9 +151,67 @@ func parseExporter(r io.Reader, s *exporterSample) error {
 			s.haveMem = true
 		case strings.HasPrefix(name, "node_memory_MemTotal_bytes"):
 			s.total = val
+		case strings.HasPrefix(name, "node_filesystem_size_bytes"):
+			if m := wantedMount(name); m != "" {
+				fs := s.fs[m]
+				fs.size = val
+				s.fs[m] = fs
+			}
+		case strings.HasPrefix(name, "node_filesystem_avail_bytes"):
+			if m := wantedMount(name); m != "" {
+				fs := s.fs[m]
+				fs.avail = val
+				s.fs[m] = fs
+			}
 		}
 	}
 	return sc.Err()
+}
+
+// wantedMount returns the mountpoint of a filesystem series when that
+// mountpoint is one of the columns, and "" otherwise. Parsing the label by
+// hand keeps the page free of a Prometheus client.
+func wantedMount(line string) string {
+	const key = "mountpoint=\""
+	i := strings.Index(line, key)
+	if i < 0 {
+		return ""
+	}
+	rest := line[i+len(key):]
+	j := strings.IndexByte(rest, '"')
+	if j < 0 {
+		return ""
+	}
+	m := rest[:j]
+	for _, want := range diskMounts {
+		if m == want {
+			return m
+		}
+	}
+	return ""
+}
+
+// diskShares turns the scrape into the three disk cells. A mount the exporter
+// does not report keeps its column and shows a dash, so the table does not
+// shift shape between nodes.
+func diskShares(s exporterSample) []Disk {
+	out := make([]Disk, 0, len(diskMounts))
+	for _, m := range diskMounts {
+		d := Disk{Mount: m}
+		if fs, ok := s.fs[m]; ok && fs.size > 0 {
+			used := fs.size - fs.avail
+			if used < 0 {
+				used = 0
+			}
+			pct := clampPercent(used / fs.size * 100)
+			d.Percent = pct
+			d.Level = Level(pct)
+			d.SizeGB = math.Round(fs.size/(1<<30)*10) / 10
+			d.UsedGB = math.Round(used/(1<<30)*10) / 10
+		}
+		out = append(out, d)
+	}
+	return out
 }
 
 // shares turns a scrape into percentages. CPU needs the previous sample of the
@@ -176,15 +250,16 @@ func clampPercent(p float64) *float64 {
 // realUsage is the third column group: the exporters first, metrics.k8s.io
 // second, a dash when neither answers.
 func (c *Collector) realUsage(ctx context.Context, kn *corev1.Node, alloc Allocatable,
-	exporters map[string]string, metrics map[string]realUsage) (Usage, string) {
+	exporters map[string]string, metrics map[string]realUsage) (Usage, string, []Disk) {
 
 	if kn == nil {
-		return Usage{}, ""
+		return Usage{}, "", diskShares(exporterSample{})
 	}
 	u := Usage{}
 	source := ""
 	if url, ok := exporters[kn.Name]; ok {
-		if s, err := c.scrape(ctx, url); err == nil {
+		s, err := c.scrape(ctx, url)
+		if err == nil {
 			cpu, mem := c.shares(kn.Name, s)
 			if cpu != nil {
 				u.CPU = Share{Percent: cpu, Level: Level(cpu)}
@@ -197,9 +272,10 @@ func (c *Collector) realUsage(ctx context.Context, kn *corev1.Node, alloc Alloca
 			if cpu != nil || mem != nil {
 				source = "node-exporter"
 			}
-		} else {
-			logf("scrape %s: %v", url, err)
+			disks := diskShares(s)
+			return u, source, disks
 		}
+		logf("scrape %s: %v", url, err)
 	}
 	if source == "" {
 		if m, ok := metrics[kn.Name]; ok {
@@ -210,5 +286,5 @@ func (c *Collector) realUsage(ctx context.Context, kn *corev1.Node, alloc Alloca
 			source = "metrics-server"
 		}
 	}
-	return u, source
+	return u, source, diskShares(exporterSample{})
 }

@@ -73,8 +73,10 @@
   th.grow, td.grow { width: auto; }
   /* phase, req, lim and real take a share of the card instead of a fixed
      width, so they widen with the window and never leave a gap */
-  td:nth-child(2), thead tr:first-child th:nth-child(2) { width: 8%; }
-  td:nth-child(n+3):nth-child(-n+8), thead tr:nth-child(2) th { width: 12%; }
+  td:nth-child(2), thead tr:first-child th:nth-child(2) { width: 6%; }
+  /* nine numbers now share the card: each takes a slice that still reads as a
+     column at 900 px and grows with the window */
+  td:nth-child(n+3):nth-child(-n+11), thead tr:nth-child(2) th { width: 6.5%; }
   .chip.ip { color: var(--ipfg); background: var(--ipbg); margin-left: 12px; }
   thead th { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); font-weight: 600; }
   tbody tr:hover { background: var(--chip); }
@@ -237,7 +239,7 @@
         <span><span class="dot" style="background:var(--ok)"></span>&lt; 80%</span>
         <span><span class="dot" style="background:var(--warn)"></span>80–90%</span>
         <span><span class="dot" style="background:var(--high)"></span>≥ 90%</span>
-        <span>requests · limits · real, each on its own</span>
+        <span>requests · limits · real · disks, each on its own</span>
       </div>
     </div>
     <div id="pools"><div class="muted small">loading…</div></div>
@@ -291,6 +293,23 @@
     var cls = share.level === "high" ? "lv-high" : share.level === "warn" ? "lv-warn" : "lv-ok";
     var title = used != null ? " title=\"" + used + " " + unit + "\"" : "";
     return '<span class="' + cls + '"' + title + ">" + v.toFixed(0) + "%</span>";
+  }
+
+  // diskAt finds one filesystem of a worker. The collector always sends the
+  // three in the same order; a missing one is a dash.
+  function diskAt(n, mount) {
+    var list = n.disks || [];
+    for (var i = 0; i < list.length; i++) {
+      if (list[i].mount === mount) { return list[i]; }
+    }
+    return null;
+  }
+
+  function diskCell(d) {
+    if (!d || d.percent == null) { return '<span class="dash">–</span>'; }
+    var cls = d.level === "high" ? "lv-high" : d.level === "warn" ? "lv-warn" : "lv-ok";
+    var title = d.usedGB + " of " + d.sizeGB + " GB";
+    return '<span class="' + cls + '" title="' + esc(title) + '">' + d.percent.toFixed(0) + "%</span>";
   }
 
   function cpuCell(u) { return pct(u && u.cpu, u && u.millicores, "m"); }
@@ -488,6 +507,7 @@
       '<td class="grp"><span class="chip' + (n.phase === "Ready" ? " ok" : "") + '">' + esc(n.phase) + "</span></td>" +
       '<td class="grp">' + cpuCell(n.requests) + "</td><td>" + cpuCell(n.limits) + "</td><td>" + cpuCell(n.real) + "</td>" +
       '<td class="grp">' + memCell(n.requests) + "</td><td>" + memCell(n.limits) + "</td><td>" + memCell(n.real) + "</td>" +
+      '<td class="grp">' + diskCell(diskAt(n, "/")) + "</td><td>" + diskCell(diskAt(n, "/var")) + "</td><td>" + diskCell(diskAt(n, "/var/lib")) + "</td>" +
       '<td class="grow"></td>' +
       "<td>" + act + "</td></tr>";
     return state.flags.volumes ? row + volumeRow(n) : row;
@@ -511,7 +531,7 @@
         return '<div class="volrow">' + line + "</div>";
       }).join("") + "</div>";
     }
-    return '<tr class="detail"><td colspan="10">' +
+    return '<tr class="detail"><td colspan="13">' +
       '<div class="dlbl">persistent volumes on this node</div>' + body + "</td></tr>";
   }
 
@@ -544,7 +564,7 @@
     // An empty pool still shows the legend and one empty line: "no workers" is
     // a state of the pool, not a reason to hide its table.
     var body = rows ||
-      '<tr><td colspan="10" class="muted small" style="padding:9px">' +
+      '<tr><td colspan="13" class="muted small" style="padding:9px">' +
         (p.replicas > 0 ? p.replicas + " desired - waiting for the first worker" : "no workers in this pool") +
       "</td></tr>";
     return head + '<div class="scroll"><table>' +
@@ -553,12 +573,14 @@
         '<th rowspan="2" class="grp">phase</th>' +
         '<th colspan="3" class="grp" style="text-align:center">CPU</th>' +
         '<th colspan="3" class="grp" style="text-align:center">memory</th>' +
+        '<th colspan="3" class="grp" style="text-align:center">disks</th>' +
         '<th rowspan="2" class="grow"></th><th rowspan="2"></th>' +
       "</tr><tr>" +
         '<th class="grp">req</th><th>lim</th><th>real</th>' +
         '<th class="grp">req</th><th>lim</th><th>real</th>' +
+        '<th class="grp">os</th><th>/var</th><th>/var/lib</th>' +
       "</tr></thead>" +
-      '<tbody><tr class="gap"><td colspan="10"></td></tr>' + body + "</tbody>" +
+      '<tbody><tr class="gap"><td colspan="13"></td></tr>' + body + "</tbody>" +
       "</table></div></div>";
   }
 
