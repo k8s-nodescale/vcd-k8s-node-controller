@@ -78,6 +78,10 @@
   .chip.ip { color: var(--ipfg); background: var(--ipbg); margin-left: 12px; }
   thead th { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); font-weight: 600; }
   tbody tr:hover { background: var(--chip); }
+  /* the column titles are a legend, not a row: a stronger rule and an empty
+     row below them keep the names away from the data */
+  thead tr:last-child th, thead th[rowspan="2"] { border-bottom: 2px solid var(--line); }
+  tbody tr.gap td { height: 12px; padding: 0; border: 0; background: none; }
   .lv-ok { color: var(--ok); font-weight: 600; }
   .lv-warn { color: var(--warn); font-weight: 600; }
   .lv-high { color: var(--high); font-weight: 600; }
@@ -130,7 +134,6 @@
   .banner code { font-size: 12px; white-space: pre-wrap; word-break: break-word; }
   /* one block per K8sWorkerPool, stacked when there is more than one */
   .poolblock { margin-top: 14px; }
-  .poolblock.selected { border-left: 3px solid var(--accent); padding-left: 10px; }
   .poolblock + .poolblock { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--line); }
   .poolhead { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 8px; }
   .poolhead b { font-size: 13px; letter-spacing: .01em; }
@@ -451,8 +454,7 @@
 
   function poolBlock(p, admin) {
     var rows = p.nodes.map(function (n) { return workerRow(p, n, admin); }).join("");
-    var selected = state.current && poolKey(state.current) === poolKey(p) ? " selected" : "";
-    var head = '<div class="poolblock' + selected + '">' +
+    var head = '<div class="poolblock">' +
       '<div class="poolhead">' +
         "<b>" + esc(p.name) + "</b>" +
         '<span class="small muted">' + esc(p.namespace) + "</span>" +
@@ -461,13 +463,12 @@
           p.readyReplicas + "/" + p.replicas + " ready</span>" +
         (p.warning ? '<span class="chip warn" title="' + esc(p.warning) + '">not reconciled</span>' : "") +
       "</div>";
-    // An empty pool has no table to draw: a header row with nothing under it
-    // reads as a broken table, and a pool at zero replicas is a normal state.
-    if (!p.nodes.length) {
-      return head + '<div class="small muted" style="padding:4px 2px">' +
+    // An empty pool still shows the legend and one empty line: "no workers" is
+    // a state of the pool, not a reason to hide its table.
+    var body = rows ||
+      '<tr><td colspan="10" class="muted small" style="padding:9px">' +
         (p.replicas > 0 ? p.replicas + " desired - waiting for the first worker" : "no workers in this pool") +
-        "</div></div>";
-    }
+      "</td></tr>";
     return head + '<div class="scroll"><table>' +
       "<thead><tr>" +
         '<th rowspan="2">node</th>' +
@@ -478,20 +479,25 @@
       "</tr><tr>" +
         '<th class="grp">req</th><th>lim</th><th>real</th>' +
         '<th class="grp">req</th><th>lim</th><th>real</th>' +
-      "</tr></thead><tbody>" + rows + "</tbody></table></div></div>";
+      "</tr></thead>" +
+      '<tbody><tr class="gap"><td colspan="10"></td></tr>' + body + "</tbody>" +
+      "</table></div></div>";
   }
 
   function renderWorkers() {
     var box = document.getElementById("pools");
     var admin = isAdmin();
-    box.innerHTML = state.pools.length
-      ? state.pools.map(function (p) { return poolBlock(p, admin); }).join("")
+    // One pool at a time: the picker above the panes is the only place a pool
+    // is chosen, and this section follows it.
+    var p = state.current;
+    box.innerHTML = p
+      ? poolBlock(p, admin)
       : '<div class="muted small">no K8sWorkerPool in this cluster</div>';
 
     var sources = {};
-    state.pools.forEach(function (p) {
+    if (p) {
       p.nodes.forEach(function (n) { if (n.realSource) { sources[n.realSource] = (sources[n.realSource] || 0) + 1; } });
-    });
+    }
     var parts = Object.keys(sources).map(function (k) { return sources[k] + " × " + k; });
     document.getElementById("realSource").textContent = parts.length
       ? "real utilisation from " + parts.join(", ")
