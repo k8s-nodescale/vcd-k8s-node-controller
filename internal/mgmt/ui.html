@@ -493,9 +493,10 @@
     return state.flags.volumes ? row + volumeRow(n) : row;
   }
 
-  // volumeRow is one row under the worker: the claims it mounts, five lines
-  // high and scrollable, so a node with thirty volumes does not stretch the
-  // table.
+  // volumeRow is one row under the worker: the volumes its pods mount, five
+  // lines high and scrollable, so a node with thirty volumes does not stretch
+  // the table. The volume is first - it is what is attached to the node; the
+  // claim is the request that bound it and only explains why.
   function volumeRow(n) {
     var list = n.persistentVolumes || [];
     var body;
@@ -503,15 +504,15 @@
       body = '<div class="small muted">no persistent volumes</div>';
     } else {
       body = '<div class="volbox">' + list.map(function (v) {
-        var line = esc(v.claim || v.name);
-        if (v.name && v.claim) { line += ' <span class="muted">· ' + esc(v.name) + "</span>"; }
+        var line = "<b>" + esc(v.name || v.claim) + "</b>";
         if (v.capacity) { line += ' <span class="muted">· ' + esc(v.capacity) + "</span>"; }
         if (v.storageClass) { line += ' <span class="muted">· ' + esc(v.storageClass) + "</span>"; }
+        if (v.claim) { line += ' <span class="muted">· claim ' + esc(v.claim) + "</span>"; }
         return '<div class="volrow">' + line + "</div>";
       }).join("") + "</div>";
     }
     return '<tr class="detail"><td colspan="10">' +
-      '<div class="dlbl">persistent volume claims on this node</div>' + body + "</td></tr>";
+      '<div class="dlbl">persistent volumes on this node</div>' + body + "</td></tr>";
   }
 
   // flagsPanel is the three switches the operator asked for: what a row shows
