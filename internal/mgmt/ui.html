@@ -149,6 +149,7 @@
   <h1>nodescale-ui<small id="clusterName"></small></h1>
   <select id="poolPick" class="muted" style="background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:4px 6px;font:inherit"></select>
   <span class="spacer"></span>
+  <span class="small muted" id="viewerNote" style="display:none">read only</span>
   <button class="ghost icon" id="theme" title="switch the colours">night</button>
   <span id="whoami" title="signed-in account"></span>
   <button class="ghost" id="signOut" title="sign out" style="display:none">sign out</button>
@@ -296,12 +297,25 @@
       document.getElementById("clusterName").textContent = me.cluster || "";
     }).catch(function () {
       state.me = null;
+      var chip = document.getElementById("whoami");
+      chip.innerHTML = '<span class="chip warn">identity unknown</span>';
+      chip.title = "the page could not ask who you are, so it stays read-only";
     });
   }
 
+  // isAdmin answers only when the server has said who we are. "Not known yet"
+  // and "the call failed" are both read-only: a page that can delete workers
+  // must never guess its own role.
+  function isAdmin() {
+    return !!(state.me && state.me.role === "admin");
+  }
+
   function refresh() {
-    loadMe();
-    return api("/api/pools").then(function (data) {
+    // The role first: rendering before /api/me answers would show a viewer the
+    // admin controls for a few seconds.
+    return loadMe().then(function () {
+      return api("/api/pools");
+    }).then(function (data) {
       state.pools = data.pools || [];
       state.stamp = data.collectedAt || "";
       state.stale = !!data.stale;
@@ -368,9 +382,11 @@
     }
     renderFlavorDraft();
 
-    var admin = !state.me || state.me.role === "admin";
+    var admin = isAdmin();
     document.getElementById("scaleActions").style.display = admin ? "" : "none";
     document.getElementById("flavorActions").style.display = admin ? "" : "none";
+    document.getElementById("viewerNote").style.display =
+      admin || !state.me || !state.me.auth ? "none" : "";
 
     // scaleDown.allowLastWorker is a kubectl-only gate: show its state, explain
     // it on hover, never offer to change it here.
@@ -442,7 +458,7 @@
 
   function renderWorkers() {
     var box = document.getElementById("pools");
-    var admin = !state.me || state.me.role === "admin";
+    var admin = isAdmin();
     box.innerHTML = state.pools.length
       ? state.pools.map(function (p) { return poolBlock(p, admin); }).join("")
       : '<div class="muted small">no K8sWorkerPool in this cluster</div>';
