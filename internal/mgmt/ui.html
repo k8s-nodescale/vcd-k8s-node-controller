@@ -384,8 +384,8 @@
     document.getElementById("kObserved").textContent = p.observedReplicas;
     document.getElementById("kReady").textContent = p.readyReplicas;
     document.getElementById("kPhase").textContent = p.phase || "Idle";
-    document.getElementById("kCpus").textContent = p.flavor.cpus;
-    document.getElementById("kMem").textContent = p.flavor.memoryMB + " MB";
+    document.getElementById("kCpus").textContent = p.flavor.cpus || "–";
+    document.getElementById("kMem").textContent = p.flavor.memoryMB ? p.flavor.memoryMB + " MB" : "–";
     document.getElementById("kDisk").textContent = p.flavor.osDiskGB ? p.flavor.osDiskGB + " GB" : "–";
     document.getElementById("kTemplate").textContent = p.flavor.template || "–";
 
@@ -398,8 +398,8 @@
     }
     renderDraftHint();
     if (state.flavorDraft === null) {
-      document.getElementById("fCpus").value = p.flavor.cpus;
-      document.getElementById("fMem").value = p.flavor.memoryMB;
+      document.getElementById("fCpus").value = p.flavor.cpus || "";
+      document.getElementById("fMem").value = p.flavor.memoryMB || "";
       document.getElementById("fDisk").value = p.flavor.osDiskGB || "";
     }
     renderFlavorDraft();
