@@ -1008,6 +1008,21 @@ open, and a certificate is matched by name, which a catch-all rule does not
 have. With a real hostname, set `ui.ingress.tls.secretName` to a TLS Secret and
 `ui.ingress.tls.redirect: true` to move everyone onto HTTPS.
 
+### Looking at the page during development
+
+The pool picker above the flavour and replicas panes only appears when the
+cluster has more than one K8sWorkerPool - with one pool there is nothing to
+choose, and a dead control is worse than no control. Append `?dev=1` to see it
+anyway:
+
+```
+http://<node-ip>:<ingress-http-node-port>/nodescale-ui/?dev=1
+```
+
+The parameter keeps the bar and its select on screen for a single-pool cluster
+and changes nothing else; without it the page behaves exactly as documented.
+It exists so the layout can be reviewed before a second pool exists.
+
 ### What the page does
 
 | Action | What it changes |
@@ -1121,7 +1136,7 @@ Service, no Ingress, no Secret.
 ## Terraform integration contract
 
 - The Terraform module installs this chart behind a `node_controller.enabled`
-  toggle and pins `chart_version` / `image_tag` (currently `0.11.9`).
+  toggle and pins `chart_version` / `image_tag` (currently `0.11.10`).
 - **Once the controller is enabled, do not use Terraform to manage worker count
   or worker LB pool membership.** Use the CRD instead. The Terraform module's
   README must state this explicitly.
@@ -1152,7 +1167,7 @@ Build locally (the Dockerfile uses `golang:1.27.1-alpine` and
 `gcr.io/distroless/static:nonroot`):
 
 ```
-docker build -t docker.io/werton13/vcd-k8s-node-controller:0.11.9 .
+docker build -t docker.io/werton13/vcd-k8s-node-controller:0.11.10 .
 ```
 
 Public module defaults are used inside the build. On a restricted network,
@@ -1162,14 +1177,14 @@ override them:
 docker build \
   --build-arg GOPROXY=https://nexus.example.com/repository/golang/ \
   --build-arg GOSUMDB=off \
-  -t docker.io/werton13/vcd-k8s-node-controller:0.11.9 .
+  -t docker.io/werton13/vcd-k8s-node-controller:0.11.10 .
 ```
 
 Push (or use `make image-push`):
 
 ```
 docker login docker.io
-docker push docker.io/werton13/vcd-k8s-node-controller:0.11.9
+docker push docker.io/werton13/vcd-k8s-node-controller:0.11.10
 docker push docker.io/werton13/vcd-k8s-node-controller:latest
 ```
 

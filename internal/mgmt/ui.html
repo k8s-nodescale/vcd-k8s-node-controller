@@ -166,7 +166,6 @@
     <div class="poolbar" id="poolBar" style="display:none">
       <span class="pane-title" style="margin:0">pool</span>
       <select id="poolPick"></select>
-      <span class="chip" id="poolName" style="display:none"></span>
       <span class="small muted">the flavour and replicas actions below apply to this pool</span>
     </div>
     <div class="split">
@@ -230,6 +229,11 @@
 (function () {
   "use strict";
   var BASE = "__PREFIX__";
+  // Development aid: ?dev=1 keeps the pool picker on screen even when the
+  // cluster has a single pool, which is the only way to look at it before a
+  // second pool exists. It changes nothing else, and a normal visit (no query
+  // parameter) hides the bar exactly as before.
+  var DEV = /[?&]dev=1(&|$)/.test(location.search);
   var state = { pools: [], current: null, stamp: "", stale: false, me: null, draft: null,
                 flavorDraft: null, pendingDelete: null };
   var pick = document.getElementById("poolPick");
@@ -356,16 +360,11 @@
     if (state.current) {
       pick.value = state.current.namespace + "/" + state.current.name;
     }
-    // The bar is always there - it says what the two panes act on. With a
-    // single pool it shows the name instead of a select, so the picker is
-    // never a control that exists only in a comment.
-    var bar = document.getElementById("poolBar");
-    var only = document.getElementById("poolName");
-    bar.style.display = state.pools.length ? "" : "none";
-    var choice = state.pools.length > 1;
-    pick.style.display = choice ? "" : "none";
-    only.style.display = choice ? "none" : "";
-    only.textContent = state.current ? state.current.namespace + "/" + state.current.name : "";
+    // The picker is the parent of the two panes, and it is only shown when
+    // there is something to pick. DEV keeps it for a single-pool cluster so
+    // the layout can be checked before a second pool exists.
+    var show = state.pools.length > 0 && (state.pools.length > 1 || DEV);
+    document.getElementById("poolBar").style.display = show ? "" : "none";
   }
 
   function render() {
