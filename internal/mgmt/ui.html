@@ -143,7 +143,15 @@
   /* the upper card is two panes: scale-up/down on the left, scale-in/out on
      the right, each with its own contour */
   .split { display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-start; }
-  .pane { flex: 1 1 340px; border: 1px solid var(--line); border-radius: 8px; padding: 12px; }
+  .pane { flex: 0 1 auto; border: 1px solid var(--line); border-radius: 8px; padding: 12px; }
+  /* the third pane is the one that grows: the other two stop at their content */
+  .pane.capacity { flex: 1 1 300px; min-width: 260px; }
+  .caprows { display: flex; flex-direction: column; gap: 9px; }
+  .caprow { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+  .caplbl { width: 56px; color: var(--muted); }
+  .caprow .dbar { flex: 1 1 auto; min-width: 60px; }
+  .capnum { font-size: 11px; color: var(--muted); white-space: nowrap; }
+  .capnote { font-size: 11px; color: var(--muted); margin-top: 2px; }
   .pane-title { margin-bottom: 10px; font-size: 11px; text-transform: uppercase;
                 letter-spacing: .04em; color: var(--muted); font-weight: 600; }
   /* the flavour, one value per line so it reads as a spec sheet */
@@ -249,6 +257,10 @@
         </div>
         <div class="small muted" id="replicasHint" style="margin-top:6px"></div>
         <div class="small muted" id="gates" style="margin-top:4px"></div>
+      </div>
+      <div class="pane capacity">
+        <div class="pane-title">capacity &middot; what the vDC still has</div>
+        <div class="caprows" id="capRows"><span class="small muted">no snapshot yet</span></div>
       </div>
     </div>
     <div class="banner" id="warning" role="alert">
@@ -447,11 +459,58 @@
     document.getElementById("poolBar").style.display = show ? "" : "none";
   }
 
+  function capNumber(v, decimals) {
+    if (v == null || isNaN(v)) { return "?"; }
+    return decimals ? v.toFixed(decimals) : String(Math.round(v));
+  }
+
+  function capRow(label, share, used, limit, unit, decimals) {
+    var pct = share && share.percent != null ? share.percent : null;
+    var cls = share && share.level === "high" ? "d-high" : share && share.level === "warn" ? "d-warn" : "d-ok";
+    var text = pct == null ? "–" : pct.toFixed(0) + "%";
+    var num = pct == null
+      ? "no limit reported"
+      : capNumber(used, decimals) + " / " + capNumber(limit, decimals) + " " + unit;
+    return '<div class="caprow"><span class="caplbl">' + label + "</span>" +
+      '<span class="dbar ' + cls + '"><i style="width:' + (pct || 0) + '%"></i><b>' + text + "</b></span>" +
+      '<span class="capnum">' + num + "</span></div>";
+  }
+
+  // The capacity pane answers one question: does another worker fit. The
+  // numbers come from the pool status, which the controller writes from the
+  // platform, so they are as fresh as the last scale operation.
+  function renderCapacity(p) {
+    var box = document.getElementById("capRows");
+    var c = p && p.capacity;
+    if (!c) {
+      box.innerHTML = '<span class="small muted">the controller has not published a capacity snapshot yet</span>';
+      return;
+    }
+    var rows = [
+      capRow("vCPU", c.cpu, c.cpuMHz / 1000, c.cpuLimitMHz / 1000, "GHz", 1),
+      capRow("RAM", c.memory, c.memoryMB / 1024, c.memoryLimitMB / 1024, "GB", 0),
+      capRow("Storage", c.storage, c.storageMB / 1024, c.storageLimitMB / 1024, "GB", 0)
+    ];
+    if (c.podSubnet && c.podSubnetsTotal > 0) {
+      rows.push('<div class="capnote">pod network ' + esc(c.podSubnet) + " · " +
+        (c.podSubnetsTotal - c.podSubnetsUsed) + " of " + c.podSubnetsTotal + " subnets free</div>");
+    }
+    if (c.storageName) {
+      rows.push('<div class="capnote">storage profile ' + esc(c.storageName) + "</div>");
+    }
+    if (c.at) {
+      rows.push('<div class="capnote">snapshot ' + new Date(c.at).toLocaleTimeString() +
+        (c.observedReplicas != null ? " at " + c.observedReplicas + " workers" : "") + "</div>");
+    }
+    box.innerHTML = rows.join("");
+  }
+
   function render() {
     var p = state.current;
     var stamp = document.getElementById("stamp");
     if (!p) {
       stamp.textContent = "no K8sWorkerPool in this cluster";
+      renderCapacity(null);
       renderWorkers();
       return;
     }
@@ -493,6 +552,7 @@
     gates.innerHTML = "minReplicas <b>" + p.minReplicas + "</b> · " +
       '<span class="gate" title="' + esc(allowLastWorkerTip(p)) + '">allowLastWorker: ' + p.allowLastWorker + "</span>";
 
+    renderCapacity(p);
     renderWorkers();
   }
 
@@ -535,7 +595,8 @@
 
     var row = "<tr>" +
       '<td class="g-a">' + cell + "</td>" +
-      '<td class="grp g-b"><span class="chip' + (n.phase === "Ready" ? " ok" : "") + '">' + esc(n.phase) + "</span></td>" +
+      '<td class="grp g-b"><span class="chip' + (n.phase === "Ready" ? " ok" : "") + '">' + esc(n.phase) + "</span>" +
+        (n.cordoned ? ' <span class="chip warn" title="the node is cordoned: it takes no new pods">cordoned</span>' : "") + "</td>" +
       '<td class="grp g-a">' + cpuCell(n.requests) + '</td><td class="g-a">' + cpuCell(n.limits) + '</td><td class="g-a">' + cpuCell(n.real) + "</td>" +
       '<td class="grp g-b">' + memCell(n.requests) + '</td><td class="g-b">' + memCell(n.limits) + '</td><td class="g-b">' + memCell(n.real) + "</td>" +
       '<td class="grp g-a">' + diskCell(diskAt(n, "/")) + '</td><td class="g-a">' + diskCell(diskAt(n, "/var")) + '</td><td class="g-a">' + diskCell(diskAt(n, "/var/lib")) + "</td>" +

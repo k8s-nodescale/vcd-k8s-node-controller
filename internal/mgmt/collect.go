@@ -170,6 +170,26 @@ func (c *Collector) poolView(ctx context.Context, p *infrav1.K8sWorkerPool, byNo
 		}
 	}
 
+	if cap := p.Status.Capacity; cap != nil {
+		view.Capacity = &Capacity{
+			Model:           cap.Model,
+			CPUMHz:          cap.CPUMHz,
+			CPULimitMHz:     cap.CPULimitMHz,
+			MemoryMB:        cap.MemoryMB,
+			MemoryLimitMB:   cap.MemoryLimitMB,
+			StorageName:     cap.StorageName,
+			StorageMB:       cap.StorageMB,
+			StorageLimitMB:  cap.StorageLimitMB,
+			PodSubnet:       cap.PodSubnet,
+			PodSubnetsTotal: cap.PodSubnetsTotal,
+			PodSubnetsUsed:  cap.PodSubnetsUsed,
+			At:              cap.At.UTC().Format(time.RFC3339),
+			CPU:             shareOf(cap.CPUMHz, cap.CPULimitMHz),
+			Memory:          shareOf(cap.MemoryMB, cap.MemoryLimitMB),
+			Storage:         shareOf(cap.StorageMB, cap.StorageLimitMB),
+		}
+	}
+
 	removing := map[string]bool{}
 	for _, name := range p.Spec.ScaleDown.DeleteWorkers {
 		removing[name] = true
@@ -188,6 +208,7 @@ func (c *Collector) poolView(ctx context.Context, p *infrav1.K8sWorkerPool, byNo
 		kn := byNode[strings.ToLower(nodeKey(n))]
 		if kn != nil {
 			row.Ready = isNodeReady(kn)
+			row.Cordoned = kn.Spec.Unschedulable
 			row.Allocatable = allocatableOf(kn)
 			for _, t := range kn.Spec.Taints {
 				row.Taints = append(row.Taints, formatTaint(t))
@@ -233,6 +254,16 @@ func (c *Collector) poolView(ctx context.Context, p *infrav1.K8sWorkerPool, byNo
 		view.Nodes = append(view.Nodes, row)
 	}
 	return view
+}
+
+// shareOf is NewShare that returns a pointer, for the capacity view where a
+// missing number is a dash and not a zero-valued struct.
+func shareOf(used, limit int64) *Share {
+	if limit <= 0 {
+		return nil
+	}
+	sh := NewShare(used, limit)
+	return &sh
 }
 
 // readyCount is what the pool reports as READY: the slots a Node backs.

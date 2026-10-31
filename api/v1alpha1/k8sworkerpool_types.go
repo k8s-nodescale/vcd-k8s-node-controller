@@ -403,6 +403,56 @@ type K8sWorkerPoolStatus struct {
 	Nodes            []WorkerNodeStatus `json:"nodes,omitempty"`
 	Conditions       []metav1.Condition `json:"conditions,omitempty"`
 	Rollout          RolloutStatus      `json:"rollout,omitempty"`
+
+	// Capacity is the platform's own view of the vDC the pool lives in: what
+	// is used and what the vDC caps, plus the pod subnet budget. The page
+	// cannot ask vCD, and the controller is the only thing that talks to the
+	// platform, so the numbers are published here. A nil Capacity means no
+	// snapshot was taken yet.
+	// +optional
+	Capacity *CapacityStatus `json:"capacity,omitempty"`
+}
+
+// CapacityStatus is a snapshot of the platform capacity and the pod subnet,
+// taken when a scale operation completed (and occasionally to catch drift).
+type CapacityStatus struct {
+	// Model is the vDC allocation model, informational.
+	// +optional
+	Model string `json:"model,omitempty"`
+	// CPUMHz is what vCD counts as used and the ceiling it enforces.
+	// +optional
+	CPUMHz int64 `json:"cpuMHz,omitempty"`
+	// +optional
+	CPULimitMHz int64 `json:"cpuLimitMHz,omitempty"`
+	// MemoryMB is the same pair for memory.
+	// +optional
+	MemoryMB int64 `json:"memoryMB,omitempty"`
+	// +optional
+	MemoryLimitMB int64 `json:"memoryLimitMB,omitempty"`
+	// Storage names the storage profile the numbers belong to, so a bar is
+	// never a sum of profiles with different limits.
+	// +optional
+	StorageName string `json:"storageName,omitempty"`
+	// +optional
+	StorageMB int64 `json:"storageMB,omitempty"`
+	// +optional
+	StorageLimitMB int64 `json:"storageLimitMB,omitempty"`
+	// PodSubnet is the cluster's pod network and how much of it is spoken
+	// for: one subnet per node, which is what decides whether another worker
+	// can be added at all.
+	// +optional
+	PodSubnet string `json:"podSubnet,omitempty"`
+	// +optional
+	PodSubnetsTotal int32 `json:"podSubnetsTotal,omitempty"`
+	// +optional
+	PodSubnetsUsed int32 `json:"podSubnetsUsed,omitempty"`
+	// At is when the snapshot was taken.
+	// +optional
+	At metav1.Time `json:"at,omitempty"`
+	// ObservedReplicas is the pool size the snapshot was taken at, which is
+	// what makes "refresh after a scale completed" decidable.
+	// +optional
+	ObservedReplicas int32 `json:"observedReplicas,omitempty"`
 }
 
 // IPLedger is the persistent IP allocation ledger.

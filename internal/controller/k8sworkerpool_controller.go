@@ -129,6 +129,11 @@ func (r *WorkerPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	res, err := r.reconcile(ctx, before, &pool)
 
+	// Publish the platform capacity while the pass is still cheap: the page
+	// needs it for the bars and the controller is the only thing that can ask
+	// the platform. It is throttled inside.
+	r.refreshCapacityStatus(ctx, &pool)
+
 	// The write that closes the pass. A create may already have published its
 	// progress (see scaleUp); this one records everything else.
 	if ferr := r.flush(ctx, before, &pool); ferr != nil {

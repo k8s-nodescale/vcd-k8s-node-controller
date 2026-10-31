@@ -65,12 +65,16 @@ type Allocatable struct {
 
 // Node is one row of the table.
 type Node struct {
-	Name        string      `json:"name"`
-	NodeName    string      `json:"nodeName,omitempty"`
-	Phase       string      `json:"phase"`
-	IP          string      `json:"ip,omitempty"`
-	ProviderID  string      `json:"providerID,omitempty"`
-	Ready       bool        `json:"ready"`
+	Name       string `json:"name"`
+	NodeName   string `json:"nodeName,omitempty"`
+	Phase      string `json:"phase"`
+	IP         string `json:"ip,omitempty"`
+	ProviderID string `json:"providerID,omitempty"`
+	Ready      bool   `json:"ready"`
+	// Cordoned is true when the Kubernetes Node is unschedulable, which is a
+	// state a Ready worker is in during every rollout and whenever an operator
+	// parks one.
+	Cordoned    bool        `json:"cordoned,omitempty"`
 	Allocatable Allocatable `json:"allocatable"`
 	Requests    Usage       `json:"requests"`
 	Limits      Usage       `json:"limits"`
@@ -122,18 +126,19 @@ type Flavor struct {
 
 // Pool is everything the page needs about one pool.
 type Pool struct {
-	Namespace       string   `json:"namespace"`
-	Name            string   `json:"name"`
-	Replicas        int32    `json:"replicas"`
-	Observed        int32    `json:"observedReplicas"`
-	Ready           int32    `json:"readyReplicas"`
-	Phase           string   `json:"phase,omitempty"`
-	Message         string   `json:"message,omitempty"`
-	MinReplicas     int32    `json:"minReplicas"`
-	AllowLastWorker bool     `json:"allowLastWorker"`
-	DeleteWorkers   []string `json:"deleteWorkers,omitempty"`
-	Flavor          Flavor   `json:"flavor"`
-	Nodes           []Node   `json:"nodes"`
+	Namespace       string    `json:"namespace"`
+	Name            string    `json:"name"`
+	Replicas        int32     `json:"replicas"`
+	Observed        int32     `json:"observedReplicas"`
+	Ready           int32     `json:"readyReplicas"`
+	Phase           string    `json:"phase,omitempty"`
+	Message         string    `json:"message,omitempty"`
+	MinReplicas     int32     `json:"minReplicas"`
+	AllowLastWorker bool      `json:"allowLastWorker"`
+	DeleteWorkers   []string  `json:"deleteWorkers,omitempty"`
+	Flavor          Flavor    `json:"flavor"`
+	Capacity        *Capacity `json:"capacity,omitempty"`
+	Nodes           []Node    `json:"nodes"`
 	// Warning carries the first condition message when the pool is not
 	// converged, so the page can say why without the operator opening kubectl.
 	Warning string `json:"warning,omitempty"`
@@ -148,4 +153,26 @@ type Disk struct {
 	UsedGB  float64  `json:"usedGB,omitempty"`
 	Percent *float64 `json:"percent,omitempty"`
 	Level   string   `json:"level,omitempty"`
+}
+
+// Capacity is the platform snapshot the controller publishes in status: what
+// the vDC counts as used, what it caps, and how much pod network is left. The
+// percentages are computed here like every other share, so the page only paints.
+type Capacity struct {
+	Model           string `json:"model,omitempty"`
+	CPUMHz          int64  `json:"cpuMHz,omitempty"`
+	CPULimitMHz     int64  `json:"cpuLimitMHz,omitempty"`
+	MemoryMB        int64  `json:"memoryMB,omitempty"`
+	MemoryLimitMB   int64  `json:"memoryLimitMB,omitempty"`
+	StorageName     string `json:"storageName,omitempty"`
+	StorageMB       int64  `json:"storageMB,omitempty"`
+	StorageLimitMB  int64  `json:"storageLimitMB,omitempty"`
+	PodSubnet       string `json:"podSubnet,omitempty"`
+	PodSubnetsTotal int32  `json:"podSubnetsTotal,omitempty"`
+	PodSubnetsUsed  int32  `json:"podSubnetsUsed,omitempty"`
+	At              string `json:"at,omitempty"`
+
+	CPU     *Share `json:"cpu,omitempty"`
+	Memory  *Share `json:"memory,omitempty"`
+	Storage *Share `json:"storage,omitempty"`
 }

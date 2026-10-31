@@ -437,6 +437,47 @@ spec:
           status:
             description: K8sWorkerPoolStatus is the observed state.
             properties:
+              capacity:
+                description: |-
+                  Capacity is the platform's own view of the vDC the pool lives in: what is used and what the vDC caps, plus the pod subnet budget. It is a snapshot, taken when a scale operation completed and refreshed on a slow timer.
+                properties:
+                  at:
+                    format: date-time
+                    type: string
+                  cpuLimitMHz:
+                    format: int64
+                    type: integer
+                  cpuMHz:
+                    format: int64
+                    type: integer
+                  memoryLimitMB:
+                    format: int64
+                    type: integer
+                  memoryMB:
+                    format: int64
+                    type: integer
+                  model:
+                    type: string
+                  observedReplicas:
+                    format: int32
+                    type: integer
+                  podSubnet:
+                    type: string
+                  podSubnetsTotal:
+                    format: int32
+                    type: integer
+                  podSubnetsUsed:
+                    format: int32
+                    type: integer
+                  storageLimitMB:
+                    format: int64
+                    type: integer
+                  storageMB:
+                    format: int64
+                    type: integer
+                  storageName:
+                    type: string
+                type: object
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current

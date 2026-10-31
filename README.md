@@ -1008,6 +1008,96 @@ open, and a certificate is matched by name, which a catch-all rule does not
 have. With a real hostname, set `ui.ingress.tls.secretName` to a TLS Secret and
 `ui.ingress.tls.redirect: true` to move everyone onto HTTPS.
 
+### Resetting a UI password
+
+The page has no "change password" form and no password store of its own: the
+accounts are a `users.yaml` file inside a Kubernetes Secret, and the sidecar
+re-reads that Secret every `ui.auth.refreshInterval` (60 seconds). A reset is
+therefore a Secret edit, not a restart.
+
+The Secret is `ui.auth.secretName` (`nodescale-ui-auth` by default) in the
+release namespace, and the account list is its `users.yaml` key:
+
+```yaml
+admins:
+  - username: admin
+    passwordHash: <bcrypt>
+viewers:
+  - username: viewer
+    passwordHash: <bcrypt>
+```
+
+Generate a hash and patch the file in place:
+
+```bash
+NS=vcd-nodescale-system
+SECRET=nodescale-ui-auth
+USER=admin
+
+# 1. a bcrypt hash for the new password (any of these works)
+HASH=$(htpasswd -nbB "$USER" 'new-password' | cut -d: -f2)
+# or: HASH=$(docker run --rm httpd:2 htpasswd -nbB "$USER" 'new-password' | cut -d: -f2)
+
+# 2. take the current file, swap the hash of that one user, put it back
+kubectl -n "$NS" get secret "$SECRET" -o jsonpath='{.data.users\.yaml}' | base64 -d > /tmp/users.yaml
+python3 - "$USER" "$HASH" <<'PY'
+import sys, re, pathlib
+user, h = sys.argv[1], sys.argv[2]
+p = pathlib.Path("/tmp/users.yaml")
+t = p.read_text()
+t = re.sub(r"(- username: %s\n\s+passwordHash: )\S+" % re.escape(user), r"\g<1>" + h, t)
+p.write_text(t)
+PY
+kubectl -n "$NS" create secret generic "$SECRET" \
+  --from-file=users.yaml=/tmp/users.yaml \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+# 3. the sidecar picks it up within ui.auth.refreshInterval
+kubectl -n "$NS" logs deploy/vcd-nodescale -c ui --tail=5 | grep auth
+```
+
+Two consequences worth knowing before doing it:
+
+- **Every session ends.** The cookie is signed with a key derived from the
+  `users.yaml` bytes, so any edit - one password, one account added or removed -
+  invalidates every signed-in browser. That is deliberate: a rotated password
+  must not leave an old session alive.
+- **Nothing rotates by itself.** The chart creates the Secret only when it does
+  not exist (`lookup` guard plus `helm.sh/resource-policy: keep`), and the
+  Ansible role writes it only when it is absent. Re-running either does not
+  change a password; it would also overwrite an operator's reset. The Ansible
+  path additionally leaves the generated plaintext on the control host in
+  `<playbook_dir>/.credentials/<inventory_hostname>/nodescale-ui-{admin,viewer}`
+  (mode 0600) - that file is a record, not the source of truth.
+
+### Where the platform credentials live
+
+- **vCD** - one Secret, `vcd.existingSecret` (default `vcd-credentials`) in the
+  release namespace, keys `url`, `user`, `password`, `org`, `vdc`, `insecure`.
+  The chart mounts it as `VCD_*` environment variables; the controller is the
+  only thing that reads them. The Ansible role creates the Secret from
+  `lookup('password')` on the control host when it is missing, so a manual
+  rotation survives a re-run.
+- **vSphere** - not implemented yet. When it is, the connection belongs in the
+  placement's Secret, so a pool references it instead of carrying credentials.
+- **What protects them.** A Kubernetes Secret is base64, not encryption: it is
+  protected by the API server's RBAC (only the controller's ServiceAccount and
+  whoever may read Secrets in that namespace), by etcd access control, and by
+  encryption-at-rest only if the cluster enables it. There is no second layer
+  here - treat the Secret as the credential itself. The UI account hashes are
+  different: they are bcrypt (one-way), and the plaintext of those passwords
+  exists only where it was generated (the `initial-passwords` key until it is
+  deleted, or the control host's `.credentials` file).
+
+```bash
+# read the vCD credential when you actually need it
+kubectl -n vcd-nodescale-system get secret vcd-credentials \
+  -o jsonpath='{.data.user}' | base64 -d; echo
+# and remove the generated UI passwords after the first sign-in
+kubectl -n vcd-nodescale-system patch secret nodescale-ui-auth \
+  --type=json -p '[{"op":"remove","path":"/data/initial-passwords"}]'
+```
+
 ### Looking at the page during development
 
 The pool picker above the flavour and replicas panes only appears when the
@@ -1136,7 +1226,7 @@ Service, no Ingress, no Secret.
 ## Terraform integration contract
 
 - The Terraform module installs this chart behind a `node_controller.enabled`
-  toggle and pins `chart_version` / `image_tag` (currently `0.11.19`).
+  toggle and pins `chart_version` / `image_tag` (currently `0.11.20`).
 - **Once the controller is enabled, do not use Terraform to manage worker count
   or worker LB pool membership.** Use the CRD instead. The Terraform module's
   README must state this explicitly.
@@ -1167,7 +1257,7 @@ Build locally (the Dockerfile uses `golang:1.27.1-alpine` and
 `gcr.io/distroless/static:nonroot`):
 
 ```
-docker build -t docker.io/werton13/vcd-k8s-node-controller:0.11.19 .
+docker build -t docker.io/werton13/vcd-k8s-node-controller:0.11.20 .
 ```
 
 Public module defaults are used inside the build. On a restricted network,
@@ -1177,14 +1267,14 @@ override them:
 docker build \
   --build-arg GOPROXY=https://nexus.example.com/repository/golang/ \
   --build-arg GOSUMDB=off \
-  -t docker.io/werton13/vcd-k8s-node-controller:0.11.19 .
+  -t docker.io/werton13/vcd-k8s-node-controller:0.11.20 .
 ```
 
 Push (or use `make image-push`):
 
 ```
 docker login docker.io
-docker push docker.io/werton13/vcd-k8s-node-controller:0.11.19
+docker push docker.io/werton13/vcd-k8s-node-controller:0.11.20
 docker push docker.io/werton13/vcd-k8s-node-controller:latest
 ```
 
