@@ -41,6 +41,8 @@ case "$root_src" in
       exit 1
     fi
     pv=$(pvs --noheadings -o pv_name --select "vg_name=$vg" 2>/dev/null | tr -d ' ' | head -n1)
+    # The VG/LV pair, not the resolved device: readlink turns the mapper path
+    # into /dev/dm-0 and lvextend does not accept that form.
     if [[ -z "$pv" ]]; then
       log "no physical volume backs VG $vg"
       exit 1
@@ -93,13 +95,13 @@ if [[ -n "$pv" ]]; then
   free=$(vgs --noheadings -o vg_free_count "$vg" 2>/dev/null | tr -d ' ')
   if [[ "${free:-0}" -gt 0 ]]; then
     log "extending $vg/$lv by $free extents"
-    out=$(lvextend -y -l +100%FREE "$lvpath" 2>&1)
+    out=$(lvextend -y -l +100%FREE "$vg/$lv" 2>&1)
     rc=$?
     if [[ "$rc" -ne 0 ]]; then
       log "lvextend failed (rc=$rc): $out; retrying"
       sleep 3
       udevadm settle >/dev/null 2>&1 || true
-      out=$(lvextend -y -l +100%FREE "$lvpath" 2>&1) || log "lvextend failed again: $out"
+      out=$(lvextend -y -l +100%FREE "$vg/$lv" 2>&1) || log "lvextend failed again: $out"
     else
       log "lvextend: $out"
     fi

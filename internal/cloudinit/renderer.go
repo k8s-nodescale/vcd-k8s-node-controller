@@ -24,7 +24,7 @@ import (
 
 // RenderVersion is bumped whenever the rendered output changes in a way that
 // matters to a running guest. It is stamped into every generated file.
-const RenderVersion = "0.3.1"
+const RenderVersion = "0.3.2"
 
 //go:embed templates/*.tmpl
 var templatesFS embed.FS

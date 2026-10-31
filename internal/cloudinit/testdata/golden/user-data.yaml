@@ -1,5 +1,5 @@
 #cloud-config
-# render=0.3.1 hash=4658f4e53764
+# render=0.3.2 hash=732099503917
 preserve_hostname: false
 hostname: pool-wrk-01
 fqdn: pool-wrk-01
@@ -264,6 +264,8 @@ write_files:
             exit 1
           fi
           pv=$(pvs --noheadings -o pv_name --select "vg_name=$vg" 2>/dev/null | tr -d ' ' | head -n1)
+          # The VG/LV pair, not the resolved device: readlink turns the mapper path
+          # into /dev/dm-0 and lvextend does not accept that form.
           if [[ -z "$pv" ]]; then
             log "no physical volume backs VG $vg"
             exit 1
@@ -316,13 +318,13 @@ write_files:
         free=$(vgs --noheadings -o vg_free_count "$vg" 2>/dev/null | tr -d ' ')
         if [[ "${free:-0}" -gt 0 ]]; then
           log "extending $vg/$lv by $free extents"
-          out=$(lvextend -y -l +100%FREE "$lvpath" 2>&1)
+          out=$(lvextend -y -l +100%FREE "$vg/$lv" 2>&1)
           rc=$?
           if [[ "$rc" -ne 0 ]]; then
             log "lvextend failed (rc=$rc): $out; retrying"
             sleep 3
             udevadm settle >/dev/null 2>&1 || true
-            out=$(lvextend -y -l +100%FREE "$lvpath" 2>&1) || log "lvextend failed again: $out"
+            out=$(lvextend -y -l +100%FREE "$vg/$lv" 2>&1) || log "lvextend failed again: $out"
           else
             log "lvextend: $out"
           fi
@@ -363,7 +365,7 @@ write_files:
       LOG=/var/log/k8s-node-prereqs.log
       exec >>"$LOG" 2>&1
       log() { echo "[$(date -Is)] $*"; }
-      log "starting prerequisites render=0.3.1 hash=4658f4e53764"
+      log "starting prerequisites render=0.3.2 hash=732099503917"
 
       # 0. The virtual disk may be bigger than the template's partition table:
       #    a 20 GiB clone of an 8 GiB image leaves / at 7.6 GiB and the apt
@@ -459,7 +461,7 @@ write_files:
       LOG=/var/log/k8s-node-join.log
       exec >>"$LOG" 2>&1
       log() { echo "[$(date -Is)] $*"; }
-      log "starting join render=0.3.1 hash=4658f4e53764"
+      log "starting join render=0.3.2 hash=732099503917"
 
       MARKER=/etc/kubernetes/kubeadm-joined
       if [[ -f "$MARKER" ]]; then
