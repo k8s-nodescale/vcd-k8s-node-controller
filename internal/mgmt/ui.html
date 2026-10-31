@@ -19,6 +19,9 @@
     --chip: #eef1f5;
     --ipfg: steelblue;
     --ipbg: rgba(70, 130, 180, .15);
+    --pod: #4f9ad4;
+    --podbg: rgba(79, 154, 212, .14);
+    --podline: rgba(79, 154, 212, .55);
     --shade: rgba(15, 30, 50, .035);
     --shade2: rgba(15, 30, 50, .075);
   }
@@ -36,6 +39,9 @@
     --chip: #232a31;
     --ipfg: #8fc0e8;
     --ipbg: rgba(120, 170, 210, .20);
+    --pod: #79bdea;
+    --podbg: rgba(121, 189, 234, .16);
+    --podline: rgba(121, 189, 234, .55);
     --shade: rgba(255, 255, 255, .045);
     --shade2: rgba(255, 255, 255, .09);
   }
@@ -152,6 +158,16 @@
   .caprow .dbar { flex: 1 1 auto; min-width: 60px; }
   .capnum { font-size: 11px; color: var(--muted); white-space: nowrap; }
   .capnote { font-size: 11px; color: var(--muted); margin-top: 2px; }
+  .capnote.warn { color: var(--warn); }
+  /* the pod network is counted in nodes, so its bar is a row of slots: one per
+     node the range can carry, filled when a node holds one */
+  .caprow.pod { margin-top: 2px; }
+  .caprow.pod .caplbl, .caprow.podbar .caplbl { width: auto; }
+  .caprow.podbar { margin-top: -3px; }
+  .pslots { display: flex; gap: 3px; flex: 1 1 auto; min-width: 60px; height: 15px; }
+  .pslots i { flex: 1 1 0; min-width: 2px; border-radius: 3px;
+              background: var(--podbg); border: 1px solid var(--podline); }
+  .pslots i.on { background: var(--pod); border-color: var(--pod); }
   .pane-title { margin-bottom: 10px; font-size: 11px; text-transform: uppercase;
                 letter-spacing: .04em; color: var(--muted); font-weight: 600; }
   /* the flavour, one value per line so it reads as a spec sheet */
@@ -476,6 +492,37 @@
       '<span class="capnum">' + num + "</span></div>";
   }
 
+  // podRow counts the pod network in nodes rather than in addresses: 110 pods
+  // per node is the kubelet default, so the range carries IPs/110 nodes, and
+  // each node that exists takes one slot. The slots are drawn one per node the
+  // range can carry, filled for the nodes that are already there.
+  function podRow(c) {
+    var capacity = Math.floor((c.podIPs || 0) / 110);
+    var assigned = Math.min(c.podNodes || 0, capacity);
+    var segs = "";
+    if (capacity > 0 && capacity <= 48) {
+      for (var i = 0; i < capacity; i++) {
+        segs += "<i" + (i < assigned ? ' class="on"' : "") + "></i>";
+      }
+    } else if (capacity > 48) {
+      // A /16 would be 596 slivers nobody can read: one bar, filled by share.
+      segs = '<i class="on" style="flex:0 0 ' + Math.round(assigned / capacity * 100) + '%"></i>';
+    }
+    var title = "addresses " + (c.podIPs || 0) + " / 110 per node = " + capacity + " nodes, " +
+      assigned + " assigned";
+    if (c.podBlocks > 0) {
+      title += "; CNI blocks " + c.podBlocksUsed + " of " + c.podBlocks;
+    }
+    var note = "";
+    if (c.podBlocks > 0 && c.podBlocksUsed >= c.podBlocks) {
+      note = '<div class="capnote warn">the CNI has no block left to hand out</div>';
+    }
+    return '<div class="caprow pod"><span class="caplbl">POD CIDR ' + esc(c.podCIDR) + "</span></div>" +
+      '<div class="caprow podbar" title="' + esc(title) + '">' +
+      '<span class="pslots">' + segs + "</span>" +
+      '<span class="capnum">' + assigned + " / " + capacity + " nodes</span></div>" + note;
+  }
+
   // The capacity pane answers one question: does another worker fit. The
   // numbers come from the pool status, which the controller writes from the
   // platform, so they are as fresh as the last scale operation.
@@ -492,15 +539,7 @@
       capRow("Storage", c.storage, c.storageMB / 1024, c.storageLimitMB / 1024, "GB", 0)
     ];
     if (c.podCIDR) {
-      // 110 pods per node is the kubelet default: the range divided by it is
-      // how many nodes it can carry, and the rest is what may still be added.
-      var line = "POD NETWORK CIDR " + c.podCIDR + " : Remaining Capacity " + (c.podRemainingNodes || 0) +
-        (c.podRemainingNodes === 1 ? " Node" : " Nodes");
-      var detail = "addresses " + (c.podIPs || 0) + " · nodes " + (c.podNodes || 0) + " × 110";
-      if (c.podBlocks > 0) {
-        detail += " · blocks " + c.podBlocksUsed + " of " + c.podBlocks;
-      }
-      rows.push('<div class="capnote" title="' + esc(detail) + '"><b>' + esc(line) + "</b></div>");
+      rows.push(podRow(c));
     }
     if (c.storageName) {
       rows.push('<div class="capnote">storage profile ' + esc(c.storageName) + "</div>");
