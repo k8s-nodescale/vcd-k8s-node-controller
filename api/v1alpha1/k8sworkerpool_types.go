@@ -437,15 +437,28 @@ type CapacityStatus struct {
 	StorageMB int64 `json:"storageMB,omitempty"`
 	// +optional
 	StorageLimitMB int64 `json:"storageLimitMB,omitempty"`
-	// PodSubnet is the cluster's pod network and how much of it is spoken
-	// for: one subnet per node, which is what decides whether another worker
-	// can be added at all.
+	// PodCIDR is the cluster's pod network. Its address count sized against
+	// the per-node allowance (110 pods, the kubelet default) is what decides
+	// whether another node can be added at all.
 	// +optional
-	PodSubnet string `json:"podSubnet,omitempty"`
+	PodCIDR string `json:"podCIDR,omitempty"`
+	// PodIPs is how many addresses the pod network holds.
 	// +optional
-	PodSubnetsTotal int32 `json:"podSubnetsTotal,omitempty"`
+	PodIPs int64 `json:"podIPs,omitempty"`
+	// PodNodes is every node of the cluster, masters included: they run pods
+	// and cost the same slice.
 	// +optional
-	PodSubnetsUsed int32 `json:"podSubnetsUsed,omitempty"`
+	PodNodes int32 `json:"podNodes,omitempty"`
+	// PodRemainingNodes is how many more nodes the range can carry:
+	// (PodIPs - PodNodes*110) / 110, floored at zero.
+	// +optional
+	PodRemainingNodes int32 `json:"podRemainingNodes,omitempty"`
+	// PodBlocks and PodBlocksUsed are the CNI's own view: a range can have
+	// addresses left and still have no block to hand out.
+	// +optional
+	PodBlocks int32 `json:"podBlocks,omitempty"`
+	// +optional
+	PodBlocksUsed int32 `json:"podBlocksUsed,omitempty"`
 	// At is when the snapshot was taken.
 	// +optional
 	At metav1.Time `json:"at,omitempty"`

@@ -159,18 +159,21 @@ type Disk struct {
 // the vDC counts as used, what it caps, and how much pod network is left. The
 // percentages are computed here like every other share, so the page only paints.
 type Capacity struct {
-	Model           string `json:"model,omitempty"`
-	CPUMHz          int64  `json:"cpuMHz,omitempty"`
-	CPULimitMHz     int64  `json:"cpuLimitMHz,omitempty"`
-	MemoryMB        int64  `json:"memoryMB,omitempty"`
-	MemoryLimitMB   int64  `json:"memoryLimitMB,omitempty"`
-	StorageName     string `json:"storageName,omitempty"`
-	StorageMB       int64  `json:"storageMB,omitempty"`
-	StorageLimitMB  int64  `json:"storageLimitMB,omitempty"`
-	PodSubnet       string `json:"podSubnet,omitempty"`
-	PodSubnetsTotal int32  `json:"podSubnetsTotal,omitempty"`
-	PodSubnetsUsed  int32  `json:"podSubnetsUsed,omitempty"`
-	At              string `json:"at,omitempty"`
+	Model          string `json:"model,omitempty"`
+	CPUMHz         int64  `json:"cpuMHz,omitempty"`
+	CPULimitMHz    int64  `json:"cpuLimitMHz,omitempty"`
+	MemoryMB       int64  `json:"memoryMB,omitempty"`
+	MemoryLimitMB  int64  `json:"memoryLimitMB,omitempty"`
+	StorageName    string `json:"storageName,omitempty"`
+	StorageMB      int64  `json:"storageMB,omitempty"`
+	StorageLimitMB int64  `json:"storageLimitMB,omitempty"`
+	PodCIDR        string `json:"podCIDR,omitempty"`
+	PodIPs         int64  `json:"podIPs,omitempty"`
+	PodNodes       int32  `json:"podNodes,omitempty"`
+	PodRemaining   int32  `json:"podRemainingNodes,omitempty"`
+	PodBlocks      int32  `json:"podBlocks,omitempty"`
+	PodBlocksUsed  int32  `json:"podBlocksUsed,omitempty"`
+	At             string `json:"at,omitempty"`
 
 	CPU     *Share `json:"cpu,omitempty"`
 	Memory  *Share `json:"memory,omitempty"`

@@ -21,12 +21,12 @@ import (
 // round trip.
 const capacityStatusTTL = 10 * time.Minute
 
-// podSubnetMask is the size of the block kube-controller-manager hands to one
-// node, i.e. how many /24s the pod network holds. kubeadm's default
-// (node-cidr-mask-size) is 24 for IPv4.
-const podSubnetMask = 24
+// podsPerNode is what a kubelet is configured for by default and what the pod
+// network has to be able to address: node count times this is the floor a pod
+// CIDR must cover, and one more node costs another slice of it.
+const podsPerNode = 110
 
-// refreshCapacityStatus publishes the platform capacity and the pod subnet
+// refreshCapacityStatus publishes the platform capacity and the pod network
 // budget in status. It is deliberate about when it spends a vCD call: when
 // there is no snapshot, when the pool's observed size differs from the one the
 // snapshot was taken at (a scale operation completed), or when the snapshot is
@@ -77,19 +77,45 @@ func (r *WorkerPoolReconciler) refreshCapacityStatus(ctx context.Context, pool *
 		}
 	}
 
-	snap.PodSubnet, snap.PodSubnetsTotal, snap.PodSubnetsUsed = r.podSubnetBudget(ctx)
+	budget := r.podBudget(ctx)
+	snap.PodCIDR = budget.CIDR
+	snap.PodIPs = budget.IPs
+	snap.PodNodes = budget.Nodes
+	snap.PodRemainingNodes = budget.RemainingNodes
+	snap.PodBlocks = budget.Blocks
+	snap.PodBlocksUsed = budget.BlocksUsed
+
 	snap.At = metav1.Now()
 	pool.Status.Capacity = snap
 }
 
-// podSubnetBudget answers "can another worker join at all". The cluster's pod
-// network comes from the kubeadm ConfigMap, and the blocks already handed out
-// are the podCIDRs on the Nodes - one per node for every CNI that uses
-// kube-controller-manager's allocator, which is what a kubeadm cluster does.
-func (r *WorkerPoolReconciler) podSubnetBudget(ctx context.Context) (string, int32, int32) {
+// podBudget answers the question the page asks: how many more nodes does the
+// pod network still have room for.
+//
+// The arithmetic is the operator's, not the CNI's: every node is sized for
+// podsPerNode pods, so the nodes the CIDR can carry are its address count
+// divided by podsPerNode, and what is left after the nodes that exist (masters
+// included, they run pods too) is how many may be added. It deliberately does
+// not depend on how a particular CNI slices the range.
+//
+// Blocks is the finer-grained second opinion - the per-node blocks the nodes
+// actually hold - because a range can have addresses left and still have no
+// block to hand out.
+type podBudget struct {
+	CIDR           string
+	IPs            int64
+	Nodes          int32
+	RemainingNodes int32
+	Blocks         int32
+	BlocksUsed     int32
+}
+
+func (r *WorkerPoolReconciler) podBudget(ctx context.Context) podBudget {
+	var out podBudget
+
 	cfg := &corev1.ConfigMap{}
 	if err := r.Get(ctx, client.ObjectKey{Namespace: "kube-system", Name: "kubeadm-config"}, cfg); err != nil {
-		return "", 0, 0
+		return out
 	}
 	var kubeadm struct {
 		Networking struct {
@@ -97,32 +123,42 @@ func (r *WorkerPoolReconciler) podSubnetBudget(ctx context.Context) (string, int
 		} `json:"networking"`
 	}
 	if err := yaml.Unmarshal([]byte(cfg.Data["ClusterConfiguration"]), &kubeadm); err != nil {
-		return "", 0, 0
+		return out
 	}
 	subnet := strings.TrimSpace(kubeadm.Networking.PodSubnet)
 	if subnet == "" {
-		return "", 0, 0
+		return out
 	}
+	out.CIDR = subnet
+
 	_, network, err := net.ParseCIDR(subnet)
 	if err != nil || network.IP.To4() == nil {
-		return subnet, 0, 0
+		return out
 	}
 	ones, bits := network.Mask.Size()
-	if bits != 32 || ones > podSubnetMask {
-		return subnet, 1, 1
+	if bits != 32 {
+		return out
 	}
+	out.IPs = int64(1) << uint(32-ones)
 
 	nodes := &corev1.NodeList{}
 	if err := r.List(ctx, nodes); err != nil {
-		return subnet, 0, 0
+		return out
 	}
+	out.Nodes = int32(len(nodes.Items))
 
-	// The block size is not the kubeadm default on every cluster: the flag is
-	// node-cidr-mask-size, and the dev cluster hands out /25s. Take it from
-	// what the nodes actually hold rather than assuming 24, or a full network
-	// reads as over-allocated.
-	perNode := podSubnetMask
-	seen := map[string]bool{}
+	// Masters run pods too, and the kubelet is sized the same, so they cost a
+	// slice of the range exactly like a worker.
+	capacityNodes := out.IPs / podsPerNode
+	remaining := capacityNodes - int64(out.Nodes)
+	if remaining < 0 {
+		remaining = 0
+	}
+	out.RemainingNodes = int32(remaining)
+
+	// The block view: what the CNI has already handed out, one block per node.
+	blocks := map[string]bool{}
+	blockSize := 0
 	for i := range nodes.Items {
 		n := &nodes.Items[i]
 		add := func(cidr string) {
@@ -133,9 +169,9 @@ func (r *WorkerPoolReconciler) podSubnetBudget(ctx context.Context) (string, int
 			if err != nil {
 				return
 			}
-			seen[block.String()] = true
-			if b, bbits := block.Mask.Size(); bbits == 32 && b > ones && b < 32 {
-				perNode = b
+			blocks[block.String()] = true
+			if b, _ := block.Mask.Size(); b > ones && b < 32 {
+				blockSize = b
 			}
 		}
 		add(n.Spec.PodCIDR)
@@ -143,6 +179,9 @@ func (r *WorkerPoolReconciler) podSubnetBudget(ctx context.Context) (string, int
 			add(cidr)
 		}
 	}
-	total := int32(1) << uint(perNode-ones)
-	return subnet, total, int32(len(seen))
+	if blockSize > 0 {
+		out.Blocks = int32(1) << uint(blockSize-ones)
+		out.BlocksUsed = int32(len(blocks))
+	}
+	return out
 }

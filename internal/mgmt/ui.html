@@ -259,7 +259,7 @@
         <div class="small muted" id="gates" style="margin-top:4px"></div>
       </div>
       <div class="pane capacity">
-        <div class="pane-title">capacity &middot; what the vDC still has</div>
+        <div class="pane-title">DATACENTER COMPUTE CAPACITY:</div>
         <div class="caprows" id="capRows"><span class="small muted">no snapshot yet</span></div>
       </div>
     </div>
@@ -491,9 +491,16 @@
       capRow("RAM", c.memory, c.memoryMB / 1024, c.memoryLimitMB / 1024, "GB", 0),
       capRow("Storage", c.storage, c.storageMB / 1024, c.storageLimitMB / 1024, "GB", 0)
     ];
-    if (c.podSubnet && c.podSubnetsTotal > 0) {
-      rows.push('<div class="capnote">pod network ' + esc(c.podSubnet) + " · " +
-        (c.podSubnetsTotal - c.podSubnetsUsed) + " of " + c.podSubnetsTotal + " subnets free</div>");
+    if (c.podCIDR) {
+      // 110 pods per node is the kubelet default: the range divided by it is
+      // how many nodes it can carry, and the rest is what may still be added.
+      var line = "POD NETWORK CIDR " + c.podCIDR + " : Remaining Capacity " + (c.podRemainingNodes || 0) +
+        (c.podRemainingNodes === 1 ? " Node" : " Nodes");
+      var detail = "addresses " + (c.podIPs || 0) + " · nodes " + (c.podNodes || 0) + " × 110";
+      if (c.podBlocks > 0) {
+        detail += " · blocks " + c.podBlocksUsed + " of " + c.podBlocks;
+      }
+      rows.push('<div class="capnote" title="' + esc(detail) + '"><b>' + esc(line) + "</b></div>");
     }
     if (c.storageName) {
       rows.push('<div class="capnote">storage profile ' + esc(c.storageName) + "</div>");

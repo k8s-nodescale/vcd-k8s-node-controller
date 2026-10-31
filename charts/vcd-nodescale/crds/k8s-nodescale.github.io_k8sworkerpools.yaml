@@ -461,12 +461,21 @@ spec:
                   observedReplicas:
                     format: int32
                     type: integer
-                  podSubnet:
-                    type: string
-                  podSubnetsTotal:
+                  podBlocks:
                     format: int32
                     type: integer
-                  podSubnetsUsed:
+                  podBlocksUsed:
+                    format: int32
+                    type: integer
+                  podCIDR:
+                    type: string
+                  podIPs:
+                    format: int64
+                    type: integer
+                  podNodes:
+                    format: int32
+                    type: integer
+                  podRemainingNodes:
                     format: int32
                     type: integer
                   storageLimitMB:
