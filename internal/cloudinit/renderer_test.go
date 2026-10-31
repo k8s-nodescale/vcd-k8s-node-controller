@@ -340,12 +340,8 @@ func TestUserDataMatchesTheTerraformBaseline(t *testing.T) {
 	if !strings.Contains(ud, "Timeout \"60\"") || !strings.Contains(ud, "Retries \"60\"") {
 		t.Error("apt does not retry a slow mirror or wait for the dpkg lock")
 	}
-	periodic, ok := files["/etc/apt/apt.conf.d/10periodic"]
-	if !ok {
-		t.Fatal("periodic apt is not disabled")
-	}
-	if !strings.Contains(periodic, "Unattended-Upgrade \"0\"") {
-		t.Error("unattended upgrades are still enabled")
+	if !strings.Contains(files["/usr/local/sbin/k8s-node-prereqs.sh"], "Unattended-Upgrade \"0\"") {
+		t.Error("periodic apt is not disabled")
 	}
 
 	// /etc/hosts has to be appended, not replaced: cloud-init owns the guest's

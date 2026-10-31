@@ -82,11 +82,27 @@ grow_partition() {
 
 if [[ -n "$pv" ]]; then
   grow_partition "$pv" || true
-  pvresize "$pv" >/dev/null 2>&1 || log "pvresize $pv failed"
+  # The partition table change reaches the kernel a moment after growpart
+  # returns, and pvresize/lvextend read it back through the kernel. Give it that
+  # moment, log what the tools say, and retry once: the first live worker showed
+  # pvresize seeing the new size while lvextend failed, with its stderr thrown
+  # away, leaving 11 GiB unclaimed.
+  udevadm settle >/dev/null 2>&1 || true
+  out=$(pvresize "$pv" 2>&1)
+  log "pvresize $pv -> ${out:-ok}"
   free=$(vgs --noheadings -o vg_free_count "$vg" 2>/dev/null | tr -d ' ')
   if [[ "${free:-0}" -gt 0 ]]; then
     log "extending $vg/$lv by $free extents"
-    lvextend -l +100%FREE "$lvpath" >/dev/null 2>&1 || log "lvextend failed"
+    out=$(lvextend -y -l +100%FREE "$lvpath" 2>&1)
+    rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+      log "lvextend failed (rc=$rc): $out; retrying"
+      sleep 3
+      udevadm settle >/dev/null 2>&1 || true
+      out=$(lvextend -y -l +100%FREE "$lvpath" 2>&1) || log "lvextend failed again: $out"
+    else
+      log "lvextend: $out"
+    fi
   else
     log "$vg has no free extents; the LV already fills it"
   fi
@@ -97,7 +113,7 @@ fi
 fstype=$(blkid -s TYPE -o value "$lvpath" 2>/dev/null || true)
 case "$fstype" in
   ext2|ext3|ext4)
-    resize2fs "$lvpath" >/dev/null 2>&1 || log "resize2fs $lvpath failed"
+    out=$(resize2fs "$lvpath" 2>&1) || log "resize2fs $lvpath failed: $out"
     ;;
   xfs)
     xfs_growfs / >/dev/null 2>&1 || log "xfs_growfs / failed"

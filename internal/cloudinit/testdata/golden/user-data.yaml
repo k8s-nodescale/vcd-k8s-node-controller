@@ -1,5 +1,5 @@
 #cloud-config
-# render=0.3.0 hash=03d81f2e029b
+# render=0.3.1 hash=4658f4e53764
 preserve_hostname: false
 hostname: pool-wrk-01
 fqdn: pool-wrk-01
@@ -64,18 +64,10 @@ write_files:
             nameservers:
               addresses: ["192.0.2.53"]
 
-  # Parity with the Terraform baseline: no periodic apt activity behind the
-  # controller's back, and a password login that works when a worker has to be
-  # rescued by hand. 0600 because sshd refuses a group- or world-writable
-  # include file.
-  - path: /etc/apt/apt.conf.d/10periodic
-    content: |
-      APT::Periodic::Update-Package-Lists "0";
-      APT::Periodic::Download-Upgradeable-Packages "0";
-      APT::Periodic::AutocleanInterval "0";
-      APT::Periodic::Unattended-Upgrade "0";
-    permissions: '0644'
-
+  # Parity with the Terraform baseline: a password login that works when a
+  # worker has to be rescued by hand. 0600 because sshd refuses a group- or
+  # world-writable include file. The matching apt policy is written by the
+  # pre-requisites script, after the Pro packages that own 10periodic are gone.
   - path: /etc/ssh/sshd_config.d/01-k8s-auth.conf
     content: |
       PubkeyAuthentication yes
@@ -313,11 +305,27 @@ write_files:
 
       if [[ -n "$pv" ]]; then
         grow_partition "$pv" || true
-        pvresize "$pv" >/dev/null 2>&1 || log "pvresize $pv failed"
+        # The partition table change reaches the kernel a moment after growpart
+        # returns, and pvresize/lvextend read it back through the kernel. Give it that
+        # moment, log what the tools say, and retry once: the first live worker showed
+        # pvresize seeing the new size while lvextend failed, with its stderr thrown
+        # away, leaving 11 GiB unclaimed.
+        udevadm settle >/dev/null 2>&1 || true
+        out=$(pvresize "$pv" 2>&1)
+        log "pvresize $pv -> ${out:-ok}"
         free=$(vgs --noheadings -o vg_free_count "$vg" 2>/dev/null | tr -d ' ')
         if [[ "${free:-0}" -gt 0 ]]; then
           log "extending $vg/$lv by $free extents"
-          lvextend -l +100%FREE "$lvpath" >/dev/null 2>&1 || log "lvextend failed"
+          out=$(lvextend -y -l +100%FREE "$lvpath" 2>&1)
+          rc=$?
+          if [[ "$rc" -ne 0 ]]; then
+            log "lvextend failed (rc=$rc): $out; retrying"
+            sleep 3
+            udevadm settle >/dev/null 2>&1 || true
+            out=$(lvextend -y -l +100%FREE "$lvpath" 2>&1) || log "lvextend failed again: $out"
+          else
+            log "lvextend: $out"
+          fi
         else
           log "$vg has no free extents; the LV already fills it"
         fi
@@ -328,7 +336,7 @@ write_files:
       fstype=$(blkid -s TYPE -o value "$lvpath" 2>/dev/null || true)
       case "$fstype" in
         ext2|ext3|ext4)
-          resize2fs "$lvpath" >/dev/null 2>&1 || log "resize2fs $lvpath failed"
+          out=$(resize2fs "$lvpath" 2>&1) || log "resize2fs $lvpath failed: $out"
           ;;
         xfs)
           xfs_growfs / >/dev/null 2>&1 || log "xfs_growfs / failed"
@@ -355,7 +363,7 @@ write_files:
       LOG=/var/log/k8s-node-prereqs.log
       exec >>"$LOG" 2>&1
       log() { echo "[$(date -Is)] $*"; }
-      log "starting prerequisites render=0.3.0 hash=03d81f2e029b"
+      log "starting prerequisites render=0.3.1 hash=4658f4e53764"
 
       # 0. The virtual disk may be bigger than the template's partition table:
       #    a 20 GiB clone of an 8 GiB image leaves / at 7.6 GiB and the apt
@@ -382,7 +390,15 @@ write_files:
       rm -f /etc/apt/apt.conf.d/20apt-esm-hook.conf
       sed -i 's/^Prompt.*/Prompt=never/' /etc/update-manager/release-upgrades 2>/dev/null || true
       truncate -s 0 /var/lib/ubuntu-release-upgrader/release-upgrade-available 2>/dev/null || true
-      log "unattended upgrades and Pro hooks removed"
+      # Written here and not by cloud-init: on this image 10periodic is a
+      # conffile of ubuntu-advantage-tools, so the purge above deletes it.
+      cat >/etc/apt/apt.conf.d/10periodic <<'APTCONF'
+      APT::Periodic::Update-Package-Lists "0";
+      APT::Periodic::Download-Upgradeable-Packages "0";
+      APT::Periodic::AutocleanInterval "0";
+      APT::Periodic::Unattended-Upgrade "0";
+      APTCONF
+      log "unattended upgrades and Pro hooks removed, periodic apt disabled"
 
       K8S_MINOR="v1.35"
       K8S_VERSION="1.35.9-1.1"
@@ -443,7 +459,7 @@ write_files:
       LOG=/var/log/k8s-node-join.log
       exec >>"$LOG" 2>&1
       log() { echo "[$(date -Is)] $*"; }
-      log "starting join render=0.3.0 hash=03d81f2e029b"
+      log "starting join render=0.3.1 hash=4658f4e53764"
 
       MARKER=/etc/kubernetes/kubeadm-joined
       if [[ -f "$MARKER" ]]; then

@@ -71,18 +71,10 @@ write_files:
             nameservers:
               addresses: {{ .DNSServersJSON }}
 
-  # Parity with the Terraform baseline: no periodic apt activity behind the
-  # controller's back, and a password login that works when a worker has to be
-  # rescued by hand. 0600 because sshd refuses a group- or world-writable
-  # include file.
-  - path: /etc/apt/apt.conf.d/10periodic
-    content: |
-      APT::Periodic::Update-Package-Lists "0";
-      APT::Periodic::Download-Upgradeable-Packages "0";
-      APT::Periodic::AutocleanInterval "0";
-      APT::Periodic::Unattended-Upgrade "0";
-    permissions: '0644'
-
+  # Parity with the Terraform baseline: a password login that works when a
+  # worker has to be rescued by hand. 0600 because sshd refuses a group- or
+  # world-writable include file. The matching apt policy is written by the
+  # pre-requisites script, after the Pro packages that own 10periodic are gone.
   - path: /etc/ssh/sshd_config.d/01-k8s-auth.conf
     content: |
       PubkeyAuthentication yes
@@ -183,7 +175,15 @@ write_files:
       rm -f /etc/apt/apt.conf.d/20apt-esm-hook.conf
       sed -i 's/^Prompt.*/Prompt=never/' /etc/update-manager/release-upgrades 2>/dev/null || true
       truncate -s 0 /var/lib/ubuntu-release-upgrader/release-upgrade-available 2>/dev/null || true
-      log "unattended upgrades and Pro hooks removed"
+      # Written here and not by cloud-init: on this image 10periodic is a
+      # conffile of ubuntu-advantage-tools, so the purge above deletes it.
+      cat >/etc/apt/apt.conf.d/10periodic <<'APTCONF'
+      APT::Periodic::Update-Package-Lists "0";
+      APT::Periodic::Download-Upgradeable-Packages "0";
+      APT::Periodic::AutocleanInterval "0";
+      APT::Periodic::Unattended-Upgrade "0";
+      APTCONF
+      log "unattended upgrades and Pro hooks removed, periodic apt disabled"
 
       K8S_MINOR="{{ .K8sMinorRepo }}"
       K8S_VERSION="{{ .K8sVersion }}"
