@@ -111,12 +111,17 @@ func (r *WorkerPoolReconciler) podSubnetBudget(ctx context.Context) (string, int
 	if bits != 32 || ones > podSubnetMask {
 		return subnet, 1, 1
 	}
-	total := int32(1) << uint(podSubnetMask-ones)
 
 	nodes := &corev1.NodeList{}
 	if err := r.List(ctx, nodes); err != nil {
-		return subnet, total, 0
+		return subnet, 0, 0
 	}
+
+	// The block size is not the kubeadm default on every cluster: the flag is
+	// node-cidr-mask-size, and the dev cluster hands out /25s. Take it from
+	// what the nodes actually hold rather than assuming 24, or a full network
+	// reads as over-allocated.
+	perNode := podSubnetMask
 	seen := map[string]bool{}
 	for i := range nodes.Items {
 		n := &nodes.Items[i]
@@ -124,8 +129,13 @@ func (r *WorkerPoolReconciler) podSubnetBudget(ctx context.Context) (string, int
 			if cidr == "" {
 				return
 			}
-			if _, block, err := net.ParseCIDR(cidr); err == nil {
-				seen[block.String()] = true
+			_, block, err := net.ParseCIDR(cidr)
+			if err != nil {
+				return
+			}
+			seen[block.String()] = true
+			if b, bbits := block.Mask.Size(); bbits == 32 && b > ones && b < 32 {
+				perNode = b
 			}
 		}
 		add(n.Spec.PodCIDR)
@@ -133,5 +143,6 @@ func (r *WorkerPoolReconciler) podSubnetBudget(ctx context.Context) (string, int
 			add(cidr)
 		}
 	}
+	total := int32(1) << uint(perNode-ones)
 	return subnet, total, int32(len(seen))
 }
