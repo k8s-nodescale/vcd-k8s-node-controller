@@ -19,6 +19,7 @@
     --chip: #eef1f5;
     --ipfg: steelblue;
     --ipbg: rgba(70, 130, 180, .15);
+    --flagbg: rgba(20, 83, 154, .10);
     --pod: #4f9ad4;
     --podbg: rgba(79, 154, 212, .14);
     --podline: rgba(79, 154, 212, .55);
@@ -39,6 +40,7 @@
     --chip: #232a31;
     --ipfg: #8fc0e8;
     --ipbg: rgba(120, 170, 210, .20);
+    --flagbg: rgba(106, 169, 240, .18);
     --pod: #79bdea;
     --podbg: rgba(121, 189, 234, .16);
     --podline: rgba(121, 189, 234, .55);
@@ -168,8 +170,18 @@
   .pslots i { flex: 1 1 0; min-width: 2px; border-radius: 3px;
               background: var(--podbg); border: 1px solid var(--podline); }
   .pslots i.on { background: var(--pod); border-color: var(--pod); }
-  .flag.dense { display: flex; align-items: center; justify-content: space-between; gap: 14px;
-                font-size: 11px; color: var(--muted); margin-top: 6px; cursor: pointer; }
+  /* "remaining" and the density switch share one line: the number on the
+     left with a question mark that explains it, the switch on the right on its
+     own highlight */
+  .caprow.podfoot { justify-content: space-between; gap: 10px; margin-top: 2px; }
+  .capfree { display: inline-flex; align-items: center; gap: 6px; }
+  .info { display: inline-flex; align-items: center; justify-content: center;
+          width: 14px; height: 14px; border-radius: 50%; border: 1px solid var(--muted);
+          color: var(--muted); font-size: 10px; line-height: 1; cursor: help; }
+  .flag.dense { display: inline-flex; align-items: center; gap: 8px; margin: 0;
+                background: var(--flagbg); border: 1px solid var(--line);
+                border-radius: 999px; padding: 3px 10px; font-size: 11px;
+                color: var(--fg); cursor: pointer; }
   .flag.dense input { accent-color: var(--accent); margin: 0; }
   .pane-title { margin-bottom: 10px; font-size: 11px; text-transform: uppercase;
                 letter-spacing: .04em; color: var(--muted); font-weight: 600; }
@@ -544,10 +556,12 @@
         '<span class="pslots">' + segs + "</span>" +
         '<span class="capnum">' + assigned + " / " + capacity + " nodes</span>" +
       "</div>" +
-      '<div class="capnote"><b>Remaining Capacity ' + free + (free === 1 ? " Node" : " Nodes") + "</b></div>" +
-      '<div class="capnote">' + esc(hint) + "</div>" +
-      '<label class="flag dense"><span>high density (110 pods per node)</span>' +
-        '<input type="checkbox" data-flag="dense"' + (dense ? " checked" : "") + "></label>";
+      '<div class="caprow podfoot">' +
+        '<span class="capfree"><b>Remaining Capacity ' + free + (free === 1 ? " Node" : " Nodes") + "</b>" +
+          '<span class="info" title="' + esc(hint) + '">?</span></span>' +
+        '<label class="flag dense"><span>Assume 110POD/Node</span>' +
+          '<input type="checkbox" data-flag="dense"' + (dense ? " checked" : "") + "></label>" +
+      "</div>";
   }
 
   // The capacity pane answers one question: does another worker fit. The
