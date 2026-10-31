@@ -27,6 +27,12 @@ rules:
   - apiGroups: ["metrics.k8s.io"]
     resources: ["nodes"]
     verbs: ["get", "list"]
+  # The page counts the pod network in CNI blocks: a node can only join when
+  # Calico has a block to hand it. Read-only, and the controller degrades to
+  # the address estimate when the CRDs are absent.
+  - apiGroups: ["crd.projectcalico.org"]
+    resources: ["ippools", "ipamblocks"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources: ["persistentvolumes"]
     verbs: ["get", "list", "watch"]

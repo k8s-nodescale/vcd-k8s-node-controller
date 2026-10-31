@@ -461,6 +461,9 @@ spec:
                   observedReplicas:
                     format: int32
                     type: integer
+                  podBlockSize:
+                    format: int32
+                    type: integer
                   podBlocks:
                     format: int32
                     type: integer
@@ -472,10 +475,16 @@ spec:
                   podIPs:
                     format: int64
                     type: integer
+                  podMaxPerNode:
+                    format: int32
+                    type: integer
                   podNodes:
                     format: int32
                     type: integer
                   podRemainingNodes:
+                    format: int32
+                    type: integer
+                  podUsablePerBlock:
                     format: int32
                     type: integer
                   storageLimitMB:

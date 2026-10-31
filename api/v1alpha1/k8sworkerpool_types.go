@@ -459,6 +459,16 @@ type CapacityStatus struct {
 	PodBlocks int32 `json:"podBlocks,omitempty"`
 	// +optional
 	PodBlocksUsed int32 `json:"podBlocksUsed,omitempty"`
+	// PodBlockSize and PodUsablePerBlock describe the CNI's block: a /26 is 64
+	// addresses of which Calico keeps one, so 63 pods fit in a block.
+	// +optional
+	PodBlockSize int32 `json:"podBlockSize,omitempty"`
+	// +optional
+	PodUsablePerBlock int32 `json:"podUsablePerBlock,omitempty"`
+	// PodMaxPerNode is the fullest block in the pool: what the nodes carry
+	// today, which is what the low-density reading is sized from.
+	// +optional
+	PodMaxPerNode int32 `json:"podMaxPerNode,omitempty"`
 	// At is when the snapshot was taken.
 	// +optional
 	At metav1.Time `json:"at,omitempty"`

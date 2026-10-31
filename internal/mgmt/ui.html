@@ -168,6 +168,9 @@
   .pslots i { flex: 1 1 0; min-width: 2px; border-radius: 3px;
               background: var(--podbg); border: 1px solid var(--podline); }
   .pslots i.on { background: var(--pod); border-color: var(--pod); }
+  .flag.dense { display: flex; align-items: center; justify-content: space-between; gap: 14px;
+                font-size: 11px; color: var(--muted); margin-top: 6px; cursor: pointer; }
+  .flag.dense input { accent-color: var(--accent); margin: 0; }
   .pane-title { margin-bottom: 10px; font-size: 11px; text-transform: uppercase;
                 letter-spacing: .04em; color: var(--muted); font-weight: 600; }
   /* the flavour, one value per line so it reads as a spec sheet */
@@ -313,14 +316,14 @@
   try {
     var savedFlags = JSON.parse(localStorage.getItem("nodescale-ui-nodeinfo") || "{}");
     if (savedFlags && typeof savedFlags === "object") {
-      ["taints", "volumes", "sts"].forEach(function (k) {
+      ["taints", "volumes", "sts", "dense"].forEach(function (k) {
         if (typeof savedFlags[k] === "boolean") { state.flags[k] = savedFlags[k]; }
       });
     }
   } catch (e) {}
   var state = { pools: [], current: null, stamp: "", stale: false, me: null, draft: null,
                 flavorDraft: null, pendingDelete: null,
-                flags: { taints: false, volumes: false, sts: false } };
+                flags: { taints: false, volumes: false, sts: false, dense: false } };
   var pick = document.getElementById("poolPick");
 
   function esc(s) {
@@ -497,30 +500,54 @@
   // each node that exists takes one slot. The slots are drawn one per node the
   // range can carry, filled for the nodes that are already there.
   function podRow(c) {
-    var capacity = Math.floor((c.podIPs || 0) / 110);
-    var assigned = Math.min(c.podNodes || 0, capacity);
+    var usable = c.podUsablePerBlock || 0;
+    var blockAddr = c.podBlockSize > 0 ? Math.pow(2, 32 - c.podBlockSize) : 0;
+    var blocks = c.podBlocks || 0;
+    var nodes = c.podNodes || 0;
+    var dense = !!state.flags.dense;
+
+    // Blocks a node needs: the kubelet ceiling when the operator says every
+    // node may run 110 pods, otherwise what the fullest node carries today.
+    var perNode = 1;
+    if (usable > 0) {
+      perNode = dense
+        ? Math.max(1, Math.ceil(110 / usable))
+        : Math.max(1, Math.ceil(Math.max(c.podMaxPerNode || 1, 1) / usable));
+    }
+
+    var capacity = blocks > 0 ? Math.floor(blocks / perNode) : 0;
+    var assigned = Math.min(nodes, capacity);
+    var free = Math.max(0, capacity - assigned);
+
     var segs = "";
     if (capacity > 0 && capacity <= 48) {
       for (var i = 0; i < capacity; i++) {
         segs += "<i" + (i < assigned ? ' class="on"' : "") + "></i>";
       }
     } else if (capacity > 48) {
-      // A /16 would be 596 slivers nobody can read: one bar, filled by share.
       segs = '<i class="on" style="flex:0 0 ' + Math.round(assigned / capacity * 100) + '%"></i>';
     }
-    var title = "addresses " + (c.podIPs || 0) + " / 110 per node = " + capacity + " nodes, " +
-      assigned + " assigned";
-    if (c.podBlocks > 0) {
-      title += "; CNI blocks " + c.podBlocksUsed + " of " + c.podBlocks;
+
+    var hint;
+    if (usable === 0) {
+      hint = "block size unknown - counted by addresses";
+    } else if (dense) {
+      hint = "high density: " + perNode + " block" + (perNode > 1 ? "s" : "") + " per node (" +
+        perNode * blockAddr + " addresses) for 110 pods";
+    } else {
+      hint = "based on current usage (" + (c.podMaxPerNode || 0) + " in the fullest block): " +
+        perNode + " block" + (perNode > 1 ? "s" : "") + " per node, " + blockAddr + " addresses";
     }
-    var note = "";
-    if (c.podBlocks > 0 && c.podBlocksUsed >= c.podBlocks) {
-      note = '<div class="capnote warn">the CNI has no block left to hand out</div>';
-    }
+
     return '<div class="caprow pod"><span class="caplbl">POD CIDR ' + esc(c.podCIDR) + "</span></div>" +
-      '<div class="caprow podbar" title="' + esc(title) + '">' +
-      '<span class="pslots">' + segs + "</span>" +
-      '<span class="capnum">' + assigned + " / " + capacity + " nodes</span></div>" + note;
+      '<div class="caprow podbar" title="' + esc("blocks " + (c.podBlocksUsed || 0) + " of " + blocks + " used") + '">' +
+        '<span class="pslots">' + segs + "</span>" +
+        '<span class="capnum">' + assigned + " / " + capacity + " nodes</span>" +
+      "</div>" +
+      '<div class="capnote"><b>Remaining Capacity ' + free + (free === 1 ? " Node" : " Nodes") + "</b></div>" +
+      '<div class="capnote">' + esc(hint) + "</div>" +
+      '<label class="flag dense"><span>high density (110 pods per node)</span>' +
+        '<input type="checkbox" data-flag="dense"' + (dense ? " checked" : "") + "></label>";
   }
 
   // The capacity pane answers one question: does another worker fit. The
@@ -836,6 +863,14 @@
     state.flavorDraft = null;
     post("flavor", body);
   });
+  document.getElementById("summary").addEventListener("change", function (ev) {
+    var t = ev.target;
+    if (!t || !t.getAttribute || !t.getAttribute("data-flag")) { return; }
+    state.flags[t.getAttribute("data-flag")] = t.checked;
+    try { localStorage.setItem("nodescale-ui-nodeinfo", JSON.stringify(state.flags)); } catch (e) {}
+    render();
+  });
+
   document.getElementById("pools").addEventListener("change", function (ev) {
     var t = ev.target;
     if (!t || !t.getAttribute || !t.getAttribute("data-flag")) { return; }

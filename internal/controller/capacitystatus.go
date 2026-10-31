@@ -8,6 +8,8 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/yaml"
 
@@ -81,107 +83,187 @@ func (r *WorkerPoolReconciler) refreshCapacityStatus(ctx context.Context, pool *
 	snap.PodCIDR = budget.CIDR
 	snap.PodIPs = budget.IPs
 	snap.PodNodes = budget.Nodes
-	snap.PodRemainingNodes = budget.RemainingNodes
+	snap.PodRemainingNodes = budget.HighDensityNodes()
 	snap.PodBlocks = budget.Blocks
 	snap.PodBlocksUsed = budget.BlocksUsed
+	snap.PodBlockSize = budget.BlockSize
+	snap.PodUsablePerBlock = budget.Usable
+	snap.PodMaxPerNode = budget.MaxPerNode
 
 	snap.At = metav1.Now()
 	pool.Status.Capacity = snap
 }
 
-// podBudget answers the question the page asks: how many more nodes does the
-// pod network still have room for.
+// podBudget is the pod network as the CNI sees it.
 //
-// The arithmetic is the operator's, not the CNI's: every node is sized for
-// podsPerNode pods, so the nodes the CIDR can carry are its address count
-// divided by podsPerNode, and what is left after the nodes that exist (masters
-// included, they run pods too) is how many may be added. It deliberately does
-// not depend on how a particular CNI slices the range.
+// The dashboard offers two readings of the same pool, because "how many nodes
+// fit" depends on what the operator intends to put on a node:
 //
-// Blocks is the finer-grained second opinion - the per-node blocks the nodes
-// actually hold - because a range can have addresses left and still have no
-// block to hand out.
+//   - current usage: blocks per node is what today's busiest block needs, so a
+//     pool sized for the load that exists;
+//   - high density: every node may run podsPerNode pods, so a node needs
+//     ceil(podsPerNode / usable addresses) blocks.
+//
+// Both are exact once Blocks, Usable and BlockSize are known; only the blocks
+// per node differs.
 type podBudget struct {
-	CIDR           string
-	IPs            int64
-	Nodes          int32
-	RemainingNodes int32
-	Blocks         int32
-	BlocksUsed     int32
+	CIDR        string
+	IPs         int64
+	Nodes       int32
+	BlockSize   int32
+	Usable      int32
+	Blocks      int32
+	BlocksUsed  int32
+	MaxPerNode  int32
+	HasCalico   bool
+	BlocksPerNo int32 // blocks a node needs at podsPerNode pods
+}
+
+// HighDensityNodes is how many nodes the pool carries when every node may run
+// podsPerNode pods.
+func (b podBudget) HighDensityNodes() int32 {
+	if b.BlocksPerNo <= 0 || b.Blocks <= 0 {
+		return 0
+	}
+	n := b.Blocks / b.BlocksPerNo
+	if n < b.Nodes {
+		return 0
+	}
+	return n - b.Nodes
 }
 
 func (r *WorkerPoolReconciler) podBudget(ctx context.Context) podBudget {
 	var out podBudget
 
+	// The cluster's own idea of the pod network: kubeadm's podSubnet. It is
+	// the fallback when the CNI does not publish blocks.
 	cfg := &corev1.ConfigMap{}
-	if err := r.Get(ctx, client.ObjectKey{Namespace: "kube-system", Name: "kubeadm-config"}, cfg); err != nil {
-		return out
+	if err := r.Get(ctx, client.ObjectKey{Namespace: "kube-system", Name: "kubeadm-config"}, cfg); err == nil {
+		var kubeadm struct {
+			Networking struct {
+				PodSubnet string `json:"podSubnet"`
+			} `json:"networking"`
+		}
+		if yaml.Unmarshal([]byte(cfg.Data["ClusterConfiguration"]), &kubeadm) == nil {
+			out.CIDR = strings.TrimSpace(kubeadm.Networking.PodSubnet)
+		}
 	}
-	var kubeadm struct {
-		Networking struct {
-			PodSubnet string `json:"podSubnet"`
-		} `json:"networking"`
+	if _, network, err := net.ParseCIDR(out.CIDR); err == nil && network.IP.To4() != nil {
+		if ones, bits := network.Mask.Size(); bits == 32 {
+			out.IPs = int64(1) << uint(32-ones)
+		}
 	}
-	if err := yaml.Unmarshal([]byte(cfg.Data["ClusterConfiguration"]), &kubeadm); err != nil {
-		return out
-	}
-	subnet := strings.TrimSpace(kubeadm.Networking.PodSubnet)
-	if subnet == "" {
-		return out
-	}
-	out.CIDR = subnet
-
-	_, network, err := net.ParseCIDR(subnet)
-	if err != nil || network.IP.To4() == nil {
-		return out
-	}
-	ones, bits := network.Mask.Size()
-	if bits != 32 {
-		return out
-	}
-	out.IPs = int64(1) << uint(32-ones)
 
 	nodes := &corev1.NodeList{}
-	if err := r.List(ctx, nodes); err != nil {
+	if err := r.List(ctx, nodes); err == nil {
+		out.Nodes = int32(len(nodes.Items))
+	}
+
+	if r.calicoBudget(ctx, &out) {
 		return out
 	}
-	out.Nodes = int32(len(nodes.Items))
 
-	// Masters run pods too, and the kubelet is sized the same, so they cost a
-	// slice of the range exactly like a worker.
-	capacityNodes := out.IPs / podsPerNode
-	remaining := capacityNodes - int64(out.Nodes)
-	if remaining < 0 {
-		remaining = 0
-	}
-	out.RemainingNodes = int32(remaining)
-
-	// The block view: what the CNI has already handed out, one block per node.
-	blocks := map[string]bool{}
-	blockSize := 0
-	for i := range nodes.Items {
-		n := &nodes.Items[i]
-		add := func(cidr string) {
-			if cidr == "" {
-				return
-			}
-			_, block, err := net.ParseCIDR(cidr)
-			if err != nil {
-				return
-			}
-			blocks[block.String()] = true
-			if b, _ := block.Mask.Size(); b > ones && b < 32 {
-				blockSize = b
-			}
-		}
-		add(n.Spec.PodCIDR)
-		for _, cidr := range n.Spec.PodCIDRs {
-			add(cidr)
-		}
-	}
-	if blockSize > 0 {
-		out.Blocks = int32(1) << uint(blockSize-ones)
-		out.BlocksUsed = int32(len(blocks))
+	// No Calico blocks to read: the coarse estimate, whole blocks assumed to
+	// pack perfectly. The page marks the number as an estimate in that case.
+	if out.IPs > 0 {
+		out.Usable = podsPerNode
+		out.BlockSize = 0
+		out.Blocks = int32(out.IPs / podsPerNode)
+		out.BlocksUsed = out.Nodes
+		out.BlocksPerNo = 1
 	}
 	return out
+}
+
+// calicoBudget reads the pool and the blocks Calico has handed out. It reports
+// false when the CRDs are not there (another CNI, or no permission), and the
+// caller falls back to the address arithmetic.
+func (r *WorkerPoolReconciler) calicoBudget(ctx context.Context, out *podBudget) bool {
+	pools := &unstructured.UnstructuredList{}
+	pools.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "crd.projectcalico.org", Version: "v1", Kind: "IPPoolList",
+	})
+	if err := r.List(ctx, pools); err != nil || len(pools.Items) == 0 {
+		return false
+	}
+
+	// The pool that carries workload addresses. Several pools are legal (one
+	// per tenant, or a second for a different encapsulation); the first that
+	// contains the kubeadm podSubnet is the one nodes draw from, else the
+	// first workload pool.
+	var cidr string
+	var blockSize, prefix int
+	for i := range pools.Items {
+		spec, _, _ := unstructured.NestedMap(pools.Items[i].Object, "spec")
+		if spec == nil {
+			continue
+		}
+		uses, _, _ := unstructured.NestedStringSlice(pools.Items[i].Object, "spec", "allowedUses")
+		workload := len(uses) == 0
+		for _, u := range uses {
+			if u == "Workload" {
+				workload = true
+			}
+		}
+		if !workload {
+			continue
+		}
+		c, _ := spec["cidr"].(string)
+		bs, _ := spec["blockSize"].(int64)
+		_, network, err := net.ParseCIDR(c)
+		if err != nil || network.IP.To4() == nil {
+			continue
+		}
+		ones, _ := network.Mask.Size()
+		if out.CIDR != "" {
+			if _, sub, err := net.ParseCIDR(out.CIDR); err == nil && !sub.Contains(network.IP) {
+				continue
+			}
+		}
+		cidr, blockSize, prefix = c, int(bs), ones
+		break
+	}
+	if cidr == "" || blockSize <= 0 || blockSize >= 32 {
+		return false
+	}
+
+	out.CIDR = cidr
+	out.IPs = int64(1) << uint(32-prefix)
+	out.BlockSize = int32(blockSize)
+	out.Usable = int32(1)<<uint(32-blockSize) - 1 // Calico keeps one address per block
+	out.Blocks = int32(1) << uint(blockSize-prefix)
+	out.HasCalico = true
+
+	blocks := &unstructured.UnstructuredList{}
+	blocks.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "crd.projectcalico.org", Version: "v1", Kind: "IPAMBlockList",
+	})
+	if err := r.List(ctx, blocks); err == nil {
+		out.BlocksUsed = int32(len(blocks.Items))
+		for i := range blocks.Items {
+			allocs, _, _ := unstructured.NestedSlice(blocks.Items[i].Object, "spec", "allocations")
+			var used int32
+			for _, a := range allocs {
+				if a != nil {
+					used++
+				}
+			}
+			// The block's first address is marked by Calico itself, so the
+			// pods it holds is the count minus that one.
+			if used > 0 {
+				used--
+			}
+			if used > out.MaxPerNode {
+				out.MaxPerNode = used
+			}
+		}
+	}
+
+	if out.Usable > 0 {
+		out.BlocksPerNo = (podsPerNode + out.Usable - 1) / out.Usable
+		if out.BlocksPerNo < 1 {
+			out.BlocksPerNo = 1
+		}
+	}
+	return true
 }
