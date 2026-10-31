@@ -151,7 +151,12 @@
   /* the upper card is two panes: scale-up/down on the left, scale-in/out on
      the right, each with its own contour */
   .split { display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-start; }
-  .pane { flex: 0 1 auto; border: 1px solid var(--line); border-radius: 8px; padding: 12px; }
+  .pane { flex: 0 1 auto; border: 1px solid var(--line); border-radius: 8px; padding: 12px;
+          display: flex; flex-direction: column; }
+  /* the flavour sheet is four lines and the replica numbers one, so the two
+     action rows would land at different heights; alignPanes() pads the shorter
+     block to the taller one and the buttons end up on one level */
+  .kpi { align-items: center; }
   /* the third pane is the one that grows: the other two stop at their content */
   .pane.capacity { flex: 1 1 300px; min-width: 260px; }
   .caprows { display: flex; flex-direction: column; gap: 9px; }
@@ -256,7 +261,7 @@
       <span class="small muted">the flavour and replicas actions below apply to this pool</span>
     </div>
     <div class="split">
-      <div class="pane">
+      <div class="pane" id="flavorPane">
         <div class="pane-title">flavor &middot; scale-up / down</div>
         <div class="flavor">
           <div class="fl"><span>vCPU</span><b id="kCpus">&ndash;</b></div>
@@ -272,7 +277,7 @@
         </div>
         <div class="small muted" id="flavorHint" style="margin-top:6px"></div>
       </div>
-      <div class="pane">
+      <div class="pane" id="replicasPane">
         <div class="pane-title">replicas &middot; scale-in / out</div>
         <div class="kpi">
           <div><span class="small muted" title="spec.replicas: what you asked for">desired</span><b id="kReplicas">&ndash;</b></div>
@@ -592,6 +597,22 @@
     box.innerHTML = rows.join("");
   }
 
+  // alignPanes pads the replica numbers to the height of the flavour sheet so
+  // that "apply flavor" and "set replicas" sit on the same line. Measured, not
+  // guessed: a long template name wraps the sheet and a constant would drift.
+  // Only while the panes are side by side - stacked, the padding is just a gap.
+  function alignPanes() {
+    var left = document.getElementById("flavorPane");
+    var right = document.getElementById("replicasPane");
+    if (!left || !right) { return; }
+    var sheet = left.getElementsByClassName("flavor")[0];
+    var kpi = right.getElementsByClassName("kpi")[0];
+    if (!sheet || !kpi) { return; }
+    kpi.style.minHeight = "";
+    if (left.offsetTop !== right.offsetTop) { return; }
+    kpi.style.minHeight = sheet.getBoundingClientRect().height + "px";
+  }
+
   function render() {
     var p = state.current;
     var stamp = document.getElementById("stamp");
@@ -641,6 +662,7 @@
 
     renderCapacity(p);
     renderWorkers();
+    alignPanes();
   }
 
   function allowLastWorkerTip(p) {
@@ -944,6 +966,12 @@
       method: "POST",
       headers: { "X-Requested-With": "nodescale-ui" }
     }).then(function () { location.href = BASE + "/login"; });
+  });
+
+  var alignTimer = null;
+  window.addEventListener("resize", function () {
+    clearTimeout(alignTimer);
+    alignTimer = setTimeout(alignPanes, 120);
   });
 
   refresh();
