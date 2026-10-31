@@ -69,7 +69,9 @@
   main { padding: 16px 18px 40px; display: flex; flex-direction: column; gap: 16px; }
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
   .row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
-  .kpi { display: flex; gap: 18px; flex-wrap: wrap; }
+  .kpi { display: flex; gap: 22px; flex-wrap: wrap; align-items: center; min-width: 220px;
+         border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
+         background: var(--bg); }
   .kpi div { display: flex; flex-direction: column; }
   .kpi b { font-size: 18px; font-variant-numeric: tabular-nums; }
   .chip { background: var(--chip); border-radius: 999px; padding: 2px 9px; font-size: 12px; }
@@ -156,7 +158,6 @@
   /* the flavour sheet is four lines and the replica numbers one, so the two
      action rows would land at different heights; alignPanes() pads the shorter
      block to the taller one and the buttons end up on one level */
-  .kpi { align-items: center; }
   /* the third pane is the one that grows: the other two stop at their content */
   .pane.capacity { flex: 1 1 300px; min-width: 260px; }
   .caprows { display: flex; flex-direction: column; gap: 9px; }
@@ -597,10 +598,14 @@
     box.innerHTML = rows.join("");
   }
 
-  // alignPanes pads the replica numbers to the height of the flavour sheet so
-  // that "apply flavor" and "set replicas" sit on the same line. Measured, not
-  // guessed: a long template name wraps the sheet and a constant would drift.
-  // Only while the panes are side by side - stacked, the padding is just a gap.
+  // alignPanes keeps the two control panes on a common grid: the replica
+  // numbers are padded to the height of the flavour sheet so that "apply
+  // flavor" and "set replicas" sit on one line, and both panes are given the
+  // taller one's height so their bottom borders end together - what follows
+  // the buttons (a draft hint, the gates line) is not symmetrical.
+  // Measured, not guessed: a long template name wraps the sheet and a constant
+  // would drift. Only while the panes are side by side - stacked, padding is
+  // just empty space.
   function alignPanes() {
     var left = document.getElementById("flavorPane");
     var right = document.getElementById("replicasPane");
@@ -609,8 +614,21 @@
     var kpi = right.getElementsByClassName("kpi")[0];
     if (!sheet || !kpi) { return; }
     kpi.style.minHeight = "";
+    left.style.minHeight = "";
+    right.style.minHeight = "";
     if (left.offsetTop !== right.offsetTop) { return; }
     kpi.style.minHeight = sheet.getBoundingClientRect().height + "px";
+    // The sheet's height is fractional, so the pad can land a pixel off; correct
+    // it from what the page reports rather than from arithmetic.
+    var fa = document.getElementById("flavorActions");
+    var sa = document.getElementById("scaleActions");
+    var dy = Math.round(sa.getBoundingClientRect().top - fa.getBoundingClientRect().top);
+    if (dy !== 0) {
+      kpi.style.minHeight = (kpi.getBoundingClientRect().height - dy) + "px";
+    }
+    var tall = Math.max(left.getBoundingClientRect().height, right.getBoundingClientRect().height);
+    left.style.minHeight = tall + "px";
+    right.style.minHeight = tall + "px";
   }
 
   function render() {
