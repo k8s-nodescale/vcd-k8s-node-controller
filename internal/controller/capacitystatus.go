@@ -32,6 +32,13 @@ const podSubnetMask = 24
 // snapshot was taken at (a scale operation completed), or when the snapshot is
 // older than capacityStatusTTL.
 func (r *WorkerPoolReconciler) refreshCapacityStatus(ctx context.Context, pool *infrav1.K8sWorkerPool) {
+	// spec.capacity.preflight: false is an operator saying "do not read the
+	// vDC capacity from this pool" - usually because the call is expensive or
+	// unreliable there. The snapshot follows the same switch; the page then
+	// says it has no numbers instead of quietly costing a call per pass.
+	if !capacityPreflightEnabled(pool) {
+		return
+	}
 	cur := pool.Status.Capacity
 	if cur != nil &&
 		cur.ObservedReplicas == pool.Status.ObservedReplicas &&
