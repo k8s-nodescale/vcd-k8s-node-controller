@@ -44,7 +44,7 @@ func testClient(t *testing.T, objs ...client.Object) client.Client {
 
 func testPool(replicas int32) *infrav1.K8sWorkerPool {
 	return &infrav1.K8sWorkerPool{
-		ObjectMeta: metav1.ObjectMeta{Name: "kion-web-dev", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "kion-web-dev"},
 		Spec: infrav1.K8sWorkerPoolSpec{
 			Replicas:   replicas,
 			NamePrefix: "kion-web-dev",
@@ -292,8 +292,8 @@ func TestCollectOnceFillsTheTable(t *testing.T) {
 		t.Fatalf("%d pools, want 1", len(pools))
 	}
 	p := pools[0]
-	if p.Namespace != "default" || p.Name != "kion-web-dev" {
-		t.Fatalf("pool %s/%s", p.Namespace, p.Name)
+	if p.Name != "kion-web-dev" {
+		t.Fatalf("pool %s", p.Name)
 	}
 	if p.Ready != 1 {
 		t.Errorf("ready %d, want 1", p.Ready)
@@ -352,20 +352,20 @@ func TestSnapshotKeepsTheLastGoodPass(t *testing.T) {
 func TestSetReplicasWritesTheSpec(t *testing.T) {
 	fc := testClient(t, testPool(1))
 	s := &Server{Client: fc}
-	if err := s.SetReplicas(context.Background(), "default", "kion-web-dev", 4); err != nil {
+	if err := s.SetReplicas(context.Background(), "kion-web-dev", 4); err != nil {
 		t.Fatal(err)
 	}
 	got := &infrav1.K8sWorkerPool{}
-	if err := fc.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "kion-web-dev"}, got); err != nil {
+	if err := fc.Get(context.Background(), client.ObjectKey{Name: "kion-web-dev"}, got); err != nil {
 		t.Fatal(err)
 	}
 	if got.Spec.Replicas != 4 {
 		t.Fatalf("replicas %d, want 4", got.Spec.Replicas)
 	}
-	if err := s.SetReplicas(context.Background(), "default", "kion-web-dev", -1); err == nil {
+	if err := s.SetReplicas(context.Background(), "kion-web-dev", -1); err == nil {
 		t.Fatal("a negative replica count was accepted")
 	}
-	if err := s.SetReplicas(context.Background(), "default", "missing", 1); err == nil {
+	if err := s.SetReplicas(context.Background(), "missing", 1); err == nil {
 		t.Fatal("a missing pool was accepted")
 	}
 }
@@ -375,18 +375,18 @@ func TestSetReplicasWritesTheSpec(t *testing.T) {
 func TestSetFlavorWritesOnlyWhatWasGiven(t *testing.T) {
 	fc := testClient(t, testPool(1))
 	s := &Server{Client: fc}
-	if err := s.SetFlavor(context.Background(), "default", "kion-web-dev", Flavor{CPUs: 4}); err != nil {
+	if err := s.SetFlavor(context.Background(), "kion-web-dev", Flavor{CPUs: 4}); err != nil {
 		t.Fatal(err)
 	}
 	got := &infrav1.K8sWorkerPool{}
-	_ = fc.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "kion-web-dev"}, got)
+	_ = fc.Get(context.Background(), client.ObjectKey{Name: "kion-web-dev"}, got)
 	if got.Spec.Flavor.CPUs != 4 {
 		t.Errorf("cpus %d, want 4", got.Spec.Flavor.CPUs)
 	}
 	if got.Spec.Flavor.MemoryMB != 4096 || got.Spec.Flavor.OSDiskGB != 20 {
 		t.Errorf("untouched fields changed: %+v", got.Spec.Flavor)
 	}
-	if err := s.SetFlavor(context.Background(), "default", "kion-web-dev", Flavor{}); err == nil {
+	if err := s.SetFlavor(context.Background(), "kion-web-dev", Flavor{}); err == nil {
 		t.Fatal("an empty flavor was accepted")
 	}
 }
@@ -398,12 +398,12 @@ func TestDeleteWorkersDedupsAndAppends(t *testing.T) {
 	pool.Spec.ScaleDown.DeleteWorkers = []string{"KION-WEB-DEV-wrk-02"}
 	fc := testClient(t, pool)
 	s := &Server{Client: fc}
-	if err := s.DeleteWorkers(context.Background(), "default", "kion-web-dev",
+	if err := s.DeleteWorkers(context.Background(), "kion-web-dev",
 		[]string{"KION-WEB-DEV-wrk-02", "KION-WEB-DEV-wrk-01"}); err != nil {
 		t.Fatal(err)
 	}
 	got := &infrav1.K8sWorkerPool{}
-	_ = fc.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "kion-web-dev"}, got)
+	_ = fc.Get(context.Background(), client.ObjectKey{Name: "kion-web-dev"}, got)
 	want := []string{"KION-WEB-DEV-wrk-02", "KION-WEB-DEV-wrk-01"}
 	if len(got.Spec.ScaleDown.DeleteWorkers) != len(want) {
 		t.Fatalf("queued %v, want %v", got.Spec.ScaleDown.DeleteWorkers, want)
@@ -413,7 +413,7 @@ func TestDeleteWorkersDedupsAndAppends(t *testing.T) {
 			t.Fatalf("queued %v, want %v", got.Spec.ScaleDown.DeleteWorkers, want)
 		}
 	}
-	if err := s.DeleteWorkers(context.Background(), "default", "kion-web-dev", nil); err == nil {
+	if err := s.DeleteWorkers(context.Background(), "kion-web-dev", nil); err == nil {
 		t.Fatal("an empty request was accepted")
 	}
 }
@@ -449,8 +449,8 @@ func TestHandlersLiveUnderThePrefix(t *testing.T) {
 		{http.MethodGet, "/nodescale-ui/healthz", http.StatusOK, "ok"},
 		{http.MethodGet, "/nodescale-ui/", http.StatusOK, "/nodescale-ui"},
 		{http.MethodGet, "/nodescale-ui/api/pools", http.StatusOK, "kion-web-dev"},
-		{http.MethodGet, "/nodescale-ui/api/pools/default/kion-web-dev", http.StatusOK, "KION-WEB-DEV-wrk-01"},
-		{http.MethodGet, "/nodescale-ui/api/pools/default/missing", http.StatusNotFound, "no such pool"},
+		{http.MethodGet, "/nodescale-ui/api/pools/kion-web-dev", http.StatusOK, "KION-WEB-DEV-wrk-01"},
+		{http.MethodGet, "/nodescale-ui/api/pools/missing", http.StatusNotFound, "no such pool"},
 		{http.MethodGet, "/api/pools", http.StatusNotFound, ""},
 	}
 	for _, c := range cases {
@@ -482,40 +482,40 @@ func TestPostReplicasAndDeleteWorkers(t *testing.T) {
 		return rec
 	}
 
-	if rec := post("/nodescale-ui/api/pools/default/kion-web-dev/replicas", `{"replicas":3}`); rec.Code != http.StatusOK {
+	if rec := post("/nodescale-ui/api/pools/kion-web-dev/replicas", `{"replicas":3}`); rec.Code != http.StatusOK {
 		t.Fatalf("replicas: %d %s", rec.Code, rec.Body.String())
 	}
 	got := &infrav1.K8sWorkerPool{}
-	_ = fc.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "kion-web-dev"}, got)
+	_ = fc.Get(context.Background(), client.ObjectKey{Name: "kion-web-dev"}, got)
 	if got.Spec.Replicas != 3 {
 		t.Errorf("replicas %d, want 3", got.Spec.Replicas)
 	}
 
-	if rec := post("/nodescale-ui/api/pools/default/kion-web-dev/delete-workers",
+	if rec := post("/nodescale-ui/api/pools/kion-web-dev/delete-workers",
 		`{"workers":["KION-WEB-DEV-wrk-01"]}`); rec.Code != http.StatusOK {
 		t.Fatalf("delete-workers: %d %s", rec.Code, rec.Body.String())
 	}
-	_ = fc.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "kion-web-dev"}, got)
+	_ = fc.Get(context.Background(), client.ObjectKey{Name: "kion-web-dev"}, got)
 	if len(got.Spec.ScaleDown.DeleteWorkers) != 1 || got.Spec.ScaleDown.DeleteWorkers[0] != "KION-WEB-DEV-wrk-01" {
 		t.Errorf("queued %v", got.Spec.ScaleDown.DeleteWorkers)
 	}
 
-	if rec := post("/nodescale-ui/api/pools/default/kion-web-dev/flavor", `{"cpus":4,"memoryMB":8192}`); rec.Code != http.StatusOK {
+	if rec := post("/nodescale-ui/api/pools/kion-web-dev/flavor", `{"cpus":4,"memoryMB":8192}`); rec.Code != http.StatusOK {
 		t.Fatalf("flavor: %d %s", rec.Code, rec.Body.String())
 	}
-	_ = fc.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "kion-web-dev"}, got)
+	_ = fc.Get(context.Background(), client.ObjectKey{Name: "kion-web-dev"}, got)
 	if got.Spec.Flavor.CPUs != 4 || got.Spec.Flavor.MemoryMB != 8192 {
 		t.Errorf("flavor %+v", got.Spec.Flavor)
 	}
 
 	// A body the server cannot read, and one it reads but refuses.
-	if rec := post("/nodescale-ui/api/pools/default/kion-web-dev/replicas", `{"replicas":`); rec.Code != http.StatusBadRequest {
+	if rec := post("/nodescale-ui/api/pools/kion-web-dev/replicas", `{"replicas":`); rec.Code != http.StatusBadRequest {
 		t.Errorf("bad json: %d, want 400", rec.Code)
 	}
-	if rec := post("/nodescale-ui/api/pools/default/kion-web-dev/replicas", `{"replicas":-2}`); rec.Code != http.StatusBadRequest {
+	if rec := post("/nodescale-ui/api/pools/kion-web-dev/replicas", `{"replicas":-2}`); rec.Code != http.StatusBadRequest {
 		t.Errorf("negative replicas: %d, want 400", rec.Code)
 	}
-	if rec := post("/nodescale-ui/api/pools/default/missing/replicas", `{"replicas":1}`); rec.Code != http.StatusNotFound {
+	if rec := post("/nodescale-ui/api/pools/missing/replicas", `{"replicas":1}`); rec.Code != http.StatusNotFound {
 		t.Errorf("missing pool: %d, want 404", rec.Code)
 	}
 }

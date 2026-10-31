@@ -1,5 +1,5 @@
 IMAGE ?= docker.io/werton13/vcd-k8s-node-controller
-TAG ?= 0.11.27
+TAG ?= 0.12.0
 GO ?= go
 CONTROLLER_GEN ?= controller-gen
 

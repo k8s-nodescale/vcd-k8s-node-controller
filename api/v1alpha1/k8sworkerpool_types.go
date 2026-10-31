@@ -603,7 +603,7 @@ type RolloutStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:subresource:scale:specpath=.spec.replicas,statuspath=.status.observedReplicas
-// +kubebuilder:resource:shortName=k8swp,scope=Namespaced
+// +kubebuilder:resource:shortName=k8swp,scope=Cluster
 // +kubebuilder:printcolumn:name="Desired",type=integer,JSONPath=`.spec.replicas`
 // +kubebuilder:printcolumn:name="Observed",type=integer,JSONPath=`.status.observedReplicas`
 // +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`

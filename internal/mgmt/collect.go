@@ -134,9 +134,6 @@ func (c *Collector) collectPools(ctx context.Context) ([]Pool, error) {
 		out = append(out, c.poolView(ctx, &pools.Items[i], byNode, used, volumes, exporters, real))
 	}
 	sort.Slice(out, func(i, j int) bool {
-		if out[i].Namespace != out[j].Namespace {
-			return out[i].Namespace < out[j].Namespace
-		}
 		return out[i].Name < out[j].Name
 	})
 	return out, nil
@@ -146,7 +143,6 @@ func (c *Collector) poolView(ctx context.Context, p *infrav1.K8sWorkerPool, byNo
 	used map[string]*nodeUsage, volumes map[string][]Volume, exporters map[string]string, real map[string]realUsage) Pool {
 
 	view := Pool{
-		Namespace:       p.Namespace,
 		Name:            p.Name,
 		Replicas:        p.Spec.Replicas,
 		Observed:        p.Status.ObservedReplicas,

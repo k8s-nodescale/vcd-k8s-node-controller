@@ -65,10 +65,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST "+p+"/api/logout", s.postLogout)
 	mux.HandleFunc("GET "+p+"/api/me", s.me)
 	mux.HandleFunc("GET "+p+"/api/pools", s.listPools)
-	mux.HandleFunc("GET "+p+"/api/pools/{ns}/{name}", s.getPool)
-	mux.HandleFunc("POST "+p+"/api/pools/{ns}/{name}/replicas", s.postReplicas)
-	mux.HandleFunc("POST "+p+"/api/pools/{ns}/{name}/flavor", s.postFlavor)
-	mux.HandleFunc("POST "+p+"/api/pools/{ns}/{name}/delete-workers", s.postDeleteWorkers)
+	mux.HandleFunc("GET "+p+"/api/pools/{name}", s.getPool)
+	mux.HandleFunc("POST "+p+"/api/pools/{name}/replicas", s.postReplicas)
+	mux.HandleFunc("POST "+p+"/api/pools/{name}/flavor", s.postFlavor)
+	mux.HandleFunc("POST "+p+"/api/pools/{name}/delete-workers", s.postDeleteWorkers)
 	if p != "" {
 		mux.HandleFunc("GET "+p, func(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, p+"/", http.StatusFound)
@@ -189,9 +189,9 @@ func (s *Server) listPools(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) getPool(w http.ResponseWriter, r *http.Request) {
 	pools, _, _ := s.Collector.Snapshot()
-	ns, name := r.PathValue("ns"), r.PathValue("name")
+	name := r.PathValue("name")
 	for i := range pools {
-		if pools[i].Namespace == ns && pools[i].Name == name {
+		if pools[i].Name == name {
 			writeJSON(w, http.StatusOK, pools[i])
 			return
 		}
@@ -207,7 +207,7 @@ func (s *Server) postReplicas(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	if err := s.SetReplicas(r.Context(), r.PathValue("ns"), r.PathValue("name"), body.Replicas); err != nil {
+	if err := s.SetReplicas(r.Context(), r.PathValue("name"), body.Replicas); err != nil {
 		writeError(w, statusFor(err), err)
 		return
 	}
@@ -220,7 +220,7 @@ func (s *Server) postFlavor(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	if err := s.SetFlavor(r.Context(), r.PathValue("ns"), r.PathValue("name"), body); err != nil {
+	if err := s.SetFlavor(r.Context(), r.PathValue("name"), body); err != nil {
 		writeError(w, statusFor(err), err)
 		return
 	}
@@ -235,7 +235,7 @@ func (s *Server) postDeleteWorkers(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	if err := s.DeleteWorkers(r.Context(), r.PathValue("ns"), r.PathValue("name"), body.Workers); err != nil {
+	if err := s.DeleteWorkers(r.Context(), r.PathValue("name"), body.Workers); err != nil {
 		writeError(w, statusFor(err), err)
 		return
 	}

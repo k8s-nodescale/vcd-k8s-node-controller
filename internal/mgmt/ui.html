@@ -415,7 +415,7 @@
   function post(action, body, pool) {
     var p = pool || state.current;
     if (!p) { return Promise.resolve(); }
-    return api("/api/pools/" + encodeURIComponent(p.namespace) + "/" + encodeURIComponent(p.name) + "/" + action, {
+    return api("/api/pools/" + encodeURIComponent(p.name) + "/" + action, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Requested-With": "nodescale-ui" },
       body: JSON.stringify(body || {})
@@ -463,10 +463,10 @@
       state.pools = data.pools || [];
       state.stamp = data.collectedAt || "";
       state.stale = !!data.stale;
-      if (!state.current || !findPool(state.current.namespace, state.current.name)) {
+      if (!state.current || !findPool(state.current.name)) {
         state.current = state.pools.length ? state.pools[0] : null;
       } else {
-        state.current = findPool(state.current.namespace, state.current.name);
+        state.current = findPool(state.current.name);
       }
       renderPools();
       render();
@@ -475,19 +475,21 @@
     });
   }
 
-  function findPool(ns, name) {
+  // A pool is cluster-scoped: its name is its identity, there is no namespace
+  // to qualify it with.
+  function findPool(name) {
     for (var i = 0; i < state.pools.length; i++) {
-      if (state.pools[i].namespace === ns && state.pools[i].name === name) { return state.pools[i]; }
+      if (state.pools[i].name === name) { return state.pools[i]; }
     }
     return null;
   }
 
   function renderPools() {
     pick.innerHTML = state.pools.map(function (p) {
-      return '<option value="' + esc(p.namespace + "/" + p.name) + '">' + esc(p.namespace + "/" + p.name) + "</option>";
+      return '<option value="' + esc(p.name) + '">' + esc(p.name) + "</option>";
     }).join("");
     if (state.current) {
-      pick.value = state.current.namespace + "/" + state.current.name;
+      pick.value = state.current.name;
     }
     // The picker is the parent of the two panes, and it is only shown when
     // there is something to pick. DEV keeps it for a single-pool cluster so
@@ -686,11 +688,11 @@
   function allowLastWorkerTip(p) {
     return "allowLastWorker: " + p.allowLastWorker + " - read only here. A pool may only go to zero " +
       "workers when this is true, and it can only be changed with kubectl: " +
-      "kubectl -n " + p.namespace + " patch k8sworkerpool " + p.name +
+      "kubectl patch k8sworkerpool " + p.name +
       " --type=merge -p '{\"spec\":{\"scaleDown\":{\"allowLastWorker\":true}}}'";
   }
 
-  function poolKey(p) { return p.namespace + "/" + p.name; }
+  function poolKey(p) { return p.name; }
 
   function workerRow(p, n, admin) {
     var act;
@@ -774,7 +776,6 @@
     var head = '<div class="poolblock">' +
       '<div class="pooltop"><div class="poolhead">' +
         "<b>" + esc(p.name) + "</b>" +
-        '<span class="small muted">' + esc(p.namespace) + "</span>" +
         '<span class="chip">' + p.nodes.length + (p.nodes.length === 1 ? " worker" : " workers") + "</span>" +
         '<span class="chip' + (p.readyReplicas >= p.replicas ? " ok" : " warn") + '">' +
           p.readyReplicas + "/" + p.replicas + " ready</span>" +
@@ -942,8 +943,7 @@
       return;
     }
     var key = t.getAttribute("data-pool");
-    var parts = key ? key.split("/") : null;
-    var pool = parts ? findPool(parts[0], parts.slice(1).join("/")) : null;
+    var pool = key ? findPool(key) : null;
     if (!pool) { return; }
     var yes = t.getAttribute("data-yes");
     if (yes) {
@@ -972,8 +972,7 @@
     applyTheme(next);
   });
   pick.addEventListener("change", function () {
-    var parts = pick.value.split("/");
-    state.current = findPool(parts[0], parts.slice(1).join("/"));
+    state.current = findPool(pick.value);
     state.draft = null;
     state.flavorDraft = null;
     render();

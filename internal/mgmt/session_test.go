@@ -93,10 +93,10 @@ func TestSignInSetsASessionAndSignOutClearsIt(t *testing.T) {
 	if rec := callWithCookie(h, http.MethodGet, "/nodescale-ui/api/pools", cookie, false); rec.Code != http.StatusOK {
 		t.Fatalf("cookie GET: %d %s", rec.Code, rec.Body.String())
 	}
-	if rec := callWithCookie(h, http.MethodPost, "/nodescale-ui/api/pools/default/kion-web-dev/replicas", cookie, false); rec.Code != http.StatusForbidden {
+	if rec := callWithCookie(h, http.MethodPost, "/nodescale-ui/api/pools/kion-web-dev/replicas", cookie, false); rec.Code != http.StatusForbidden {
 		t.Fatalf("write without the CSRF header: %d, want 403", rec.Code)
 	}
-	if rec := callWithCookie(h, http.MethodPost, "/nodescale-ui/api/pools/default/kion-web-dev/replicas", cookie, true); rec.Code != http.StatusOK {
+	if rec := callWithCookie(h, http.MethodPost, "/nodescale-ui/api/pools/kion-web-dev/replicas", cookie, true); rec.Code != http.StatusOK {
 		t.Fatalf("admin write with the header: %d %s", rec.Code, rec.Body.String())
 	}
 
@@ -140,7 +140,7 @@ func TestViewerSessionIsReadOnly(t *testing.T) {
 		!strings.Contains(rec.Body.String(), "\"role\":\"viewer\"") {
 		t.Fatalf("me: %d %s", rec.Code, rec.Body.String())
 	}
-	if rec := callWithCookie(h, http.MethodPost, "/nodescale-ui/api/pools/default/kion-web-dev/replicas", cookie, true); rec.Code != http.StatusForbidden {
+	if rec := callWithCookie(h, http.MethodPost, "/nodescale-ui/api/pools/kion-web-dev/replicas", cookie, true); rec.Code != http.StatusForbidden {
 		t.Fatalf("viewer write: %d, want 403", rec.Code)
 	}
 }

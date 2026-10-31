@@ -2,7 +2,6 @@ apiVersion: k8s-nodescale.github.io/v1alpha1
 kind: K8sWorkerPool
 metadata:
   name: default
-  namespace: vcd-nodescale-system
 spec:
   replicas: 2
   namePrefix: myorg-cluster-prod

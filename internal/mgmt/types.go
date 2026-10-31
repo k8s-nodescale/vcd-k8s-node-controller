@@ -126,7 +126,6 @@ type Flavor struct {
 
 // Pool is everything the page needs about one pool.
 type Pool struct {
-	Namespace       string    `json:"namespace"`
 	Name            string    `json:"name"`
 	Replicas        int32     `json:"replicas"`
 	Observed        int32     `json:"observedReplicas"`

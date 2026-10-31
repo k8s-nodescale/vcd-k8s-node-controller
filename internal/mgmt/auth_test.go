@@ -176,7 +176,7 @@ func TestViewerReadsButCannotAct(t *testing.T) {
 	if rec := do(h, http.MethodGet, "/nodescale-ui/api/pools", "viewer", "viewer-pw", false); rec.Code != http.StatusOK {
 		t.Fatalf("viewer GET: %d %s", rec.Code, rec.Body.String())
 	}
-	rec := do(h, http.MethodPost, "/nodescale-ui/api/pools/default/kion-web-dev/replicas", "viewer", "viewer-pw", true)
+	rec := do(h, http.MethodPost, "/nodescale-ui/api/pools/kion-web-dev/replicas", "viewer", "viewer-pw", true)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("viewer POST: %d %s, want 403", rec.Code, rec.Body.String())
 	}
@@ -186,10 +186,10 @@ func TestViewerReadsButCannotAct(t *testing.T) {
 
 	// An admin without the CSRF header is refused too: the header is about the
 	// request's shape, not the account.
-	if rec := do(h, http.MethodPost, "/nodescale-ui/api/pools/default/kion-web-dev/replicas", "admin", "admin-pw", false); rec.Code != http.StatusForbidden {
+	if rec := do(h, http.MethodPost, "/nodescale-ui/api/pools/kion-web-dev/replicas", "admin", "admin-pw", false); rec.Code != http.StatusForbidden {
 		t.Fatalf("admin POST without the header: %d, want 403", rec.Code)
 	}
-	if rec := do(h, http.MethodPost, "/nodescale-ui/api/pools/default/kion-web-dev/replicas", "admin", "admin-pw", true); rec.Code != http.StatusOK {
+	if rec := do(h, http.MethodPost, "/nodescale-ui/api/pools/kion-web-dev/replicas", "admin", "admin-pw", true); rec.Code != http.StatusOK {
 		t.Fatalf("admin POST: %d %s", rec.Code, rec.Body.String())
 	}
 }
@@ -246,11 +246,11 @@ func TestMeReportsTheRole(t *testing.T) {
 func TestActionIsAnnotatedWithTheActor(t *testing.T) {
 	s := testAuthServer(t)
 	h := s.Handler()
-	if rec := do(h, http.MethodPost, "/nodescale-ui/api/pools/default/kion-web-dev/replicas", "admin", "admin-pw", true); rec.Code != http.StatusOK {
+	if rec := do(h, http.MethodPost, "/nodescale-ui/api/pools/kion-web-dev/replicas", "admin", "admin-pw", true); rec.Code != http.StatusOK {
 		t.Fatalf("%d %s", rec.Code, rec.Body.String())
 	}
 	got := &infrav1.K8sWorkerPool{}
-	if err := s.Client.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "kion-web-dev"}, got); err != nil {
+	if err := s.Client.Get(context.Background(), client.ObjectKey{Name: "kion-web-dev"}, got); err != nil {
 		t.Fatal(err)
 	}
 	note := got.Annotations[lastActionAnnotation]

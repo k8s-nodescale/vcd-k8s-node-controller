@@ -194,14 +194,15 @@ reserved; `Failed` means the drain hit `drainTimeout` (VM kept), AutoHeal
 exhausted its attempts, or no Node appeared within `provisioning.timeout` (VM
 kept).
 
-Example (placeholder org, network and template; nothing cluster-specific):
+Example (placeholder org, network and template; nothing cluster-specific).
+The pool is **cluster-scoped**: no metadata.namespace, and k8sworkerpool
+commands take no -n:
 
 ```yaml
 apiVersion: k8s-nodescale.github.io/v1alpha1
 kind: K8sWorkerPool
 metadata:
   name: demo-cluster
-  namespace: default
 spec:
   replicas: 2
   namePrefix: demo-cluster
@@ -348,6 +349,33 @@ the API server prunes the newer status fields and the new subresources are
 missing. `kubectl scale` works only after the CRD that carries the subresource
 is applied.
 
+**Moving from 0.11.x to 0.12.0: the pool is cluster-scoped.** `scope` is
+part of the CRD and cannot be patched in place, so an existing installation is
+migrated by hand, once:
+
+```
+# 1. keep the pools: spec, finalizers and status - the status carries the IP
+#    ledger, and losing it may hand out an address that is already in use
+kubectl get k8sworkerpool -A -o yaml > pools-backup.yaml
+
+# 2. stop the controller: with it running, deleting the CRs runs the cleanup
+#    finalizer and the controller deletes the workers
+kubectl -n vcd-nodescale-system scale deploy/vcd-nodescale --replicas=0
+
+# 3. replace the CRD, which drops every K8sWorkerPool
+kubectl delete crd k8sworkerpools.k8s-nodescale.github.io
+kubectl apply -f charts/vcd-nodescale/crds/k8s-nodescale.github.io_k8sworkerpools.yaml
+
+# 4. recreate each pool without metadata.namespace, then restore its status
+kubectl apply -f pools-backup.yaml        # namespace: and status: removed
+kubectl patch k8sworkerpool <name> --subresource=status --type=merge \
+  -p '{"status":{...}}'                  # the status from the backup
+
+# 5. upgrade the release (the chart ships the cluster-scoped CRD)
+helm upgrade vcd-nodescale charts/vcd-nodescale -n vcd-nodescale-system \
+  --set image.tag=0.12.0
+```
+
 3. Apply a `K8sWorkerPool` (see `config/samples/` and the resource reference
    above), then use it as described in **How to use**.
 
@@ -373,11 +401,11 @@ workers and the reconciliation policy**.
 Raise `spec.replicas` on the pool, one replica at a time:
 
 ```
-kubectl -n default patch k8sworkerpool demo-cluster --type merge -p '{"spec":{"replicas":3}}'
+kubectl patch k8sworkerpool demo-cluster --type merge -p '{"spec":{"replicas":3}}'
 ```
 
-`kubectl -n default edit k8sworkerpool demo-cluster` works as well, and so does
-`kubectl -n default scale k8sworkerpool demo-cluster --replicas=3`: the CRD
+`kubectl edit k8sworkerpool demo-cluster` works as well, and so does
+`kubectl scale k8sworkerpool demo-cluster --replicas=3`: the CRD
 exposes the `scale` subresource (`spec.replicas` / `status.observedReplicas`),
 which also keeps `replicas` out of the alphabetically ordered YAML an editor
 shows.
@@ -459,7 +487,7 @@ that does not answer, a full data disk) would otherwise sit in `Provisioning`
 forever. `spec.provisioning.timeout` bounds that window:
 
 ```
-$ kubectl -n default get k8sworkerpool demo-cluster -o jsonpath='{range .status.nodes[*]}{.name} {.phase} {.message}{"\n"}{end}'
+$ kubectl get k8sworkerpool demo-cluster -o jsonpath='{range .status.nodes[*]}{.name} {.phase} {.message}{"\n"}{end}'
 demo-cluster-wrk-03 Failed VM has run for 16m0s without a Kubernetes Node (spec.provisioning.timeout=15m0s); the VM is kept for inspection
 ```
 
@@ -473,9 +501,9 @@ slow template; do not remove the check.
 Watch it:
 
 ```
-kubectl -n default get k8sworkerpool demo-cluster -w
+kubectl get k8sworkerpool demo-cluster -w
 
-kubectl -n default get k8sworkerpool demo-cluster \
+kubectl get k8sworkerpool demo-cluster \
   -o jsonpath='{range .status.nodes[*]}{.name}{"\t"}{.phase}{"\t"}{.ip}{"\n"}{end}'
 
 kubectl get nodes -l node-role.kubernetes.io/worker
@@ -484,7 +512,7 @@ kubectl get nodes -l node-role.kubernetes.io/worker
 The pool is converged when the `Ready` condition says so:
 
 ```
-kubectl -n default get k8sworkerpool demo-cluster \
+kubectl get k8sworkerpool demo-cluster \
   -o jsonpath='{.status.conditions[?(@.type=="Ready")]}'
 # {"type":"Ready","status":"True","reason":"Converged","message":"3/3 workers Ready",...}
 ```
@@ -661,8 +689,8 @@ Notes:
 actually runs with, read back from vCD on every pass. A difference between them
 is a roll-out candidate, so the loop also notices a VM somebody resized by hand.
 
-    kubectl -n vcd-nodescale-system patch k8sworkerpool default --type merge -p '{"spec":{"flavor":{"cpus":8,"memoryMB":16384}}}'
-    kubectl -n vcd-nodescale-system get k8sworkerpool default -o custom-columns=PHASE:.status.rollout.phase,DONE:.status.rollout.workersDone,TOTAL:.status.rollout.workersTotal,NOW:.status.rollout.currentWorker
+    kubectl patch k8sworkerpool default --type merge -p '{"spec":{"flavor":{"cpus":8,"memoryMB":16384}}}'
+    kubectl get k8sworkerpool default -o custom-columns=PHASE:.status.rollout.phase,DONE:.status.rollout.workersDone,TOTAL:.status.rollout.workersTotal,NOW:.status.rollout.currentWorker
 
 Each worker goes through the removal pipeline with a resize in the middle
 instead of a delete:
@@ -951,8 +979,8 @@ does not disappear until every worker has been drained, removed from the ingress
 pool, stopped, deleted in vCD and had its address released. Only then is the
 finalizer dropped and the CR garbage-collected:
 
-    kubectl -n default delete k8sworkerpool kion-web-dev
-    kubectl -n default get k8sworkerpool kion-web-dev -w   # Terminating until done
+    kubectl delete k8sworkerpool kion-web-dev
+    kubectl get k8sworkerpool kion-web-dev -w   # Terminating until done
 
 What this means in practice:
 
@@ -1208,13 +1236,13 @@ curl -u admin:'<password>' -X POST \
   -H 'Content-Type: application/json' \
   -H 'X-Requested-With: nodescale-ui' \
   -d '{"replicas":3}' \
-  http://<node>:<port>/nodescale-ui/api/pools/default/kion-web-dev/replicas
+  http://<node>:<port>/nodescale-ui/api/pools/kion-web-dev/replicas
 ```
 
 Every accepted change is logged with the account and recorded on the pool:
 
 ```
-kubectl -n default get k8sworkerpool kion-web-dev \
+kubectl get k8sworkerpool kion-web-dev \
   -o jsonpath='{.metadata.annotations.k8s-nodescale\.github\.io/last-action-by}'
 ```
 
@@ -1226,7 +1254,7 @@ Service, no Ingress, no Secret.
 ## Terraform integration contract
 
 - The Terraform module installs this chart behind a `node_controller.enabled`
-  toggle and pins `chart_version` / `image_tag` (currently `0.11.27`).
+  toggle and pins `chart_version` / `image_tag` (currently `0.12.0`).
 - **Once the controller is enabled, do not use Terraform to manage worker count
   or worker LB pool membership.** Use the CRD instead. The Terraform module's
   README must state this explicitly.
@@ -1257,7 +1285,7 @@ Build locally (the Dockerfile uses `golang:1.27.1-alpine` and
 `gcr.io/distroless/static:nonroot`):
 
 ```
-docker build -t docker.io/werton13/vcd-k8s-node-controller:0.11.27 .
+docker build -t docker.io/werton13/vcd-k8s-node-controller:0.12.0 .
 ```
 
 Public module defaults are used inside the build. On a restricted network,
@@ -1267,14 +1295,14 @@ override them:
 docker build \
   --build-arg GOPROXY=https://nexus.example.com/repository/golang/ \
   --build-arg GOSUMDB=off \
-  -t docker.io/werton13/vcd-k8s-node-controller:0.11.27 .
+  -t docker.io/werton13/vcd-k8s-node-controller:0.12.0 .
 ```
 
 Push (or use `make image-push`):
 
 ```
 docker login docker.io
-docker push docker.io/werton13/vcd-k8s-node-controller:0.11.27
+docker push docker.io/werton13/vcd-k8s-node-controller:0.12.0
 docker push docker.io/werton13/vcd-k8s-node-controller:latest
 ```
 
