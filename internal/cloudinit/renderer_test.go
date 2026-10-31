@@ -25,6 +25,11 @@ func testParams() Params {
 		K8sMinorRepo:   "v1.35",
 		JoinEndpoint:   "192.0.2.2:6443",
 		JoinCommand:    "kubeadm join 192.0.2.2:6443 --token x --discovery-token-ca-cert-hash sha256:y",
+		HostsLines: []string{
+			"192.0.2.2 master-01",
+			"192.0.2.10 pool-wrk-01",
+			"192.0.2.11 pool-wrk-02",
+		},
 		Disks: []DiskParam{
 			{
 				Device: "/dev/sdb", VG: "data1_vg", LV: "data1_lv",
@@ -276,7 +281,7 @@ func TestRenderedScriptsParse(t *testing.T) {
 			scripts[filepath.Base(path)] = content
 		}
 	}
-	for _, want := range []string{"k8s-node-prereqs.sh", "k8s-node-join.sh", "vcd-verify-layout.sh", "vcd-ensure-layout.sh"} {
+	for _, want := range []string{"k8s-node-prereqs.sh", "k8s-node-join.sh", "vcd-verify-layout.sh", "vcd-ensure-layout.sh", "vcd-grow-root.sh"} {
 		if _, ok := scripts[want]; !ok {
 			t.Fatalf("%s was not rendered", want)
 		}
@@ -303,6 +308,92 @@ func TestRenderedScriptsParse(t *testing.T) {
 		if out, err := exec.Command("bash", "-n", path).CombinedOutput(); err != nil {
 			t.Errorf("%s syntax error: %v\n%s", name, err, out)
 		}
+	}
+}
+
+// TestUserDataMatchesTheTerraformBaseline pins the four settings item 17 found
+// missing on the first controller-created workers, and the root-grow script
+// that stands in for the Terraform image's growpart. Each one is a statement
+// about a guest, not about a template: a worker built here must behave like one
+// built by the baseline playbook.
+func TestUserDataMatchesTheTerraformBaseline(t *testing.T) {
+	ud, _ := mustRender(t, testParams())
+	files := userDataFiles(t, ud)
+
+	if !strings.Contains(ud, "ssh_pwauth: true") {
+		t.Error("password login is off; the Terraform baseline allows it")
+	}
+	sshd, ok := files["/etc/ssh/sshd_config.d/01-k8s-auth.conf"]
+	if !ok {
+		t.Fatal("the sshd drop-in is missing")
+	}
+	for _, want := range []string{
+		"PubkeyAuthentication yes",
+		"PasswordAuthentication yes",
+		"KbdInteractiveAuthentication yes",
+		"PermitRootLogin no",
+	} {
+		if !strings.Contains(sshd, want) {
+			t.Errorf("sshd drop-in lacks %q", want)
+		}
+	}
+	if !strings.Contains(ud, "Timeout \"60\"") || !strings.Contains(ud, "Retries \"60\"") {
+		t.Error("apt does not retry a slow mirror or wait for the dpkg lock")
+	}
+	periodic, ok := files["/etc/apt/apt.conf.d/10periodic"]
+	if !ok {
+		t.Fatal("periodic apt is not disabled")
+	}
+	if !strings.Contains(periodic, "Unattended-Upgrade \"0\"") {
+		t.Error("unattended upgrades are still enabled")
+	}
+
+	// /etc/hosts has to be appended, not replaced: cloud-init owns the guest's
+	// own line, the pool contributes its peers.
+	if !strings.Contains(ud, "path: /etc/hosts") || !strings.Contains(ud, "append: true") {
+		t.Fatal("/etc/hosts is not written by the template")
+	}
+	for _, p := range testParams().HostsLines {
+		if !strings.Contains(ud, p) {
+			t.Errorf("/etc/hosts lacks %q", p)
+		}
+	}
+
+	// The root filesystem: the pre-requisites stage grows it before apt needs
+	// the space, and the grow happens before the marker short-circuit so a
+	// later osDiskGB change is picked up on the next boot.
+	prereqs := files["/usr/local/sbin/k8s-node-prereqs.sh"]
+	growAt := strings.Index(prereqs, "vcd-grow-root.sh")
+	markerAt := strings.Index(prereqs, "MARKER=/etc/kubernetes/prereqs.done")
+	if growAt < 0 {
+		t.Fatal("the pre-requisites stage does not grow the root filesystem")
+	}
+	if markerAt < 0 || growAt > markerAt {
+		t.Error("the root grow sits behind the done marker; a grown disk would be missed")
+	}
+	if !strings.Contains(prereqs, "unattended-upgrades") {
+		t.Error("the pre-requisites stage does not remove unattended-upgrades")
+	}
+	if !strings.Contains(prereqs, "cloud-guest-utils") {
+		t.Error("growpart is not installed")
+	}
+
+	grow, ok := files["/usr/local/sbin/vcd-grow-root.sh"]
+	if !ok {
+		t.Fatal("vcd-grow-root.sh is missing")
+	}
+	for _, want := range []string{"growpart", "pvresize", "lvextend", "resize2fs"} {
+		if !strings.Contains(grow, want) {
+			t.Errorf("grow script never calls %s", want)
+		}
+	}
+	if !strings.Contains(grow, "vg_name=$vg") {
+		// Only the VG behind / may be touched: the data VGs own their disks.
+		t.Error("grow script does not confine itself to the root volume group")
+	}
+
+	if !strings.Contains(ud, "systemctl restart ssh ssh.socket ssh.service") {
+		t.Error("the sshd drop-in is never picked up: ssh is not restarted")
 	}
 }
 

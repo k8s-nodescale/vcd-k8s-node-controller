@@ -20,7 +20,26 @@ users:
       - {{ .SSHAuthorizedKey }}
     {{- end }}
 
-ssh_pwauth: false
+# The Terraform baseline allows password login, and an operator locked out of a
+# worker that failed a stage needs it. Key-only would be a different policy than
+# the one the cluster's own images are built with.
+ssh_pwauth: true
+
+# Same apt policy as the Terraform baseline: retry a slow mirror, wait for the
+# dpkg lock instead of failing, and never update or upgrade on its own.
+apt:
+  conf: |
+    Acquire {
+      Retries "60"
+    }
+    DPkg {
+      Lock {
+        Timeout "60"
+      }
+    }
+
+package_update: false
+package_upgrade: false
 
 # Declarative only: two boot steps, everything else is a file or a unit. See
 # customization-phases.md §4.2 - work that can fail slowly or needs a retry
@@ -51,6 +70,39 @@ write_files:
                 via: {{ .GatewayIP }}
             nameservers:
               addresses: {{ .DNSServersJSON }}
+
+  # Parity with the Terraform baseline: no periodic apt activity behind the
+  # controller's back, and a password login that works when a worker has to be
+  # rescued by hand. 0600 because sshd refuses a group- or world-writable
+  # include file.
+  - path: /etc/apt/apt.conf.d/10periodic
+    content: |
+      APT::Periodic::Update-Package-Lists "0";
+      APT::Periodic::Download-Upgradeable-Packages "0";
+      APT::Periodic::AutocleanInterval "0";
+      APT::Periodic::Unattended-Upgrade "0";
+    permissions: '0644'
+
+  - path: /etc/ssh/sshd_config.d/01-k8s-auth.conf
+    content: |
+      PubkeyAuthentication yes
+      PasswordAuthentication yes
+      KbdInteractiveAuthentication yes
+      PermitRootLogin no
+    permissions: '0600'
+
+  # The Terraform baseline writes every node of the cluster into /etc/hosts, so
+  # a worker can resolve its peers before DNS knows them. The controller knows
+  # the pool's own workers (and reads the cluster's Nodes), and appends rather
+  # than replacing the file cloud-init writes for the guest's own hostname.
+  {{- if .HostsLines }}
+  - path: /etc/hosts
+    append: true
+    content: |
+  {{- range .HostsLines }}
+      {{ . }}
+  {{- end }}
+  {{- end }}
 
   - path: /etc/modules-load.d/k8s.conf
     content: |
@@ -88,6 +140,11 @@ write_files:
     content: |
 {{ .EnsureScript }}
 
+  - path: /usr/local/sbin/vcd-grow-root.sh
+    permissions: '0700'
+    content: |
+{{ .GrowScript }}
+
   - path: /usr/local/sbin/k8s-node-prereqs.sh
     permissions: '0700'
     content: |
@@ -101,11 +158,32 @@ write_files:
       log() { echo "[$(date -Is)] $*"; }
       log "starting prerequisites {{ .RenderStamp }}"
 
+      # 0. The virtual disk may be bigger than the template's partition table:
+      #    a 20 GiB clone of an 8 GiB image leaves / at 7.6 GiB and the apt
+      #    below fills it. Grow the root before anything needs the space. It is
+      #    idempotent and deliberately outside the marker: a disk extended
+      #    later (spec.flavor.osDiskGB) is picked up on the next boot.
+      if [[ -x /usr/local/sbin/vcd-grow-root.sh ]]; then
+        /usr/local/sbin/vcd-grow-root.sh || log "root grow failed; continuing with the filesystem as it is"
+      fi
+
       MARKER=/etc/kubernetes/prereqs.done
       if [[ -f "$MARKER" ]]; then
         log "prerequisites already done"
         exit 0
       fi
+
+      # 0b. Parity with the Terraform baseline: unattended-upgrades must not
+      #     compete for the dpkg lock while the node is being prepared, and
+      #     Pro/ESM hooks must not inject repositories the cluster image never
+      #     had. Done before any apt call, once.
+      systemctl disable --now unattended-upgrades >/dev/null 2>&1 || true
+      DEBIAN_FRONTEND=noninteractive apt-get purge --auto-remove -y \
+        unattended-upgrades ubuntu-advantage-tools ubuntu-pro-client >/dev/null 2>&1 || true
+      rm -f /etc/apt/apt.conf.d/20apt-esm-hook.conf
+      sed -i 's/^Prompt.*/Prompt=never/' /etc/update-manager/release-upgrades 2>/dev/null || true
+      truncate -s 0 /var/lib/ubuntu-release-upgrader/release-upgrade-available 2>/dev/null || true
+      log "unattended upgrades and Pro hooks removed"
 
       K8S_MINOR="{{ .K8sMinorRepo }}"
       K8S_VERSION="{{ .K8sVersion }}"
@@ -126,7 +204,7 @@ write_files:
       # 3. containerd.
       if ! command -v containerd >/dev/null 2>&1; then
         apt-get update -y
-        DEBIAN_FRONTEND=noninteractive apt-get install -y containerd conntrack socat
+        DEBIAN_FRONTEND=noninteractive apt-get install -y containerd conntrack socat cloud-guest-utils
       fi
       mkdir -p /etc/containerd
       systemctl enable containerd
@@ -295,3 +373,6 @@ runcmd:
   # --now, not just enable: on the first boot of a worker the prerequisites
   # have just finished and the node should join in this boot, not the next one.
   - systemctl enable --now --no-block k8s-node-join.service
+  # The sshd drop-in above is read at start, and the image's socket unit may be
+  # the one that answers: restart all three the way the Terraform baseline does.
+  - systemctl restart ssh ssh.socket ssh.service || true

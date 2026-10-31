@@ -1037,6 +1037,7 @@ func (r *WorkerPoolReconciler) createWorker(ctx context.Context, pool *infrav1.K
 		JoinEndpoint:     pool.Spec.Join.Endpoint,
 		JoinCommand:      join,
 		Disks:            cloudInitDisks,
+		HostsLines:       r.hostsLines(ctx, pool),
 	})
 	if err != nil {
 		return release(fmt.Errorf("render bootstrap for %s: %w", name, err))
@@ -1070,6 +1071,49 @@ func (r *WorkerPoolReconciler) createWorker(ctx context.Context, pool *infrav1.K
 		return cloud.VM{}, "", cause
 	}
 	return vm, tokenID(token), nil
+}
+
+// hostsLines is what a worker's /etc/hosts gains beyond its own line: every
+// node of the cluster by name and address, which is what the Terraform
+// baseline writes and what lets a worker resolve its peers before DNS knows
+// them. The pool's own workers come from status (their addresses are the
+// ledger's); the rest is read from the cluster, so control-plane nodes are in
+// there too. Names are sorted to keep the render deterministic.
+//
+// Failing to read the Nodes is not a reason to fail a create: the guest comes
+// up with an incomplete hosts file, which is a nuisance, not a broken node.
+func (r *WorkerPoolReconciler) hostsLines(ctx context.Context, pool *infrav1.K8sWorkerPool) []string {
+	byName := map[string]string{}
+	for i := range pool.Status.Nodes {
+		n := &pool.Status.Nodes[i]
+		// NodeName, not the VM name: peers resolve the name the kubelet
+		// registers, and the VM name may carry a different case.
+		if n.NodeName != "" && n.IP != "" {
+			byName[n.NodeName] = n.IP
+		}
+	}
+	nodes := &corev1.NodeList{}
+	if err := r.Client.List(ctx, nodes); err == nil {
+		for i := range nodes.Items {
+			n := &nodes.Items[i]
+			for _, a := range n.Status.Addresses {
+				if a.Type == corev1.NodeInternalIP {
+					byName[n.Name] = a.Address
+					break
+				}
+			}
+		}
+	}
+	names := make([]string, 0, len(byName))
+	for name := range byName {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	lines := make([]string, 0, len(names))
+	for _, name := range names {
+		lines = append(lines, byName[name]+" "+name)
+	}
+	return lines
 }
 
 // ownedWorkerVMs keeps the VMs that belong to the pool. Ownership is decided by

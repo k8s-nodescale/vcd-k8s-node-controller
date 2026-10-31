@@ -24,7 +24,7 @@ import (
 
 // RenderVersion is bumped whenever the rendered output changes in a way that
 // matters to a running guest. It is stamped into every generated file.
-const RenderVersion = "0.2.0"
+const RenderVersion = "0.3.0"
 
 //go:embed templates/*.tmpl
 var templatesFS embed.FS
@@ -62,6 +62,10 @@ type Params struct {
 	JoinEndpoint     string // e.g. "192.168.100.2:6443"
 	JoinCommand      string
 	Disks            []DiskParam
+	// HostsLines is what /etc/hosts gains beyond the guest's own line: the
+	// cluster's nodes by name and address, the way the Terraform baseline
+	// writes them.
+	HostsLines []string
 }
 
 // Renderer renders the templates.
@@ -71,6 +75,7 @@ type Renderer struct {
 	diskSetupTpl  *template.Template
 	layoutTpl     *template.Template
 	ensureTpl     *template.Template
+	growTpl       *template.Template
 	stamp         string
 }
 
@@ -96,6 +101,10 @@ func New() (*Renderer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse layout repair template: %w", err)
 	}
+	grow, err := template.ParseFS(templatesFS, "templates/grow-root.sh.tmpl")
+	if err != nil {
+		return nil, fmt.Errorf("parse root grow template: %w", err)
+	}
 	hash, err := templateHash()
 	if err != nil {
 		return nil, err
@@ -106,6 +115,7 @@ func New() (*Renderer, error) {
 		diskSetupTpl:  diskSetup,
 		layoutTpl:     layout,
 		ensureTpl:     ensure,
+		growTpl:       grow,
 		stamp:         fmt.Sprintf("render=%s hash=%s", RenderVersion, hash),
 	}, nil
 }
@@ -126,6 +136,10 @@ func (r *Renderer) Render(p Params) (userData string, initscript string, err err
 	if err := r.ensureTpl.Execute(&ensure, p); err != nil {
 		return "", "", fmt.Errorf("render layout repair: %w", err)
 	}
+	var grow bytes.Buffer
+	if err := r.growTpl.Execute(&grow, p); err != nil {
+		return "", "", fmt.Errorf("render root grow: %w", err)
+	}
 
 	var ud bytes.Buffer
 	if err := r.userDataTpl.Execute(&ud, struct {
@@ -133,7 +147,9 @@ func (r *Renderer) Render(p Params) (userData string, initscript string, err err
 		RenderStamp  string
 		LayoutScript string
 		EnsureScript string
-	}{p, r.stamp, indentLines(layout.String(), 6), indentLines(ensure.String(), 6)}); err != nil {
+		GrowScript   string
+	}{p, r.stamp, indentLines(layout.String(), 6), indentLines(ensure.String(), 6),
+		indentLines(grow.String(), 6)}); err != nil {
 		return "", "", fmt.Errorf("render user-data: %w", err)
 	}
 	gz, err := base64Gzip(ud.Bytes())

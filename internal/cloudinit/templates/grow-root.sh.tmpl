@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# Grow the root filesystem into the disk vCD handed us.
+#
+# A clone carries the template's partition table: on this image the disk is
+# 20 GiB but sda3 is 8.29 GiB, so / reports 7.6 GiB and ~11 GiB stay unusable.
+# The controller grows the virtual disk; until this script existed nothing in
+# the guest grew the partition, the PV, the LV or the filesystem.
+#
+# Idempotent: on a disk that is already grown every step is a no-op. It only
+# ever touches the volume group the root filesystem lives in - the data VGs
+# own their own disks and are prepared by prepare-data-disks.sh.
+set -uo pipefail
+
+LOG=/var/log/vcd-grow-root.log
+exec >>"$LOG" 2>&1
+log() { echo "[$(date -Is)] $*"; }
+
+root_src=$(findmnt -n -o SOURCE / 2>/dev/null || true)
+if [[ -z "$root_src" ]]; then
+  log "cannot resolve the device behind /"
+  exit 1
+fi
+log "root is $root_src"
+
+pv=""
+vg=""
+lv=""
+lvpath=""
+
+case "$root_src" in
+  /dev/mapper/*|/dev/*-*/*)
+    if ! command -v lvs >/dev/null 2>&1; then
+      log "no LVM tools on this image; nothing to grow"
+      exit 0
+    fi
+    vg=$(lvs --noheadings -o vg_name "$root_src" 2>/dev/null | tr -d ' ')
+    lv=$(lvs --noheadings -o lv_name "$root_src" 2>/dev/null | tr -d ' ')
+    lvpath=$(readlink -f "$root_src")
+    if [[ -z "$vg" || -z "$lv" ]]; then
+      log "root is $root_src but no LV matches it"
+      exit 1
+    fi
+    pv=$(pvs --noheadings -o pv_name --select "vg_name=$vg" 2>/dev/null | tr -d ' ' | head -n1)
+    if [[ -z "$pv" ]]; then
+      log "no physical volume backs VG $vg"
+      exit 1
+    fi
+    ;;
+  /dev/*)
+    lvpath="$root_src"
+    ;;
+  *)
+    log "root is $root_src (overlay or network); nothing to grow"
+    exit 0
+    ;;
+esac
+
+grow_partition() {
+  local dev="$1" disk part out rc
+  disk=$(lsblk -no pkname "$dev" 2>/dev/null | head -n1)
+  part=$(cat "/sys/class/block/$(basename "$dev")/partition" 2>/dev/null || true)
+  if [[ -z "$disk" || -z "$part" ]]; then
+    log "$dev is not a partition; skipping the partition step"
+    return 0
+  fi
+  if command -v growpart >/dev/null 2>&1; then
+    out=$(growpart "/dev/$disk" "$part" 2>&1)
+    rc=$?
+    log "growpart /dev/$disk $part -> rc=$rc ${out:-}"
+  elif command -v parted >/dev/null 2>&1; then
+    out=$(parted ---pretend-input-tty "/dev/$disk" resizepart "$part" 100% 2>&1)
+    rc=$?
+    log "parted resizepart /dev/$disk $part -> rc=$rc ${out:-}"
+  else
+    log "neither growpart nor parted is installed; cannot grow the partition"
+    return 1
+  fi
+  partprobe "/dev/$disk" >/dev/null 2>&1 || true
+  udevadm settle >/dev/null 2>&1 || true
+  return 0
+}
+
+if [[ -n "$pv" ]]; then
+  grow_partition "$pv" || true
+  pvresize "$pv" >/dev/null 2>&1 || log "pvresize $pv failed"
+  free=$(vgs --noheadings -o vg_free_count "$vg" 2>/dev/null | tr -d ' ')
+  if [[ "${free:-0}" -gt 0 ]]; then
+    log "extending $vg/$lv by $free extents"
+    lvextend -l +100%FREE "$lvpath" >/dev/null 2>&1 || log "lvextend failed"
+  else
+    log "$vg has no free extents; the LV already fills it"
+  fi
+else
+  grow_partition "$lvpath" || true
+fi
+
+fstype=$(blkid -s TYPE -o value "$lvpath" 2>/dev/null || true)
+case "$fstype" in
+  ext2|ext3|ext4)
+    resize2fs "$lvpath" >/dev/null 2>&1 || log "resize2fs $lvpath failed"
+    ;;
+  xfs)
+    xfs_growfs / >/dev/null 2>&1 || log "xfs_growfs / failed"
+    ;;
+  "")
+    log "no filesystem type found on $lvpath; nothing to resize"
+    ;;
+  *)
+    log "filesystem $fstype is not grown automatically"
+    ;;
+esac
+
+log "done: $(df -h / | tail -n1)"
+exit 0
