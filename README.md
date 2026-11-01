@@ -711,6 +711,16 @@ volume group the spec names. It is idempotent, it never shrinks, and it never
 touches the root volume group - that one is grown by `vcd-grow-root.sh`. The
 `DISKS` column of the page is the filesystem size, so the result is visible the
 moment the worker comes back.
+
+A resize that fails leaves the worker **powered off** and its step in `Failed`
+rather than booting it with a shape that does not match the spec. Fix the cause,
+then clear the step to retry it:
+
+    kubectl patch k8sworkerpool <name> --subresource=status --type=json \
+      -p '[{"op":"remove","path":"/status/nodes/<i>/resize"}]'
+
+Returning `spec.flavor` to the worker's current shape also closes it: the next
+pass finds nothing to do.
       -> ingress pool in
 
 A change that cannot be applied in place takes the recreate branch after the
@@ -1350,7 +1360,7 @@ Service, no Ingress, no Secret.
 ## Terraform integration contract
 
 - The Terraform module installs this chart behind a `node_controller.enabled`
-  toggle and pins `chart_version` / `image_tag` (currently `0.14.3`).
+  toggle and pins `chart_version` / `image_tag` (currently `0.14.4`).
 - **Once the controller is enabled, do not use Terraform to manage worker count
   or worker LB pool membership.** Use the CRD instead. The Terraform module's
   README must state this explicitly.
@@ -1381,7 +1391,7 @@ Build locally (the Dockerfile uses `golang:1.27.1-alpine` and
 `gcr.io/distroless/static:nonroot`):
 
 ```
-docker build -t docker.io/werton13/vcd-k8s-node-controller:0.14.3 .
+docker build -t docker.io/werton13/vcd-k8s-node-controller:0.14.4 .
 ```
 
 Public module defaults are used inside the build. On a restricted network,
@@ -1391,14 +1401,14 @@ override them:
 docker build \
   --build-arg GOPROXY=https://nexus.example.com/repository/golang/ \
   --build-arg GOSUMDB=off \
-  -t docker.io/werton13/vcd-k8s-node-controller:0.14.3 .
+  -t docker.io/werton13/vcd-k8s-node-controller:0.14.4 .
 ```
 
 Push (or use `make image-push`):
 
 ```
 docker login docker.io
-docker push docker.io/werton13/vcd-k8s-node-controller:0.14.3
+docker push docker.io/werton13/vcd-k8s-node-controller:0.14.4
 docker push docker.io/werton13/vcd-k8s-node-controller:latest
 ```
 

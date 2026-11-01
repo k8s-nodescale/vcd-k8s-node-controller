@@ -272,11 +272,14 @@ type NodeFlavor struct {
 
 // DiskSpec describes an internal disk attached to a worker VM.
 type DiskSpec struct {
-	SizeGB         int32  `json:"sizeGB"`
-	Mount          string `json:"mount,omitempty"`
-	BusType        string `json:"busType,omitempty"`
-	BusNumber      int32  `json:"busNumber,omitempty"`
-	UnitNumber     int32  `json:"unitNumber,omitempty"`
+	SizeGB  int32  `json:"sizeGB"`
+	Mount   string `json:"mount,omitempty"`
+	BusType string `json:"busType,omitempty"`
+	// BusNumber and UnitNumber are always written, zero included: a disk on
+	// bus 1 unit 0 is not "a disk without a unit number", and a manifest that
+	// omits it reads that way.
+	BusNumber      int32  `json:"busNumber"`
+	UnitNumber     int32  `json:"unitNumber"`
 	StorageProfile string `json:"storageProfile,omitempty"`
 }
 
@@ -584,7 +587,7 @@ type DiskStatus struct {
 	// BusNumber and UnitNumber address the disk on its controller. Both are
 	// needed: the provider matches a spec disk to a platform disk by the pair,
 	// and a missing bus number silently matches nothing.
-	BusNumber  int32 `json:"busNumber,omitempty"`
+	BusNumber  int32 `json:"busNumber"`
 	UnitNumber int32 `json:"unitNumber"`
 	SizeGB     int32 `json:"sizeGB"`
 }
