@@ -137,7 +137,16 @@ type Pool struct {
 	DeleteWorkers   []string  `json:"deleteWorkers,omitempty"`
 	Flavor          Flavor    `json:"flavor"`
 	Capacity        *Capacity `json:"capacity,omitempty"`
-	Nodes           []Node    `json:"nodes"`
+	// The address window the pool owns inside its CIDR. Two pools can share a
+	// CIDR only if their windows do not overlap, so the page has to show where
+	// this one starts and ends, not just the network.
+	IPNetwork    string `json:"ipNetwork,omitempty"`
+	IPWindowFrom string `json:"ipWindowFrom,omitempty"`
+	IPWindowTo   string `json:"ipWindowTo,omitempty"`
+	IPWindowSize int32  `json:"ipWindowSize,omitempty"`
+	IPWindowUsed int32  `json:"ipWindowUsed,omitempty"`
+	IPWindowDecl bool   `json:"ipWindowDeclared,omitempty"`
+	Nodes        []Node `json:"nodes"`
 	// Warning carries the first condition message when the pool is not
 	// converged, so the page can say why without the operator opening kubectl.
 	Warning string `json:"warning,omitempty"`

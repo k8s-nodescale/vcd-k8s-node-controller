@@ -801,6 +801,89 @@ Consequences worth knowing:
 - Because ownership is by prefix, the Terraform workers are the pool's workers
   too; see the Terraform integration contract below for how to remove one.
 
+## Managing K8sWorkerPool address ranges
+
+A cluster usually has one node subnet, and more than one pool can live in it: a
+pool of large workers, a pool of small ones, both on the same org network, with
+a different `namePrefix`, `flavor` and template. Each pool therefore declares the
+part of the subnet it owns - an **address window** - and never allocates outside
+it. Two pools sharing a CIDR do not collide because each one's allocator is
+physically unable to return the other's addresses.
+
+```yaml
+ipPlan:
+  cidr: 192.168.100.0/24
+  wNodeOffset: 40        # first address of the window (offset from the network)
+  nodeCount: 24          # how many addresses: .40-.63
+```
+
+`nodeCount` defaults to **10** and must be at least 1: the API server writes the
+default into every pool, so a limit always exists and can be read back from the
+object. There is deliberately no "whole network" mode - a pool that may take
+everything says so with a number, so the size is visible in `kubectl get -o yaml`
+and in review.
+
+What the controller always keeps out of a window, whatever it is set to: the
+network and broadcast addresses, the gateway (offset 1), `kubeapiLB`,
+`ingressLB`, the masters (`mNodeOffset` for `masterCount`), `dvmOffset`, and
+everything listed in `reserved`. Ordinals in worker names are relative to
+`wNodeOffset`, so the first worker of a pool whose window starts at .40 is still
+`namePrefix-wrk-01`.
+
+### The rules, including every edge
+
+1. **The window must fit.** `wNodeOffset + nodeCount - 1` may not pass the last
+   usable address (the broadcast, so `total - 2`). A pool that asks for more is
+   refused with `InvalidSpec` and nothing is created.
+2. **`nodeCount: 0` is not a mode.** The CRD minimum is 1 and the controller
+   repeats the check, because a zero used to be read as "unbounded" and a typo
+   would have handed a pool the entire subnet.
+3. **Growth stops at the edge.** A `replicas` above the window's capacity does
+   not fail the pool: the address is taken *before* the VM is cloned, so no
+   half-created VM is left behind, the workers that exist stay untouched,
+   `spec.replicas` keeps the operator's intent and `Ready=False` carries
+   `ScaleUpFailed` with "no free IPs in the pool's window". The pass retries, so
+   raising `nodeCount` recovers by itself.
+4. **Scale-in frees addresses for the same pool only.** Freed addresses go to
+   the pool's ledger and are reused first on the next scale-out. They are not
+   "returned to the network": they are outside every other pool's window anyway.
+5. **Lowering `nodeCount` below the number of addresses in use touches nothing.**
+   Existing workers keep their addresses (ownership is by `namePrefix`, and an
+   adopted worker is not asked where its address came from), nothing is drained
+   or deleted, and no new address is handed out until in-use drops to the new
+   limit. The pool then grows again - up to the new, smaller limit.
+6. **A worker whose VM disappeared frees its address.** The write-off path
+   releases it, and the next scale-out can take it back.
+7. **A queued slot already holds an address.** The vDC capacity pre-flight parks
+   a worker as `Queued`; that slot has its address reserved and counts against
+   the window, because it is a worker that will exist.
+8. **Adopted workers count too.** A VM created by Terraform or by hand that
+   matches the prefix enters `status.nodes` and the ledger. If that leaves the
+   pool over its window, growth stops (rule 3) but nothing is removed.
+9. **Changing `cidr` in place is not a migration.** The ledger's addresses
+   belong to the old network; treat a different CIDR as a new pool.
+10. **Overlap between two pools is not refused by the API yet.** Each pool has
+    its own ledger, so two pools with overlapping windows will really hand out
+    the same address. Keep windows disjoint by hand; the admission webhook
+    (roadmap 5) is what makes the API refuse the second one, and a
+    controller-side guard reports the conflict until then.
+
+### A worked example on a /24
+
+`192.168.100.0/24`, `.1` gateway, `.2` and `.3` the API and ingress VIPs,
+`.4-.6` the masters, `.7-.253` for workers:
+
+| pool | `wNodeOffset` | `nodeCount` | window |
+|---|---|---|---|
+| `large` | 7 | 48 | `.7-.54` |
+| `small` | 55 | 8 | `.55-.62` |
+| `gpu` | 63 | 8 | `.63-.70` |
+| _free_ | 71 | - | `.71-.253` for the next pool |
+
+The page shows the same thing per pool: a `NODE IPS` line with the window, the
+addresses in use against `nodeCount`, and a warning when the pool is close to
+its edge - the node-level equivalent of the pod-block warning.
+
 ## Drift, missing workers and the reconciliation policy
 
 0.3.x behaviour, for the record: a worker that disappeared without a request
@@ -1254,7 +1337,7 @@ Service, no Ingress, no Secret.
 ## Terraform integration contract
 
 - The Terraform module installs this chart behind a `node_controller.enabled`
-  toggle and pins `chart_version` / `image_tag` (currently `0.12.3`).
+  toggle and pins `chart_version` / `image_tag` (currently `0.13.0`).
 - **Once the controller is enabled, do not use Terraform to manage worker count
   or worker LB pool membership.** Use the CRD instead. The Terraform module's
   README must state this explicitly.
@@ -1285,7 +1368,7 @@ Build locally (the Dockerfile uses `golang:1.27.1-alpine` and
 `gcr.io/distroless/static:nonroot`):
 
 ```
-docker build -t docker.io/werton13/vcd-k8s-node-controller:0.12.3 .
+docker build -t docker.io/werton13/vcd-k8s-node-controller:0.13.0 .
 ```
 
 Public module defaults are used inside the build. On a restricted network,
@@ -1295,14 +1378,14 @@ override them:
 docker build \
   --build-arg GOPROXY=https://nexus.example.com/repository/golang/ \
   --build-arg GOSUMDB=off \
-  -t docker.io/werton13/vcd-k8s-node-controller:0.12.3 .
+  -t docker.io/werton13/vcd-k8s-node-controller:0.13.0 .
 ```
 
 Push (or use `make image-push`):
 
 ```
 docker login docker.io
-docker push docker.io/werton13/vcd-k8s-node-controller:0.12.3
+docker push docker.io/werton13/vcd-k8s-node-controller:0.13.0
 docker push docker.io/werton13/vcd-k8s-node-controller:latest
 ```
 

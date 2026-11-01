@@ -2,6 +2,8 @@ package mgmt
 
 import (
 	"context"
+	"encoding/binary"
+	"net/netip"
 	"sort"
 	"strings"
 	"sync"
@@ -139,6 +141,36 @@ func (c *Collector) collectPools(ctx context.Context) ([]Pool, error) {
 	return out, nil
 }
 
+// ipWindow describes the part of the CIDR this pool may hand out: wNodeOffset
+// for nodeCount addresses. The broadcast address is never in it.
+func ipWindow(plan infrav1.IPPlan) (from, to string, size int32, declared bool) {
+	prefix, err := netip.ParsePrefix(plan.CIDR)
+	if err != nil || !prefix.Addr().Is4() {
+		return "", "", 0, false
+	}
+	prefix = prefix.Masked()
+	total := int64(1) << uint(32-prefix.Bits())
+	start := int64(plan.WNodeOffset)
+	if start < 0 {
+		start = 0
+	}
+	if start >= total-1 || plan.NodeCount < 1 {
+		return "", "", 0, false
+	}
+	last := start + int64(plan.NodeCount) - 1
+	if last > total-2 {
+		last = total - 2
+	}
+	addr := func(off int64) string {
+		b := prefix.Addr().As4()
+		v := uint32(int64(binary.BigEndian.Uint32(b[:])) + off)
+		var out [4]byte
+		binary.BigEndian.PutUint32(out[:], v)
+		return netip.AddrFrom4(out).String()
+	}
+	return addr(start), addr(last), int32(last - start + 1), true
+}
+
 func (c *Collector) poolView(ctx context.Context, p *infrav1.K8sWorkerPool, byNode map[string]*corev1.Node,
 	used map[string]*nodeUsage, volumes map[string][]Volume, exporters map[string]string, real map[string]realUsage) Pool {
 
@@ -165,6 +197,14 @@ func (c *Collector) poolView(ctx context.Context, p *infrav1.K8sWorkerPool, byNo
 			break
 		}
 	}
+
+	from, to, size, declared := ipWindow(p.Spec.IPPlan)
+	view.IPNetwork = p.Spec.IPPlan.CIDR
+	view.IPWindowFrom = from
+	view.IPWindowTo = to
+	view.IPWindowSize = size
+	view.IPWindowUsed = int32(len(p.Status.Ledger.Used))
+	view.IPWindowDecl = declared
 
 	if cap := p.Status.Capacity; cap != nil {
 		view.Capacity = &Capacity{

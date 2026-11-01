@@ -375,7 +375,7 @@ func testPool(replicas int32) *infrav1.K8sWorkerPool {
 			},
 			IPPlan: infrav1.IPPlan{
 				CIDR: "192.168.100.0/24", MNodeOffset: 4, WNodeOffset: 7,
-				KubeAPILB: 2, IngressLB: 3, MasterCount: 3,
+				KubeAPILB: 2, IngressLB: 3, MasterCount: 3, NodeCount: 200,
 			},
 			Join: infrav1.JoinConfig{
 				Endpoint: "192.168.100.2:6443",

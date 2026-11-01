@@ -575,6 +575,24 @@
   // The capacity pane answers one question: does another worker fit. The
   // numbers come from the pool status, which the controller writes from the
   // platform, so they are as fresh as the last scale operation.
+  function ipRow(p) {
+    var used = p.ipWindowUsed || 0;
+    var size = p.ipWindowSize || 0;
+    if (!p.ipNetwork || size <= 0) { return ""; }
+    var share = Math.min(100, used / size * 100);
+    var lvl = share >= 90 ? "high" : share >= 80 ? "warn" : "ok";
+    var range = p.ipWindowFrom + " - " + p.ipWindowTo;
+    var note = p.ipWindowDeclared
+      ? '<div class="capnote">window ' + esc(range) + " for this pool; another pool may own the rest of " +
+        esc(p.ipNetwork) + "</div>"
+      : "";
+    return '<div class="caprow pod"><span class="caplbl">NODE IPS ' + esc(p.ipNetwork) + "</span></div>" +
+      '<div class="caprow podbar" title="' + esc(range + " - " + used + " of " + size + " addresses used") + '">' +
+        '<span class="dbar d-' + lvl + '"><i style="width:' + share.toFixed(1) + '%"></i></span>' +
+        '<span class="capnum">' + used + " / " + size + "</span>" +
+      "</div>" + note;
+  }
+
   function renderCapacity(p) {
     var box = document.getElementById("capRows");
     var c = p && p.capacity;
@@ -587,6 +605,9 @@
       capRow("RAM", c.memory, c.memoryMB / 1024, c.memoryLimitMB / 1024, "GB", 0),
       capRow("Storage", c.storage, c.storageMB / 1024, c.storageLimitMB / 1024, "GB", 0)
     ];
+    if (p && p.ipNetwork) {
+      rows.push(ipRow(p));
+    }
     if (c.podCIDR) {
       rows.push(podRow(c));
     }

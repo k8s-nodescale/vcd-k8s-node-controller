@@ -735,6 +735,9 @@ func (r *WorkerPoolReconciler) validateSpec(pool *infrav1.K8sWorkerPool) string 
 	default:
 		return fmt.Sprintf("spec.provider %q is not supported (vcd)", pool.Spec.Provider)
 	}
+	if msg := validateIPWindow(pool.Spec.IPPlan); msg != "" {
+		return msg
+	}
 	if pool.Spec.ScaleDown.AllowLastWorker && pool.Spec.ScaleDown.MinReplicas > 0 {
 		return "spec.scaleDown.allowLastWorker requires spec.scaleDown.minReplicas: 0: the flag could never be honoured while the floor is higher"
 	}
@@ -748,6 +751,36 @@ func (r *WorkerPoolReconciler) validateSpec(pool *infrav1.K8sWorkerPool) string 
 	}
 	if _, err := parseTaints(pool.Spec.Join.Taints); err != nil {
 		return err.Error()
+	}
+	return ""
+}
+
+// validateIPWindow checks that the window is usable and fits the network. It is
+// a per-object check: whether the window overlaps another pool's is the job of
+// the admission webhook, because that needs the other objects.
+func validateIPWindow(plan infrav1.IPPlan) string {
+	if plan.NodeCount < 1 {
+		return fmt.Sprintf("spec.ipPlan.nodeCount %d must be at least 1: a pool without a window would take the whole network", plan.NodeCount)
+	}
+	_, network, err := net.ParseCIDR(plan.CIDR)
+	if err != nil {
+		return fmt.Sprintf("spec.ipPlan.cidr %q is not a CIDR: %v", plan.CIDR, err)
+	}
+	ones, bits := network.Mask.Size()
+	if bits != 32 {
+		return fmt.Sprintf("spec.ipPlan.cidr %q is not IPv4", plan.CIDR)
+	}
+	total := int64(1) << uint(32-ones)
+	start := int64(plan.WNodeOffset)
+	if start < 0 {
+		start = 0
+	}
+	if start >= total-1 {
+		return fmt.Sprintf("spec.ipPlan.wNodeOffset %d is outside %s", plan.WNodeOffset, plan.CIDR)
+	}
+	if start+int64(plan.NodeCount) > total-1 {
+		return fmt.Sprintf("spec.ipPlan.nodeCount %d from wNodeOffset %d does not fit %s: the window would end past the last usable address (%d available)",
+			plan.NodeCount, plan.WNodeOffset, plan.CIDR, total-1-start)
 	}
 	return ""
 }
@@ -1264,6 +1297,7 @@ func toIPAMPlan(p infrav1.IPPlan, v *infrav1.VCDRef) ipam.Plan {
 		KubeAPILB:   p.KubeAPILB,
 		IngressLB:   p.IngressLB,
 		MasterCount: p.MasterCount,
+		NodeCount:   p.NodeCount,
 		Reserved:    p.Reserved,
 	}
 }

@@ -198,6 +198,18 @@ spec:
                   masterCount:
                     format: int32
                     type: integer
+                  nodeCount:
+                    default: 10
+                    description: |-
+                      NodeCount is how many worker addresses this pool may take: its
+                      window is wNodeOffset .. wNodeOffset+nodeCount-1. Two pools can
+                      share one CIDR as long as their windows do not overlap, and a
+                      pool that outgrows its window fails instead of borrowing a
+                      neighbour's address. The default is 10, so every pool states a
+                      limit; a pool that needs the whole network says so with a number.
+                    format: int32
+                    minimum: 1
+                    type: integer
                   reserved:
                     items:
                       type: string

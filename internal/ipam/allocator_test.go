@@ -11,6 +11,7 @@ func basePlan() Plan {
 		KubeAPILB:   2,
 		IngressLB:   3,
 		MasterCount: 3,
+		NodeCount:   200,
 		Reserved:    []string{"192.168.100.100"},
 	}
 }

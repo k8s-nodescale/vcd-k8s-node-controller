@@ -17,7 +17,11 @@ type Plan struct {
 	KubeAPILB   int
 	IngressLB   int
 	MasterCount int32
-	Reserved    []string
+	// NodeCount is the size of the worker window: wNodeOffset .. wNodeOffset+
+	// NodeCount-1. It is never zero - the CRD defaults it to 10 and validates a
+	// minimum of 1, so "unset" cannot mean "the whole network".
+	NodeCount int32
+	Reserved  []string
 }
 
 // Ledger is the persisted allocation state.
@@ -30,12 +34,17 @@ type Ledger struct {
 // Allocator hands out IPv4 addresses from a CIDR while never returning
 // infrastructure addresses (gateway, VIPs, masters, DVM, explicit reservations).
 type Allocator struct {
-	plan     Plan
-	prefix   netip.Prefix
-	total    uint64
-	reserved map[netip.Addr]struct{}
-	used     map[netip.Addr]struct{}
-	ledger   Ledger
+	plan   Plan
+	prefix netip.Prefix
+	total  uint64
+	// windowStart and windowEnd are the offsets this pool may allocate from.
+	// Everything outside is another pool's business: the addresses are real,
+	// but they are not ours to hand out.
+	windowStart uint64
+	windowEnd   uint64
+	reserved    map[netip.Addr]struct{}
+	used        map[netip.Addr]struct{}
+	ledger      Ledger
 }
 
 // New builds an allocator from the plan and the last persisted ledger.
@@ -61,9 +70,48 @@ func New(plan Plan, ledger Ledger) (*Allocator, error) {
 			Free:      append([]string(nil), ledger.Free...),
 		},
 	}
+	a.windowStart, a.windowEnd = a.window()
+	if err := a.validateWindow(); err != nil {
+		return nil, err
+	}
 	a.buildReserved()
 	a.buildUsed()
 	return a, nil
+}
+
+// window is the range of offsets this pool may allocate from: wNodeOffset for
+// NodeCount addresses. The end is exclusive here.
+func (a *Allocator) window() (start, end uint64) {
+	start = 0
+	if a.plan.WNodeOffset > 0 {
+		start = uint64(a.plan.WNodeOffset)
+	}
+	end = start + uint64(a.plan.NodeCount)
+	if end > a.total {
+		end = a.total
+	}
+	return start, end
+}
+
+// validateWindow refuses a window that is empty or does not fit the network.
+// There is no "unbounded" mode: a pool that may take everything says so with a
+// number, so the limit is visible in the object rather than implied by a zero.
+func (a *Allocator) validateWindow() error {
+	if a.plan.NodeCount < 1 {
+		return fmt.Errorf("nodeCount %d must be at least 1: a pool without a window would take the whole network", a.plan.NodeCount)
+	}
+	// The last offset is the broadcast address, so a window may end at total-2.
+	if a.windowStart+uint64(a.plan.NodeCount) > a.total-1 {
+		return fmt.Errorf("nodeCount %d from wNodeOffset %d does not fit %s (%d addresses available)",
+			a.plan.NodeCount, a.plan.WNodeOffset, a.plan.CIDR, a.total-1-a.windowStart)
+	}
+	return nil
+}
+
+// inWindow reports whether an offset belongs to this pool. Addresses outside it
+// belong to another pool that declared a neighbouring window.
+func (a *Allocator) inWindow(off uint64) bool {
+	return off >= a.windowStart && off < a.windowEnd
 }
 
 func (a *Allocator) buildReserved() {
@@ -123,6 +171,17 @@ func (a *Allocator) addrAt(offset uint64) netip.Addr {
 	return netip.AddrFrom4(out)
 }
 
+// offsetOf is the position of addr within the prefix, the same number the
+// plan's offsets are expressed in.
+func (a *Allocator) offsetOf(addr netip.Addr) uint64 {
+	if !a.prefix.Contains(addr) {
+		return ^uint64(0)
+	}
+	base := a.prefix.Masked().Addr().As4()
+	have := addr.As4()
+	return uint64(binary.BigEndian.Uint32(have[:]) - binary.BigEndian.Uint32(base[:]))
+}
+
 func (a *Allocator) available(addr netip.Addr) bool {
 	if _, ok := a.reserved[addr]; ok {
 		return false
@@ -148,6 +207,9 @@ func (a *Allocator) Allocate() (string, error) {
 		if err != nil {
 			continue
 		}
+		if !a.inWindow(a.offsetOf(addr)) {
+			continue
+		}
 		if a.available(addr) {
 			a.used[addr] = struct{}{}
 			a.ledger.Used = append(a.ledger.Used, addr.String())
@@ -155,11 +217,7 @@ func (a *Allocator) Allocate() (string, error) {
 		}
 	}
 
-	start := a.plan.WNodeOffset
-	if start < 0 {
-		start = 0
-	}
-	for off := uint64(start); off < a.total; off++ {
+	for off := a.windowStart; off < a.windowEnd; off++ {
 		addr := a.addrAt(off)
 		if !a.available(addr) {
 			continue
@@ -171,7 +229,8 @@ func (a *Allocator) Allocate() (string, error) {
 		}
 		return addr.String(), nil
 	}
-	return "", fmt.Errorf("no free IPs in %s", a.plan.CIDR)
+	return "", fmt.Errorf("no free IPs in the pool's window of %s (wNodeOffset %d, nodeCount %d)",
+		a.plan.CIDR, a.plan.WNodeOffset, a.plan.NodeCount)
 }
 
 // Ordinal returns the Terraform-style worker ordinal for ip: the offset from

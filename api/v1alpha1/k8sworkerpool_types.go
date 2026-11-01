@@ -301,13 +301,23 @@ type VCDRef struct {
 // IPPlan mirrors Terraform's ip_plan variable. It carries only the
 // provider-neutral address plan.
 type IPPlan struct {
-	CIDR        string   `json:"cidr"`
-	MNodeOffset int      `json:"mNodeOffset,omitempty"`
-	WNodeOffset int      `json:"wNodeOffset,omitempty"`
-	KubeAPILB   int      `json:"kubeapiLB,omitempty"`
-	IngressLB   int      `json:"ingressLB,omitempty"`
-	MasterCount int32    `json:"masterCount,omitempty"`
-	Reserved    []string `json:"reserved,omitempty"`
+	CIDR        string `json:"cidr"`
+	MNodeOffset int    `json:"mNodeOffset,omitempty"`
+	WNodeOffset int    `json:"wNodeOffset,omitempty"`
+	KubeAPILB   int    `json:"kubeapiLB,omitempty"`
+	IngressLB   int    `json:"ingressLB,omitempty"`
+	MasterCount int32  `json:"masterCount,omitempty"`
+	// NodeCount is how many worker addresses this pool may take: its window is
+	// wNodeOffset .. wNodeOffset+nodeCount-1. Two pools can share one CIDR as
+	// long as their windows do not overlap, and a pool that outgrows its window
+	// fails instead of borrowing a neighbour's address. The default is
+	// materialised into every pool by the API server, so "not set" is not a
+	// hidden mode and zero is not a sentinel: an operator who needs a larger
+	// pool says so.
+	// +kubebuilder:default=10
+	// +kubebuilder:validation:Minimum=1
+	NodeCount int32    `json:"nodeCount"`
+	Reserved  []string `json:"reserved,omitempty"`
 }
 
 // JoinConfig controls cluster join behaviour.
