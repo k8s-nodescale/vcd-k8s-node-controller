@@ -182,6 +182,9 @@ type Pool struct {
 	// Warning carries the first condition message when the pool is not
 	// converged, so the page can say why without the operator opening kubectl.
 	Warning string `json:"warning,omitempty"`
+	// Busy is set while an operation is in flight; the page disables every
+	// action and says what is running.
+	Busy string `json:"busy,omitempty"`
 }
 
 // Disk is one filesystem on a worker: the mount, how big it is and how full.

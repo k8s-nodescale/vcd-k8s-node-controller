@@ -158,6 +158,11 @@ func (s *Server) update(ctx context.Context, name, action string, mutate func(*i
 		if err := s.Client.Get(ctx, types.NamespacedName{Name: name}, p); err != nil {
 			return err
 		}
+		// One operation at a time: a resize, a scale and a removal all drain
+		// the same workers and share the same budget.
+		if why := busyReason(p); why != "" {
+			return fmt.Errorf("%w: an operation is already in progress: %s", ErrInvalid, why)
+		}
 		if err := mutate(p); err != nil {
 			return err
 		}

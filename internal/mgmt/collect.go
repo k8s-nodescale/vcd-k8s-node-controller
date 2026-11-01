@@ -357,6 +357,7 @@ func (c *Collector) poolView(ctx context.Context, p *infrav1.K8sWorkerPool, byNo
 			break
 		}
 	}
+	view.Busy = busyReason(p)
 
 	from, to, size, declared := ipWindow(p.Spec.IPPlan)
 	view.IPNetwork = p.Spec.IPPlan.CIDR

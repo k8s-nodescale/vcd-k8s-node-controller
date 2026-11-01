@@ -203,6 +203,8 @@
   /* the disk editor: the same sheet as the flavour, with the current size and a
      "new value" input that stays dead until "change" is ticked */
   .disks-title { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  /* the lock note wraps inside the pane instead of widening it */
+  #busyNote { max-width: 340px; line-height: 1.45; }
   /* The block keeps its height in every state: the delta sits in the row of the
      disk it belongs to, and the confirmation shares the line of the apply
      button instead of adding a box below it. */
@@ -304,6 +306,7 @@
           <button id="setFlavor" title="send this flavor to the controller">apply flavor</button>
         </div>
         <div class="small muted" id="flavorHint" style="margin-top:6px"></div>
+        <div class="small" id="busyNote" style="display:none;margin-top:6px;color:var(--warn)"></div>
       </div>
 
       <div class="pane" id="disksPane">
@@ -968,6 +971,7 @@
     var admin = isAdmin();
     document.getElementById("scaleActions").style.display = admin ? "" : "none";
     document.getElementById("flavorActions").style.display = admin ? "" : "none";
+    applyBusy(p, admin);
     document.getElementById("viewerNote").style.display =
       admin || !state.me || !state.me.auth ? "none" : "";
 
@@ -983,6 +987,33 @@
     alignPanes();
   }
 
+  // One operation at a time. While the controller is replacing, resizing or
+  // scaling a worker, every action on the page is inactive: two of them would
+  // drain the same nodes and spend the same budget. The API refuses as well, so
+  // the disabled buttons are the honest face of the same rule.
+  function applyBusy(p, admin) {
+    var busy = !!(p && p.busy);
+    var disabled = !admin || busy;
+    ["setFlavor", "setReplicas", "minus", "plus", "applyDisks"].forEach(function (id) {
+      var el = document.getElementById(id);
+      if (!el) { return; }
+      if (id === "applyDisks") {
+        if (busy) { el.disabled = true; }
+      } else {
+        el.disabled = disabled;
+      }
+    });
+    ["fCpus", "fMem", "fDisk", "replicasInput"].forEach(function (id) {
+      document.getElementById(id).disabled = disabled;
+    });
+    var note = document.getElementById("busyNote");
+    if (!note) { return; }
+    note.style.display = busy ? "" : "none";
+    if (busy) {
+      note.textContent = "operation in progress: " + p.busy + "; the actions stay locked until the pool is idle";
+    }
+  }
+
   function allowLastWorkerTip(p) {
     return "allowLastWorker: " + p.allowLastWorker + " - read only here. A pool may only go to zero " +
       "workers when this is true, and it can only be changed with kubectl: " +
@@ -996,6 +1027,8 @@
     var act;
     if (n.deleting) {
       act = '<span class="small muted">removing…</span>';
+    } else if (p.busy) {
+      act = '<span class="small muted" title="' + esc(p.busy) + '">locked</span>';
     } else if (!admin) {
       act = '<span class="small muted">view only</span>';
     } else if (state.pendingDelete && state.pendingDelete.pool === poolKey(p) && state.pendingDelete.worker === n.name) {
