@@ -22,14 +22,15 @@ import (
 )
 
 const (
-	// DeleteWorkerAnnotation marks a Node for removal on the next reconcile:
+	// ReplaceWorkerAnnotation marks a Node for replacement on the next
+	// reconcile:
 	//
-	//	kubectl annotate node <worker> k8s-nodescale.github.io/delete-worker=true
+	//	kubectl annotate node <worker> k8s-nodescale.github.io/replace-worker=true
 	//
 	// The node is drained and its VM deleted; because spec.replicas is left
-	// alone, the pool then creates a replacement (rolling replacement).
-	// Use spec.scaleDown.deleteWorkers to remove a worker for good.
-	DeleteWorkerAnnotation = infrav1.AnnotationDomain + "/delete-worker"
+	// alone, the pool then creates a replacement in the same slot. It is not a
+	// deletion - use spec.scaleDown.deleteWorkers to remove a worker for good.
+	ReplaceWorkerAnnotation = infrav1.AnnotationDomain + "/replace-worker"
 	// ForceDeleteAnnotation skips the node-local volume guard for one node.
 	ForceDeleteAnnotation = infrav1.AnnotationDomain + "/force-delete"
 
@@ -82,7 +83,7 @@ func (r *WorkerPoolReconciler) deletionRequests(ctx context.Context, pool *infra
 		return nil, err
 	}
 	for _, node := range nodes {
-		if !strings.EqualFold(node.Annotations[DeleteWorkerAnnotation], "true") {
+		if !strings.EqualFold(node.Annotations[ReplaceWorkerAnnotation], "true") {
 			continue
 		}
 		key := strings.ToLower(node.Name)

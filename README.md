@@ -27,7 +27,7 @@ Implemented:
   cloud-init payload. `DeleteVM` powers the VM off and removes it together with
   its disks; it is idempotent.
 - Scale-in: lowering `spec.replicas` removes the highest-ordinal worker, while
-  `spec.scaleDown.deleteWorkers` and the `k8s-nodescale.github.io/delete-worker`
+  `spec.scaleDown.deleteWorkers` and the `k8s-nodescale.github.io/replace-worker`
   annotation remove a worker **by name**. Every removal is cordon -> ingress-pool
   removal -> PDB-aware drain (eviction API, escalating past a stuck budget once
   `drainTimeout` is spent) -> volume-detach wait -> Node delete
@@ -389,7 +389,7 @@ shows up in `status.nodes[].phase`. Both directions are supported:
 | more workers | raise `spec.replicas` | creates the missing workers |
 | fewer workers | lower `spec.replicas` | removes the highest-ordinal worker, never below `scaleDown.minReplicas` |
 | one specific worker gone | `spec.scaleDown.deleteWorkers: ["<worker>"]` | removes that worker and decrements `replicas`; no replacement |
-| one specific worker replaced | `kubectl annotate node <worker> k8s-nodescale.github.io/delete-worker=true` | removes it and creates a replacement (`replicas` untouched) |
+| one specific worker replaced | `kubectl annotate node <worker> k8s-nodescale.github.io/replace-worker=true` | removes it and creates a replacement (`replicas` untouched) |
 
 The scale-out path is described next, the removal path under **Scale in /
 removing a worker**. What the pool counts as its own is in **Ownership**, and
@@ -552,7 +552,7 @@ Three ways to ask, one implementation:
 | --- | --- | --- |
 | `spec.replicas: 2` (was 3) | the highest-ordinal worker (the one at the end of the pool) | no |
 | `spec.scaleDown.deleteWorkers: ["demo-cluster-wrk-02"]` | exactly that worker; the entry is pruned and `replicas` is decremented when it is gone | no |
-| `kubectl annotate node demo-cluster-wrk-03 k8s-nodescale.github.io/delete-worker=true` | exactly that worker, with `replicas` untouched | yes, a replacement is created (rolling replacement) |
+| `kubectl annotate node demo-cluster-wrk-03 k8s-nodescale.github.io/replace-worker=true` | exactly that worker, with `replicas` untouched | yes, a replacement is created (rolling replacement) |
 
 The annotation is the **rolling replacement** request: it marks one Node object
 instead of naming a worker in the spec. Because `spec.replicas` is untouched,
@@ -561,7 +561,7 @@ it to replace a worker whose guest is in a bad state, or to move it to a new
 address, without changing the size of the pool.
 
 ```bash
-kubectl annotate node demo-cluster-wrk-03 k8s-nodescale.github.io/delete-worker=true
+kubectl annotate node demo-cluster-wrk-03 k8s-nodescale.github.io/replace-worker=true
 ```
 
 Only the value `true` (case-insensitive) counts; any other value is ignored. The
@@ -574,7 +574,7 @@ The request can be withdrawn while nothing has started, by removing the
 annotation:
 
 ```bash
-kubectl annotate node demo-cluster-wrk-03 k8s-nodescale.github.io/delete-worker-
+kubectl annotate node demo-cluster-wrk-03 k8s-nodescale.github.io/replace-worker-
 ```
 
 Once the worker is `Draining` in `status.nodes[].phase` (with
@@ -1376,7 +1376,7 @@ Service, no Ingress, no Secret.
 ## Terraform integration contract
 
 - The Terraform module installs this chart behind a `node_controller.enabled`
-  toggle and pins `chart_version` / `image_tag` (currently `0.15.6`).
+  toggle and pins `chart_version` / `image_tag` (currently `0.16.0`).
 - **Once the controller is enabled, do not use Terraform to manage worker count
   or worker LB pool membership.** Use the CRD instead. The Terraform module's
   README must state this explicitly.
@@ -1407,7 +1407,7 @@ Build locally (the Dockerfile uses `golang:1.27.1-alpine` and
 `gcr.io/distroless/static:nonroot`):
 
 ```
-docker build -t docker.io/werton13/vcd-k8s-node-controller:0.15.6 .
+docker build -t docker.io/werton13/vcd-k8s-node-controller:0.16.0 .
 ```
 
 Public module defaults are used inside the build. On a restricted network,
@@ -1417,14 +1417,14 @@ override them:
 docker build \
   --build-arg GOPROXY=https://nexus.example.com/repository/golang/ \
   --build-arg GOSUMDB=off \
-  -t docker.io/werton13/vcd-k8s-node-controller:0.15.6 .
+  -t docker.io/werton13/vcd-k8s-node-controller:0.16.0 .
 ```
 
 Push (or use `make image-push`):
 
 ```
 docker login docker.io
-docker push docker.io/werton13/vcd-k8s-node-controller:0.15.6
+docker push docker.io/werton13/vcd-k8s-node-controller:0.16.0
 docker push docker.io/werton13/vcd-k8s-node-controller:latest
 ```
 

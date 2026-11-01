@@ -246,7 +246,7 @@ func TestReconcileDeletesWorkerByNodeAnnotation(t *testing.T) {
 	pool.Spec.ScaleDown = infrav1.ScaleDownPolicy{MinReplicas: 1}
 	fc := &fakeCloud{vms: threeWorkers()}
 	nodes := readyNodes("pool-wrk-01", "pool-wrk-02", "pool-wrk-03")
-	nodes[2].Annotations = map[string]string{DeleteWorkerAnnotation: "true"}
+	nodes[2].Annotations = map[string]string{ReplaceWorkerAnnotation: "true"}
 	fk := &fakeKube{nodes: nodes}
 	r := newTestReconciler(t, fc, fk, pool)
 
