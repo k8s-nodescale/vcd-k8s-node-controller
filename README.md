@@ -10,7 +10,7 @@ design doc).
 
 ## Status
 
-**0.17.0 is the first production-ready build.** The worker lifecycle, the
+**1.0.0 is the first production-ready build.** The worker lifecycle, the
 management page, the capacity snapshot and the address windows are signed off and
 verified on a dev cluster (vCD, NSX-V): adding a replica to a `K8sWorkerPool`
 creates a VM, lays out and grows its disks, boots the guest, joins it to the
@@ -22,7 +22,7 @@ One branch per feature, cut from `main`, named for what it delivers
 (`vsphere-provider`, `admission-webhook`, ...). A feature is merged into `main`
 only when it is complete and has been tested on the dev cluster; `main` stays the
 released baseline, and no half-finished feature is committed to it. Releases are
-tagged from `main` (`v0.17.0`, ...), and the chart on GitHub Pages is built from
+tagged from `main` (`v1.0.0`, ...), and the chart on GitHub Pages is built from
 that tag.
 
 Implemented:
@@ -1387,7 +1387,7 @@ Service, no Ingress, no Secret.
 ## Terraform integration contract
 
 - The Terraform module installs this chart behind a `node_controller.enabled`
-  toggle and pins `chart_version` / `image_tag` (currently `0.17.0`).
+  toggle and pins `chart_version` / `image_tag` (currently `1.0.0`).
 - **Once the controller is enabled, do not use Terraform to manage worker count
   or worker LB pool membership.** Use the CRD instead. The Terraform module's
   README must state this explicitly.
@@ -1418,7 +1418,7 @@ Build locally (the Dockerfile uses `golang:1.27.1-alpine` and
 `gcr.io/distroless/static:nonroot`):
 
 ```
-docker build -t docker.io/werton13/vcd-k8s-node-controller:0.17.0 .
+docker build -t docker.io/werton13/vcd-k8s-node-controller:1.0.0 .
 ```
 
 Public module defaults are used inside the build. On a restricted network,
@@ -1428,14 +1428,14 @@ override them:
 docker build \
   --build-arg GOPROXY=https://nexus.example.com/repository/golang/ \
   --build-arg GOSUMDB=off \
-  -t docker.io/werton13/vcd-k8s-node-controller:0.17.0 .
+  -t docker.io/werton13/vcd-k8s-node-controller:1.0.0 .
 ```
 
 Push (or use `make image-push`):
 
 ```
 docker login docker.io
-docker push docker.io/werton13/vcd-k8s-node-controller:0.17.0
+docker push docker.io/werton13/vcd-k8s-node-controller:1.0.0
 docker push docker.io/werton13/vcd-k8s-node-controller:latest
 ```
 
