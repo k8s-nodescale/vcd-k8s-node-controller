@@ -696,8 +696,21 @@ Each worker goes through the removal pipeline with a resize in the middle
 instead of a delete:
 
     cordon (nodeName) -> ingress pool out -> drain (PDB) -> VolumeAttachment wait
-      -> read the VM -> power off -> grow CPU/memory/system disk -> verify the shape
-      -> power on -> wait Node Ready and the flavor to match -> uncordon
+      -> read the VM -> power off -> grow CPU/memory/system disk/data disks
+      -> verify the shape -> power on -> wait Node Ready and the flavor to match
+      -> uncordon
+
+**Data disks grow too.** `spec.flavor.disks[].sizeGB` is applied when the VM is
+cloned and, since 0.14.0, also in place: raising one makes every worker a
+rollout candidate (`grow`), lowering one is a `recreate` because vCD cannot
+shrink a disk. The controller grows the virtual disk in the same powered-off
+window as CPU and memory, and the guest turns it into space on the next boot:
+`vcd-grow-data-disks.sh` runs at the top of the pre-requisites stage and does
+`pvresize` -> `lvextend -l +100%FREE` -> `resize2fs` (or `xfs_growfs`) for every
+volume group the spec names. It is idempotent, it never shrinks, and it never
+touches the root volume group - that one is grown by `vcd-grow-root.sh`. The
+`DISKS` column of the page is the filesystem size, so the result is visible the
+moment the worker comes back.
       -> ingress pool in
 
 A change that cannot be applied in place takes the recreate branch after the
@@ -1337,7 +1350,7 @@ Service, no Ingress, no Secret.
 ## Terraform integration contract
 
 - The Terraform module installs this chart behind a `node_controller.enabled`
-  toggle and pins `chart_version` / `image_tag` (currently `0.13.1`).
+  toggle and pins `chart_version` / `image_tag` (currently `0.14.0`).
 - **Once the controller is enabled, do not use Terraform to manage worker count
   or worker LB pool membership.** Use the CRD instead. The Terraform module's
   README must state this explicitly.
@@ -1368,7 +1381,7 @@ Build locally (the Dockerfile uses `golang:1.27.1-alpine` and
 `gcr.io/distroless/static:nonroot`):
 
 ```
-docker build -t docker.io/werton13/vcd-k8s-node-controller:0.13.1 .
+docker build -t docker.io/werton13/vcd-k8s-node-controller:0.14.0 .
 ```
 
 Public module defaults are used inside the build. On a restricted network,
@@ -1378,14 +1391,14 @@ override them:
 docker build \
   --build-arg GOPROXY=https://nexus.example.com/repository/golang/ \
   --build-arg GOSUMDB=off \
-  -t docker.io/werton13/vcd-k8s-node-controller:0.13.1 .
+  -t docker.io/werton13/vcd-k8s-node-controller:0.14.0 .
 ```
 
 Push (or use `make image-push`):
 
 ```
 docker login docker.io
-docker push docker.io/werton13/vcd-k8s-node-controller:0.13.1
+docker push docker.io/werton13/vcd-k8s-node-controller:0.14.0
 docker push docker.io/werton13/vcd-k8s-node-controller:latest
 ```
 

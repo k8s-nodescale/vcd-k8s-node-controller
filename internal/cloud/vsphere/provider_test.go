@@ -31,7 +31,7 @@ func TestTheStubSatisfiesTheContractAndRefuses(t *testing.T) {
 		"PowerOffVM":    func() error { return prov.PowerOffVM(ctx, "vm-1") },
 		"PowerOnVM":     func() error { return prov.PowerOnVM(ctx, "vm-1") },
 		"CycleVM":       func() error { return prov.CycleVM(ctx, "vm-1") },
-		"ResizeVM":      func() error { _, err := prov.ResizeVM(ctx, "vm-1", 4, 8192, 40); return err },
+		"ResizeVM":      func() error { _, err := prov.ResizeVM(ctx, "vm-1", 4, 8192, 40, nil); return err },
 		"Capacity":      func() error { _, err := prov.Capacity(ctx); return err },
 	}
 	for name, call := range calls {

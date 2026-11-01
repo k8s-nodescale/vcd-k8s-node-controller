@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Grow the data disks into the space vCD added.
+#
+# prepare-data-disks.sh gives each data disk one volume group with a logical
+# volume filling it, so growing a disk is pvresize -> lvextend -> grow the
+# filesystem. Idempotent: on a disk that already fills its VG every step is a
+# no-op, and nothing here can shrink anything. It only touches the volume groups
+# the spec names, never the root VG and never a data VG that is absent (a worker
+# created before the disks existed simply has nothing to do).
+set -uo pipefail
+
+LOG=/var/log/vcd-grow-data.log
+exec >>"$LOG" 2>&1
+log() { echo "[$(date -Is)] $*"; }
+log "growing data disks"
+
+grow() { # vg lv mount fstype
+  local vg="$1" lv="$2" mnt="$3" fs="$4" pv free out
+  if ! vgs "$vg" >/dev/null 2>&1; then
+    log "volume group $vg does not exist; nothing to grow for $mnt"
+    return 0
+  fi
+  pv=$(pvs --noheadings -o pv_name --select "vg_name=$vg" 2>/dev/null | tr -d ' ' | head -n1)
+  if [[ -n "$pv" ]]; then
+    udevadm settle >/dev/null 2>&1 || true
+    out=$(pvresize "$pv" 2>&1)
+    log "pvresize $pv -> ${out:-ok}"
+  fi
+  free=$(vgs --noheadings -o vg_free_count "$vg" 2>/dev/null | tr -d ' ')
+  if [[ "${free:-0}" -gt 0 ]]; then
+    out=$(lvextend -y -l +100%FREE "$vg/$lv" 2>&1)
+    if [[ $? -ne 0 ]]; then
+      sleep 3
+      udevadm settle >/dev/null 2>&1 || true
+      out=$(lvextend -y -l +100%FREE "$vg/$lv" 2>&1) || { log "lvextend $vg/$lv failed: $out"; return 1; }
+    fi
+    log "lvextend $vg/$lv: $out"
+  fi
+  case "$fs" in
+    ext2|ext3|ext4)
+      out=$(resize2fs "/dev/$vg/$lv" 2>&1) || { log "resize2fs /dev/$vg/$lv failed: $out"; return 1; }
+      ;;
+    xfs)
+      out=$(xfs_growfs "$mnt" 2>&1) || { log "xfs_growfs $mnt failed: $out"; return 1; }
+      ;;
+    *)
+      log "filesystem $fs on $mnt is not grown automatically"
+      return 0
+      ;;
+  esac
+  log "grew $mnt: $(df -h "$mnt" | tail -n1)"
+  return 0
+}
+
+{{- range .Disks }}
+grow {{ printf "%q" .VG }} {{ printf "%q" .LV }} {{ printf "%q" .Mount }} {{ printf "%q" .FSType }} || log "grow of {{ .Mount }} failed; continuing"
+{{- end }}
+
+log "done"
+exit 0

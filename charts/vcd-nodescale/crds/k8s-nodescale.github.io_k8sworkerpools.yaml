@@ -609,6 +609,21 @@ spec:
                         cpus:
                           format: int32
                           type: integer
+                        disks:
+                          description: |-
+                            Disks are the data disks, by unit number. They are compared with
+                            spec.flavor.disks on every pass, so raising one is a rollout like any
+                            other compute change and a reduction is a recreate.
+                          items:
+                            properties:
+                              sizeGB:
+                                format: int32
+                                type: integer
+                              unitNumber:
+                                format: int32
+                                type: integer
+                            type: object
+                          type: array
                         memoryMB:
                           format: int32
                           type: integer

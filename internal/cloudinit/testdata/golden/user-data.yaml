@@ -1,5 +1,5 @@
 #cloud-config
-# render=0.3.2 hash=732099503917
+# render=0.4.0 hash=0ea72d37ece9
 preserve_hostname: false
 hostname: pool-wrk-01
 fqdn: pool-wrk-01
@@ -354,6 +354,68 @@ write_files:
       log "done: $(df -h / | tail -n1)"
       exit 0
 
+  - path: /usr/local/sbin/vcd-grow-data-disks.sh
+    permissions: '0700'
+    content: |
+      #!/usr/bin/env bash
+      # Grow the data disks into the space vCD added.
+      #
+      # prepare-data-disks.sh gives each data disk one volume group with a logical
+      # volume filling it, so growing a disk is pvresize -> lvextend -> grow the
+      # filesystem. Idempotent: on a disk that already fills its VG every step is a
+      # no-op, and nothing here can shrink anything. It only touches the volume groups
+      # the spec names, never the root VG and never a data VG that is absent (a worker
+      # created before the disks existed simply has nothing to do).
+      set -uo pipefail
+
+      LOG=/var/log/vcd-grow-data.log
+      exec >>"$LOG" 2>&1
+      log() { echo "[$(date -Is)] $*"; }
+      log "growing data disks"
+
+      grow() { # vg lv mount fstype
+        local vg="$1" lv="$2" mnt="$3" fs="$4" pv free out
+        if ! vgs "$vg" >/dev/null 2>&1; then
+          log "volume group $vg does not exist; nothing to grow for $mnt"
+          return 0
+        fi
+        pv=$(pvs --noheadings -o pv_name --select "vg_name=$vg" 2>/dev/null | tr -d ' ' | head -n1)
+        if [[ -n "$pv" ]]; then
+          udevadm settle >/dev/null 2>&1 || true
+          out=$(pvresize "$pv" 2>&1)
+          log "pvresize $pv -> ${out:-ok}"
+        fi
+        free=$(vgs --noheadings -o vg_free_count "$vg" 2>/dev/null | tr -d ' ')
+        if [[ "${free:-0}" -gt 0 ]]; then
+          out=$(lvextend -y -l +100%FREE "$vg/$lv" 2>&1)
+          if [[ $? -ne 0 ]]; then
+            sleep 3
+            udevadm settle >/dev/null 2>&1 || true
+            out=$(lvextend -y -l +100%FREE "$vg/$lv" 2>&1) || { log "lvextend $vg/$lv failed: $out"; return 1; }
+          fi
+          log "lvextend $vg/$lv: $out"
+        fi
+        case "$fs" in
+          ext2|ext3|ext4)
+            out=$(resize2fs "/dev/$vg/$lv" 2>&1) || { log "resize2fs /dev/$vg/$lv failed: $out"; return 1; }
+            ;;
+          xfs)
+            out=$(xfs_growfs "$mnt" 2>&1) || { log "xfs_growfs $mnt failed: $out"; return 1; }
+            ;;
+          *)
+            log "filesystem $fs on $mnt is not grown automatically"
+            return 0
+            ;;
+        esac
+        log "grew $mnt: $(df -h "$mnt" | tail -n1)"
+        return 0
+      }
+      grow "data1_vg" "data1_lv" "/var" "ext4" || log "grow of /var failed; continuing"
+      grow "data2_vg" "data2_lv" "/var/lib" "ext4" || log "grow of /var/lib failed; continuing"
+
+      log "done"
+      exit 0
+
   - path: /usr/local/sbin/k8s-node-prereqs.sh
     permissions: '0700'
     content: |
@@ -365,7 +427,7 @@ write_files:
       LOG=/var/log/k8s-node-prereqs.log
       exec >>"$LOG" 2>&1
       log() { echo "[$(date -Is)] $*"; }
-      log "starting prerequisites render=0.3.2 hash=732099503917"
+      log "starting prerequisites render=0.4.0 hash=0ea72d37ece9"
 
       # 0. The virtual disk may be bigger than the template's partition table:
       #    a 20 GiB clone of an 8 GiB image leaves / at 7.6 GiB and the apt
@@ -374,6 +436,12 @@ write_files:
       #    later (spec.flavor.osDiskGB) is picked up on the next boot.
       if [[ -x /usr/local/sbin/vcd-grow-root.sh ]]; then
         /usr/local/sbin/vcd-grow-root.sh || log "root grow failed; continuing with the filesystem as it is"
+      fi
+      # The data disks are mounted by vcd-ensure-layout, which runs before this
+      # unit; growing them is the same three steps as the root, per volume
+      # group. A worker created before the disks were in the spec has none.
+      if [[ -x /usr/local/sbin/vcd-grow-data-disks.sh ]]; then
+        /usr/local/sbin/vcd-grow-data-disks.sh || log "data disk grow failed; continuing"
       fi
 
       MARKER=/etc/kubernetes/prereqs.done
@@ -461,7 +529,7 @@ write_files:
       LOG=/var/log/k8s-node-join.log
       exec >>"$LOG" 2>&1
       log() { echo "[$(date -Is)] $*"; }
-      log "starting join render=0.3.2 hash=732099503917"
+      log "starting join render=0.4.0 hash=0ea72d37ece9"
 
       MARKER=/etc/kubernetes/kubeadm-joined
       if [[ -f "$MARKER" ]]; then

@@ -137,6 +137,11 @@ write_files:
     content: |
 {{ .GrowScript }}
 
+  - path: /usr/local/sbin/vcd-grow-data-disks.sh
+    permissions: '0700'
+    content: |
+{{ .GrowDataScript }}
+
   - path: /usr/local/sbin/k8s-node-prereqs.sh
     permissions: '0700'
     content: |
@@ -157,6 +162,12 @@ write_files:
       #    later (spec.flavor.osDiskGB) is picked up on the next boot.
       if [[ -x /usr/local/sbin/vcd-grow-root.sh ]]; then
         /usr/local/sbin/vcd-grow-root.sh || log "root grow failed; continuing with the filesystem as it is"
+      fi
+      # The data disks are mounted by vcd-ensure-layout, which runs before this
+      # unit; growing them is the same three steps as the root, per volume
+      # group. A worker created before the disks were in the spec has none.
+      if [[ -x /usr/local/sbin/vcd-grow-data-disks.sh ]]; then
+        /usr/local/sbin/vcd-grow-data-disks.sh || log "data disk grow failed; continuing"
       fi
 
       MARKER=/etc/kubernetes/prereqs.done

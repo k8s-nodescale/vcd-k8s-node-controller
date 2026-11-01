@@ -456,7 +456,7 @@ func (p *Pool) CreateVM(ctx context.Context, spec cloud.CreateVMSpec) (cloud.VM,
 
 	// Before the data disks: the system disk is the only disk in the spec at
 	// this point, so the resize PUT carries no half-attached disks.
-	if err := setSystemDiskSize(vm, spec.OSDiskGB); err != nil {
+	if err := setDiskSizes(vm, spec.OSDiskGB, nil); err != nil {
 		return cloud.VM{}, err
 	}
 
@@ -656,7 +656,7 @@ func powerOn(vm *govcd.VM) error {
 // caller opened, and the result is verified before the caller powers it on: a
 // resize that only half applied must not boot a worker with the wrong shape
 // (I-17).
-func (p *Pool) ResizeVM(ctx context.Context, id string, cpus, memoryMB, osDiskGB int32) (cloud.VM, error) {
+func (p *Pool) ResizeVM(ctx context.Context, id string, cpus, memoryMB, osDiskGB int32, disks []cloud.DiskSpec) (cloud.VM, error) {
 	if err := ctx.Err(); err != nil {
 		return cloud.VM{}, err
 	}
@@ -683,9 +683,33 @@ func (p *Pool) ResizeVM(ctx context.Context, id string, cpus, memoryMB, osDiskGB
 	case osDiskGB > 0 && curDisk > 0 && osDiskGB < curDisk:
 		return cloud.VM{}, fmt.Errorf("VM %q has a %d GB system disk, cannot shrink to %d GB", vm.VM.Name, curDisk, osDiskGB)
 	}
+	// A data disk that has to shrink is the same story: vCD grows, it never
+	// shrinks, so the caller has to replace the VM rather than resize it.
+	curData := map[int32]int32{}
+	for _, d := range dataDiskSizes(vm) {
+		curData[d.UnitNumber] = d.SizeGB
+	}
+	for _, d := range disks {
+		if d.SizeGB <= 0 {
+			continue
+		}
+		if have, ok := curData[d.UnitNumber]; ok && have > 0 && d.SizeGB < have {
+			return cloud.VM{}, fmt.Errorf("VM %q has a %d GB data disk at unit %d, cannot shrink to %d GB",
+				vm.VM.Name, have, d.UnitNumber, d.SizeGB)
+		}
+	}
 
 	want := func(have, want int32) bool { return want <= 0 || have == want }
-	if want(curCPU, cpus) && want(curMem, memoryMB) && want(curDisk, osDiskGB) {
+	disksMatch := true
+	for _, d := range disks {
+		if d.SizeGB <= 0 {
+			continue
+		}
+		if have, ok := curData[d.UnitNumber]; ok && have != d.SizeGB {
+			disksMatch = false
+		}
+	}
+	if want(curCPU, cpus) && want(curMem, memoryMB) && want(curDisk, osDiskGB) && disksMatch {
 		info, err := p.vmInfo(vm, nil)
 		if err != nil {
 			return cloud.VM{}, err
@@ -703,8 +727,8 @@ func (p *Pool) ResizeVM(ctx context.Context, id string, cpus, memoryMB, osDiskGB
 	// The system disk is changed through the VM spec section, so it goes
 	// first: that call carries the current CPU and memory with it, and doing
 	// it after ChangeCPUCount would write the pre-resize values back.
-	if osDiskGB > 0 && curDisk != osDiskGB {
-		if err := setSystemDiskSize(vm, osDiskGB); err != nil {
+	if (osDiskGB > 0 && curDisk != osDiskGB) || !disksMatch {
+		if err := setDiskSizes(vm, osDiskGB, disks); err != nil {
 			return cloud.VM{}, err
 		}
 	}
@@ -873,9 +897,13 @@ func (p *Pool) edgeGateway(name string) (*govcd.EdgeGateway, error) {
 // does the same thing for the static nodes; a clone without it keeps the
 // catalog template size.
 func setSystemDiskSize(vm *govcd.VM, sizeGB int32) error {
-	if sizeGB <= 0 {
-		return nil
-	}
+	return setDiskSizes(vm, sizeGB, nil)
+}
+
+// setDiskSizes writes the system disk (bus 0/unit 0) and every data disk named
+// in disks into one VM spec section update. vCD rewrites the whole section on
+// each call, so doing it twice would write the first result back.
+func setDiskSizes(vm *govcd.VM, sizeGB int32, disks []cloud.DiskSpec) error {
 	if vm.VM.VmSpecSection == nil {
 		if err := vm.Refresh(); err != nil {
 			return fmt.Errorf("refresh VM %q: %w", vm.VM.Name, err)
@@ -906,14 +934,63 @@ func setSystemDiskSize(vm *govcd.VM, sizeGB int32) error {
 		return fmt.Errorf("VM %q system disk is %d MB, cannot shrink to %d MB", vm.VM.Name, system.SizeMb, wantMB)
 	}
 
-	system.SizeMb = wantMB
-	if _, err := vm.UpdateVmSpecSection(spec, "resize worker system disk"); err != nil {
-		return fmt.Errorf("resize system disk of VM %q to %d GB: %w", vm.VM.Name, sizeGB, err)
+	if system.SizeMb != wantMB {
+		system.SizeMb = wantMB
+	}
+	grew := system.SizeMb == wantMB
+	for _, want := range disks {
+		if want.SizeGB <= 0 {
+			continue
+		}
+		var disk *types.DiskSettings
+		for _, d := range spec.DiskSection.DiskSettings {
+			if d != nil && int32(d.UnitNumber) == want.UnitNumber && int32(d.BusNumber) == want.BusNumber {
+				disk = d
+				break
+			}
+		}
+		if disk == nil {
+			continue // a disk the template does not have is not ours to add here
+		}
+		wantMB := int64(want.SizeGB) * 1024
+		if disk.SizeMb >= wantMB {
+			continue
+		}
+		disk.SizeMb = wantMB
+		grew = true
+	}
+	if !grew {
+		return nil
+	}
+	reason := "resize worker disks"
+	if _, err := vm.UpdateVmSpecSection(spec, reason); err != nil {
+		return fmt.Errorf("resize disks of VM %q: %w", vm.VM.Name, err)
 	}
 	if err := vm.Refresh(); err != nil {
 		return fmt.Errorf("refresh VM %q after disk resize: %w", vm.VM.Name, err)
 	}
 	return nil
+}
+
+// dataDiskSizes lists every disk of a VM except the system disk, by unit
+// number. A disk the platform does not report is simply absent: an empty list
+// is "no opinion", never "a zero-sized disk".
+func dataDiskSizes(vm *govcd.VM) []cloud.DiskState {
+	if vm == nil || vm.VM == nil || vm.VM.VmSpecSection == nil || vm.VM.VmSpecSection.DiskSection == nil {
+		return nil
+	}
+	var out []cloud.DiskState
+	for _, d := range vm.VM.VmSpecSection.DiskSection.DiskSettings {
+		if d == nil || (d.BusNumber == 0 && d.UnitNumber == 0) {
+			continue
+		}
+		out = append(out, cloud.DiskState{
+			BusNumber:  int32(d.BusNumber),
+			UnitNumber: int32(d.UnitNumber),
+			SizeGB:     int32(d.SizeMb / 1024),
+		})
+	}
+	return out
 }
 
 // vdc resolves the configured org and VDC. The controller is scoped to one
@@ -993,6 +1070,7 @@ func (p *Pool) vmInfo(vm *govcd.VM, selector map[string]string) (*cloud.VM, erro
 		MemoryMB:   memMB,
 		DiskGB:     diskGB,
 		OSDiskGB:   systemDiskGB(vm),
+		DataDisks:  dataDiskSizes(vm),
 		Template:   metadata[metadataKeyTemplate],
 		Metadata:   metadata,
 	}, nil

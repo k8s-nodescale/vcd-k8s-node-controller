@@ -75,7 +75,7 @@ func (p *Provider) PowerOnVM(ctx context.Context, id string) error { return clou
 func (p *Provider) CycleVM(ctx context.Context, id string) error { return cloud.ErrNotImplemented }
 
 // ResizeVM reconfigures a powered-off worker VM.
-func (p *Provider) ResizeVM(ctx context.Context, id string, cpus, memoryMB, osDiskGB int32) (cloud.VM, error) {
+func (p *Provider) ResizeVM(ctx context.Context, id string, cpus, memoryMB, osDiskGB int32, disks []cloud.DiskSpec) (cloud.VM, error) {
 	return cloud.VM{}, cloud.ErrNotImplemented
 }
 

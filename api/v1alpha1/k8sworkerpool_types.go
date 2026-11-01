@@ -566,12 +566,23 @@ type FlavorStatus struct {
 	CPUs     int32 `json:"cpus,omitempty"`
 	MemoryMB int32 `json:"memoryMB,omitempty"`
 	OSDiskGB int32 `json:"osDiskGB,omitempty"`
+	// Disks are the data disks, by unit number. They are compared with
+	// spec.flavor.disks on every pass, so raising one is a rollout like any
+	// other compute change and a reduction is a recreate.
+	// +optional
+	Disks []DiskStatus `json:"disks,omitempty"`
 	// Template is the image the VM was cloned from, recorded on the VM when
 	// the provider creates it. A worker the controller adopted (a Terraform
 	// bootstrap worker) carries no such record, so this stays empty and means
 	// "no opinion": an unknown image never turns adoption into a recreate.
 	// +optional
 	Template string `json:"template,omitempty"`
+}
+
+// DiskStatus is one data disk of a worker, as the platform reports it.
+type DiskStatus struct {
+	UnitNumber int32 `json:"unitNumber"`
+	SizeGB     int32 `json:"sizeGB"`
 }
 
 // ResizeStatus is the per-worker rollout state.

@@ -214,7 +214,17 @@ type VM struct {
 	// It is empty when the platform cannot tell - a VM the controller did not
 	// create - and an empty template is "no opinion", never a difference.
 	Template string
-	Metadata map[string]string
+	// DataDisks are the attached data disks, by unit number, so a size a human
+	// raised in vCD is noticed the same way a raised CPU count is.
+	DataDisks []DiskState
+	Metadata  map[string]string
+}
+
+// DiskState is one data disk as the platform reports it.
+type DiskState struct {
+	BusNumber  int32
+	UnitNumber int32
+	SizeGB     int32
 }
 
 // CreateVMSpec is the input for provisioning a single worker VM.
@@ -279,7 +289,8 @@ type WorkerCompute interface {
 	// ResizeVM grows a powered-off VM to the requested shape and returns the
 	// refreshed VM. Shrinking is refused: the platform cannot shrink CPU or
 	// memory and a smaller disk would destroy data, so a shrink is a recreate.
-	ResizeVM(ctx context.Context, id string, cpus, memoryMB, osDiskGB int32) (VM, error)
+	// disks grows the data disks by unit number; an empty slice leaves them.
+	ResizeVM(ctx context.Context, id string, cpus, memoryMB, osDiskGB int32, disks []DiskSpec) (VM, error)
 }
 
 // CapacityReader reads what the platform still has free: compute capacity and

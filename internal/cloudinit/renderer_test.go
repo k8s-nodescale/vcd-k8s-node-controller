@@ -281,7 +281,7 @@ func TestRenderedScriptsParse(t *testing.T) {
 			scripts[filepath.Base(path)] = content
 		}
 	}
-	for _, want := range []string{"k8s-node-prereqs.sh", "k8s-node-join.sh", "vcd-verify-layout.sh", "vcd-ensure-layout.sh", "vcd-grow-root.sh"} {
+	for _, want := range []string{"k8s-node-prereqs.sh", "k8s-node-join.sh", "vcd-verify-layout.sh", "vcd-ensure-layout.sh", "vcd-grow-root.sh", "vcd-grow-data-disks.sh"} {
 		if _, ok := scripts[want]; !ok {
 			t.Fatalf("%s was not rendered", want)
 		}
@@ -390,6 +390,40 @@ func TestUserDataMatchesTheTerraformBaseline(t *testing.T) {
 
 	if !strings.Contains(ud, "systemctl restart ssh ssh.socket ssh.service") {
 		t.Error("the sshd drop-in is never picked up: ssh is not restarted")
+	}
+}
+
+// The data disks are grown on every boot: prepare-data-disks.sh gives each disk
+// one VG with the LV filling it, so a bigger vCD disk becomes bigger space only
+// after pvresize, lvextend and a filesystem grow. The run happens before the
+// pre-requisites stage installs anything, and it is idempotent.
+func TestDataDisksAreGrownAtBoot(t *testing.T) {
+	ud, _ := mustRender(t, testParams())
+	files := userDataFiles(t, ud)
+
+	grow, ok := files["/usr/local/sbin/vcd-grow-data-disks.sh"]
+	if !ok {
+		t.Fatal("vcd-grow-data-disks.sh is missing")
+	}
+	for _, want := range []string{"pvresize", "lvextend", "resize2fs"} {
+		if !strings.Contains(grow, want) {
+			t.Errorf("the data disk grow script never calls %s", want)
+		}
+	}
+	for _, d := range testParams().Disks {
+		if !strings.Contains(grow, d.VG) || !strings.Contains(grow, d.LV) || !strings.Contains(grow, d.Mount) {
+			t.Errorf("the grow script does not mention %s (%s/%s)", d.Mount, d.VG, d.LV)
+		}
+	}
+
+	prereqs := files["/usr/local/sbin/k8s-node-prereqs.sh"]
+	rootAt := strings.Index(prereqs, "vcd-grow-root.sh")
+	dataAt := strings.Index(prereqs, "vcd-grow-data-disks.sh")
+	if dataAt < 0 {
+		t.Fatal("the pre-requisites stage does not grow the data disks")
+	}
+	if rootAt < 0 || dataAt < rootAt {
+		t.Error("the data disks are grown before the root, which is the wrong order")
 	}
 }
 

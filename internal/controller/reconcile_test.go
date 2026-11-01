@@ -196,7 +196,7 @@ func (f *fakeCloud) CycleVM(ctx context.Context, id string) error {
 	return nil
 }
 
-func (f *fakeCloud) ResizeVM(ctx context.Context, id string, cpus, memoryMB, osDiskGB int32) (cloud.VM, error) {
+func (f *fakeCloud) ResizeVM(ctx context.Context, id string, cpus, memoryMB, osDiskGB int32, disks []cloud.DiskSpec) (cloud.VM, error) {
 	f.resizes = append(f.resizes, id)
 	if f.failResize {
 		return cloud.VM{}, errors.New("injected resize failure")
@@ -219,6 +219,13 @@ func (f *fakeCloud) ResizeVM(ctx context.Context, id string, cpus, memoryMB, osD
 		}
 		if osDiskGB > 0 {
 			f.vms[i].OSDiskGB = osDiskGB
+		}
+		for _, want := range disks {
+			for j := range f.vms[i].DataDisks {
+				if f.vms[i].DataDisks[j].UnitNumber == want.UnitNumber && want.SizeGB > 0 {
+					f.vms[i].DataDisks[j].SizeGB = want.SizeGB
+				}
+			}
 		}
 		return f.vms[i], nil
 	}

@@ -24,7 +24,7 @@ import (
 
 // RenderVersion is bumped whenever the rendered output changes in a way that
 // matters to a running guest. It is stamped into every generated file.
-const RenderVersion = "0.3.2"
+const RenderVersion = "0.4.0"
 
 //go:embed templates/*.tmpl
 var templatesFS embed.FS
@@ -76,6 +76,7 @@ type Renderer struct {
 	layoutTpl     *template.Template
 	ensureTpl     *template.Template
 	growTpl       *template.Template
+	growDataTpl   *template.Template
 	stamp         string
 }
 
@@ -105,6 +106,10 @@ func New() (*Renderer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse root grow template: %w", err)
 	}
+	growData, err := template.ParseFS(templatesFS, "templates/grow-data-disks.sh.tmpl")
+	if err != nil {
+		return nil, fmt.Errorf("parse data disk grow template: %w", err)
+	}
 	hash, err := templateHash()
 	if err != nil {
 		return nil, err
@@ -116,6 +121,7 @@ func New() (*Renderer, error) {
 		layoutTpl:     layout,
 		ensureTpl:     ensure,
 		growTpl:       grow,
+		growDataTpl:   growData,
 		stamp:         fmt.Sprintf("render=%s hash=%s", RenderVersion, hash),
 	}, nil
 }
@@ -140,16 +146,21 @@ func (r *Renderer) Render(p Params) (userData string, initscript string, err err
 	if err := r.growTpl.Execute(&grow, p); err != nil {
 		return "", "", fmt.Errorf("render root grow: %w", err)
 	}
+	var growData bytes.Buffer
+	if err := r.growDataTpl.Execute(&growData, p); err != nil {
+		return "", "", fmt.Errorf("render data disk grow: %w", err)
+	}
 
 	var ud bytes.Buffer
 	if err := r.userDataTpl.Execute(&ud, struct {
 		Params
-		RenderStamp  string
-		LayoutScript string
-		EnsureScript string
-		GrowScript   string
+		RenderStamp    string
+		LayoutScript   string
+		EnsureScript   string
+		GrowScript     string
+		GrowDataScript string
 	}{p, r.stamp, indentLines(layout.String(), 6), indentLines(ensure.String(), 6),
-		indentLines(grow.String(), 6)}); err != nil {
+		indentLines(grow.String(), 6), indentLines(growData.String(), 6)}); err != nil {
 		return "", "", fmt.Errorf("render user-data: %w", err)
 	}
 	gz, err := base64Gzip(ud.Bytes())

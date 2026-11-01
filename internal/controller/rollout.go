@@ -115,6 +115,23 @@ func compareFlavor(have, want *infrav1.FlavorStatus) flavorDelta {
 	cmp(have.CPUs, want.CPUs)
 	cmp(have.MemoryMB, want.MemoryMB)
 	cmp(have.OSDiskGB, want.OSDiskGB)
+	// Data disks are matched by unit number, and a disk either side does not
+	// know about is "no opinion": an adopted worker whose disks the platform
+	// does not report must not turn into a rollout.
+	haveDisks := map[int32]int32{}
+	for _, d := range have.Disks {
+		if d.SizeGB > 0 {
+			haveDisks[d.UnitNumber] = d.SizeGB
+		}
+	}
+	for _, d := range want.Disks {
+		if d.SizeGB <= 0 {
+			continue
+		}
+		if h, ok := haveDisks[d.UnitNumber]; ok {
+			cmp(h, d.SizeGB)
+		}
+	}
 	switch {
 	case grow && shrink:
 		return flavorMixed
@@ -127,16 +144,34 @@ func compareFlavor(have, want *infrav1.FlavorStatus) flavorDelta {
 	}
 }
 
+// resizeDisks turns the wanted data disks into what the provider needs to grow
+// them. The bus number is not part of the status: disks are addressed by unit
+// within the single SCSI controller the template defines.
+func resizeDisks(disks []infrav1.DiskStatus) []cloud.DiskSpec {
+	out := make([]cloud.DiskSpec, 0, len(disks))
+	for _, d := range disks {
+		if d.SizeGB <= 0 {
+			continue
+		}
+		out = append(out, cloud.DiskSpec{UnitNumber: d.UnitNumber, SizeGB: d.SizeGB})
+	}
+	return out
+}
+
 // flavorOf is the observed side of spec.flavor for one VM. Every observation
 // goes through here, so the template can never be forgotten by one call site
 // and remembered by another.
 func flavorOf(vm cloud.VM) *infrav1.FlavorStatus {
-	return &infrav1.FlavorStatus{
+	out := &infrav1.FlavorStatus{
 		CPUs:     vm.CPU,
 		MemoryMB: vm.MemoryMB,
 		OSDiskGB: vm.OSDiskGB,
 		Template: vm.Template,
 	}
+	for _, d := range vm.DataDisks {
+		out.Disks = append(out.Disks, infrav1.DiskStatus{UnitNumber: d.UnitNumber, SizeGB: d.SizeGB})
+	}
+	return out
 }
 
 func rolloutMaxUnavailable(pool *infrav1.K8sWorkerPool, workers int) int {
@@ -216,6 +251,9 @@ func (r *WorkerPoolReconciler) reconcileRollout(ctx context.Context, pool *infra
 		MemoryMB: pool.Spec.Flavor.MemoryMB,
 		OSDiskGB: pool.Spec.Flavor.OSDiskGB,
 		Template: pool.Spec.Flavor.Template,
+	}
+	for _, d := range pool.Spec.Flavor.Disks {
+		target.Disks = append(target.Disks, infrav1.DiskStatus{UnitNumber: d.UnitNumber, SizeGB: d.SizeGB})
 	}
 
 	inFlight := rolloutInFlight(pool)
@@ -560,7 +598,7 @@ func (r *WorkerPoolReconciler) advanceResize(ctx context.Context, pool *infrav1.
 				n.Message = n.Resize.Message
 				return nil
 			}
-			resized, err := prov.ResizeVM(ctx, n.ProviderID, target.CPUs, target.MemoryMB, target.OSDiskGB)
+			resized, err := prov.ResizeVM(ctx, n.ProviderID, target.CPUs, target.MemoryMB, target.OSDiskGB, resizeDisks(target.Disks))
 			if err != nil {
 				if errors.Is(err, cloud.ErrPoweredOn) {
 					if perr := prov.PowerOffVM(ctx, n.ProviderID); perr != nil {
