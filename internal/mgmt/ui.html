@@ -203,12 +203,15 @@
   /* the disk editor: the same sheet as the flavour, with the current size and a
      "new value" input that stays dead until "change" is ticked */
   .disks-title { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-  /* the confirmation lives in its own box so it cannot reflow the inputs */
-  .confirmbox { display: none; margin-top: 8px; border: 1px solid var(--line);
-                border-radius: 8px; padding: 8px 10px; background: var(--bg);
-                align-items: center; justify-content: space-between; gap: 10px;
-                font-size: 12px; flex-wrap: wrap; }
-  .confirmbox.on { display: flex; }
+  /* The block keeps its height in every state: the delta sits in the row of the
+     disk it belongs to, and the confirmation shares the line of the apply
+     button instead of adding a box below it. */
+  .disks-actions { justify-content: flex-end; min-height: 32px; }
+  .disk-confirm { display: inline-flex; align-items: center; gap: 8px; margin-right: auto;
+                  font-size: 12px; color: var(--muted); }
+  .flavor .fl.diskrow .delta { font-size: 11px; color: var(--muted); white-space: nowrap; }
+  .flavor .fl.diskrow .delta.changed { color: var(--fg); }
+  #diskHint { min-height: 16px; }
   button.ghost.ok { color: var(--ok); }
   button.ghost.no { color: var(--high); }
   .flag.change { display: inline-flex; align-items: center; gap: 6px; margin: 0;
@@ -310,10 +313,10 @@
         </div>
         <div class="flavor" id="diskRows"><span class="small muted">loading&hellip;</span></div>
         <div class="row disks-actions" id="diskActions" style="margin-top:10px">
+          <span class="disk-confirm" id="diskConfirm"></span>
           <button id="applyDisks" disabled title="grow the disks; this asks for confirmation">apply</button>
         </div>
         <div class="small muted" id="diskHint" style="margin-top:6px"></div>
-        <div class="confirmbox" id="diskConfirm"></div>
       </div>
       </div>
       <div class="pane" id="replicasPane">
@@ -645,11 +648,12 @@
   function diskRows(p) {
     var gb = function (n) { return n ? n + " GB" : "&ndash;"; };
     var rows = '<div class="fl diskrow"><span>OS</span><b>' + gb(p.flavor.osDiskGB) +
-      '</b><input type="number" min="1" step="1" data-disk="os" title="new size of the system disk, GB" disabled></div>';
+      '</b><input type="number" min="1" step="1" data-disk="os" title="new size of the system disk, GB" disabled>' +
+      '<span class="delta"></span></div>';
     (p.flavor.disks || []).forEach(function (d) {
       rows += '<div class="fl diskrow"><span>' + esc(d.mount || ("unit " + d.unitNumber)) + "</span><b>" +
         gb(d.sizeGB) + '</b><input type="number" min="1" step="1" data-disk="' + esc(d.unitNumber) +
-        '" title="new size, GB" disabled></div>';
+        '" title="new size, GB" disabled><span class="delta"></span></div>';
     });
     return rows;
   }
@@ -722,33 +726,62 @@
       hint.innerHTML = '<span class="confirm">' + esc(plan.err) + "</span>";
       return;
     }
-    hint.textContent = "";
+    hint.textContent = "a disk cannot shrink, only grow";
   }
 
   function renderDiskConfirm(p) {
-    var box = document.getElementById("diskConfirm");
-    if (!box || !p) { return; }
+    var slot = document.getElementById("diskConfirm");
+    var apply = document.getElementById("applyDisks");
+    if (!slot || !p) { return; }
     if (!state.pendingDisks || !state.pendingPlan) {
-      box.className = "confirmbox";
-      box.innerHTML = "";
+      slot.innerHTML = "";
+      apply.style.display = "";
       return;
     }
     var plan = state.pendingPlan;
-    var where = " (no workers yet)";
+    var where = "no workers yet";
     if (plan.workers > 0) {
-      where = " on " + plan.workers + (plan.workers === 1 ? " worker" : " workers") +
-        (plan.total > 0 ? ", +" + plan.total + " GB total" : "");
+      where = plan.workers + (plan.workers === 1 ? " worker" : " workers") +
+        (plan.total > 0 ? ", +" + plan.total + " GB" : "");
     }
-    box.className = "confirmbox on";
-    box.innerHTML = "<span>" + "grow " + esc(plan.parts.join(", ")) + esc(where) + "?" + "</span>" +
-      '<span><button class="ghost icon ok" id="diskYes">grow</button> ' +
-      '<button class="ghost icon no" id="diskNo">cancel</button></span>';
+    slot.innerHTML = "<span>" + esc(where) + "</span>" +
+      '<button class="ghost icon ok" id="diskYes" title="send the new sizes">grow</button>' +
+      '<button class="ghost icon no" id="diskNo" title="discard the change">cancel</button>';
+    apply.style.display = "none";
+  }
+
+  // The delta belongs to the row it changes, so the operator sees which disk is
+  // about to grow without reading a sentence.
+  function renderDiskDeltas(p) {
+    var rows = document.querySelectorAll("#diskRows .diskrow");
+    for (var i = 0; i < rows.length; i++) {
+      var input = rows[i].querySelector("input[data-disk]");
+      var delta = rows[i].querySelector(".delta");
+      if (!input || !delta) { continue; }
+      var key = input.getAttribute("data-disk"), cur = 0;
+      if (key === "os") {
+        cur = p.flavor.osDiskGB || 0;
+      } else {
+        (p.flavor.disks || []).forEach(function (d) {
+          if (String(d.unitNumber) === key) { cur = d.sizeGB; }
+        });
+      }
+      var want = parseInt(input.value, 10);
+      if (!state.diskDraft || input.disabled || isNaN(want) || want === cur || want <= 0) {
+        delta.textContent = "";
+        delta.className = "delta";
+        continue;
+      }
+      delta.textContent = want > cur ? "+" + (want - cur) + " GB" : (want - cur) + " GB";
+      delta.className = "delta changed";
+    }
   }
 
   function updateDiskButtons(p) {
     var plan = state.diskDraft ? diskPlan(p) : null;
     var ready = !!plan && !plan.err && plan.changed;
     document.getElementById("applyDisks").disabled = !ready || !isAdmin();
+    renderDiskDeltas(p);
     renderDiskHint(p);
     renderDiskConfirm(p);
   }
