@@ -260,13 +260,14 @@ func (r *WorkerPoolReconciler) reconcile(ctx context.Context, before, pool *infr
 	// Named deletions (spec.scaleDown.deleteWorkers and the per-node
 	// annotation) run before the replica arithmetic: deleting a specific
 	// worker must not be read as a scale-up.
-	if handled, res, err := r.reconcileDeletions(ctx, pool, alloc); handled {
-		if err != nil {
-			logger.Error(err, "worker deletion failed", "pool", pool.Name)
-			r.setCondition(pool, metav1.ConditionFalse, "ScaleDownFailed", err.Error())
-			return res, err
+	deletionsHandled, deletionsRes, deletionsErr := r.reconcileDeletions(ctx, pool, alloc)
+	if deletionsHandled {
+		if deletionsErr != nil {
+			logger.Error(deletionsErr, "worker deletion failed", "pool", pool.Name)
+			r.setCondition(pool, metav1.ConditionFalse, "ScaleDownFailed", deletionsErr.Error())
+			return deletionsRes, deletionsErr
 		}
-		return res, nil
+		return deletionsRes, nil
 	}
 
 	if handled, res, err := r.reconcileMissing(ctx, pool, alloc); handled {
@@ -347,6 +348,14 @@ func (r *WorkerPoolReconciler) reconcile(ctx context.Context, before, pool *infr
 
 	requeue := requeueConverged
 	if condStatus != metav1.ConditionTrue {
+		requeue = requeueProgressing
+	}
+	// A removal the guard refused is the last word on this pass's condition:
+	// the readiness evaluation above would otherwise report the pool as
+	// converged and hide a request that is still waiting for a human.
+	var refused removalRefused
+	if errors.As(deletionsErr, &refused) {
+		r.setCondition(pool, metav1.ConditionFalse, refused.reason, refused.msg)
 		requeue = requeueProgressing
 	}
 	return ctrl.Result{RequeueAfter: requeue}, nil

@@ -21,6 +21,17 @@ import (
 	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/kube"
 )
 
+// removalRefused is the guard stopping a removal before anything was touched.
+// It is not a failure of the pass: the rest of the reconcile (a scale-up, for
+// instance) still has to run, and the condition is re-applied at the end so the
+// readiness pass cannot hide it.
+type removalRefused struct {
+	reason string
+	msg    string
+}
+
+func (e removalRefused) Error() string { return e.msg }
+
 const (
 	// ReplaceWorkerAnnotation marks a Node for replacement on the next
 	// reconcile:
@@ -197,6 +208,8 @@ func (r *WorkerPoolReconciler) reconcileWithdrawnDeletions(ctx context.Context, 
 // returns. Draining is a minutes-long operation; one step per pass keeps the
 // work queue free and makes progress visible in status.
 func (r *WorkerPoolReconciler) runDeletions(ctx context.Context, pool *infrav1.K8sWorkerPool, alloc *ipam.Allocator, requests []deletionRequest) (bool, ctrl.Result, error) {
+	progressed, refused := false, false
+	var refusedAt removalRefused
 	for _, req := range requests {
 		idx := nodeIndex(pool.Status.Nodes, req.name)
 		if idx < 0 {
@@ -215,9 +228,23 @@ func (r *WorkerPoolReconciler) runDeletions(ctx context.Context, pool *infrav1.K
 			continue
 		}
 		finished, res, err := r.deleteWorkerStep(ctx, pool, alloc, idx, req)
+		var refusedErr removalRefused
+		if errors.As(err, &refusedErr) {
+			// The guard refused this one. That is not a reason to abandon the
+			// pass: a pool short of its replica count for an unrelated reason
+			// (a worker removed by a replacement a moment ago) still has to be
+			// scaled up, and a refusal must not starve that.
+			refused = true
+			refusedAt = refusedErr
+			continue
+		}
 		if err != nil || !finished {
 			return true, res, err
 		}
+		progressed = true
+	}
+	if !progressed && refused {
+		return false, ctrl.Result{RequeueAfter: requeueConverged}, refusedAt
 	}
 	return true, ctrl.Result{RequeueAfter: deleteStepRequeue}, nil
 }
@@ -277,7 +304,7 @@ func (r *WorkerPoolReconciler) deleteWorkerStep(ctx context.Context, pool *infra
 			node.Message = msg
 			r.setCondition(pool, metav1.ConditionFalse, reason, msg)
 			r.eventf(pool, corev1.EventTypeWarning, reason, msg)
-			return true, ctrl.Result{RequeueAfter: requeueConverged}, nil
+			return false, ctrl.Result{RequeueAfter: requeueConverged}, removalRefused{reason: reason, msg: msg}
 		}
 	}
 

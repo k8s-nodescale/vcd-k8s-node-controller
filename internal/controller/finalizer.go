@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -100,6 +101,12 @@ func (r *WorkerPoolReconciler) reconcilePoolDeletion(ctx context.Context, pool *
 	}
 	req := deletionRequest{name: nodes[0].Name, force: force, finalizer: true}
 	_, res, err := r.deleteWorkerStep(ctx, pool, alloc, 0, req)
+	// A refusal here is a condition, not a failed pass: the pool keeps its
+	// finalizer and says why, and the next pass tries again.
+	var refused removalRefused
+	if errors.As(err, &refused) {
+		return ctrl.Result{RequeueAfter: requeueConverged}, nil
+	}
 	return res, err
 }
 
