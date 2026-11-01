@@ -207,7 +207,7 @@
      disk it belongs to, and the confirmation shares the line of the apply
      button instead of adding a box below it. */
   .disks-actions { justify-content: flex-end; min-height: 32px; }
-  .disk-confirm { display: inline-flex; align-items: center; gap: 8px; margin-right: auto;
+  .disk-confirm { display: inline-flex; align-items: center; gap: 8px;
                   font-size: 12px; color: var(--muted); }
   .flavor .fl.diskrow .delta { font-size: 11px; color: var(--muted); white-space: nowrap; }
   .flavor .fl.diskrow .delta.changed { color: var(--fg); }
@@ -658,6 +658,17 @@
     return rows;
   }
 
+  // currentDiskSize is the size in the spec for one row: "os" or a unit number.
+  function currentDiskSize(p, key) {
+    if (!p) { return 0; }
+    if (key === "os") { return p.flavor.osDiskGB || 0; }
+    var disks = p.flavor.disks || [];
+    for (var i = 0; i < disks.length; i++) {
+      if (String(disks[i].unitNumber) === key) { return disks[i].sizeGB; }
+    }
+    return 0;
+  }
+
   // diskPlan turns the draft into a request. An error means "not sendable";
   // changed=false means the numbers already match the spec, which is shown by
   // the apply button staying disabled rather than by a message.
@@ -758,14 +769,7 @@
       var input = rows[i].querySelector("input[data-disk]");
       var delta = rows[i].querySelector(".delta");
       if (!input || !delta) { continue; }
-      var key = input.getAttribute("data-disk"), cur = 0;
-      if (key === "os") {
-        cur = p.flavor.osDiskGB || 0;
-      } else {
-        (p.flavor.disks || []).forEach(function (d) {
-          if (String(d.unitNumber) === key) { cur = d.sizeGB; }
-        });
-      }
+      var key = input.getAttribute("data-disk"), cur = currentDiskSize(p, key);
       var want = parseInt(input.value, 10);
       if (!state.diskDraft || input.disabled || isNaN(want) || want === cur || want <= 0) {
         delta.textContent = "";
@@ -801,17 +805,12 @@
     for (var i = 0; i < inputs.length; i++) {
       var key = inputs[i].getAttribute("data-disk");
       inputs[i].disabled = !change.checked;
-      var current = "";
-      if (key === "os") {
-        current = p.flavor.osDiskGB || "";
-      } else {
-        var disks = p.flavor.disks || [];
-        for (var j = 0; j < disks.length; j++) {
-          if (String(disks[j].unitNumber) === key) { current = disks[j].sizeGB; }
-        }
-      }
+      var current = currentDiskSize(p, key);
+      // The stepper stops at the current size: a disk cannot shrink, so the
+      // arrows can only take the number up and back down to where it started.
+      inputs[i].min = current > 0 ? current : 1;
       var drafted = state.diskDraft && state.diskDraft[key] != null ? state.diskDraft[key] : null;
-      inputs[i].value = drafted != null ? drafted : current;
+      inputs[i].value = drafted != null ? drafted : (current || "");
     }
 
     document.getElementById("diskActions").style.display = admin ? "" : "none";
@@ -1189,6 +1188,23 @@
     state.pendingDisks = null;
     state.pendingPlan = null;
     updateDiskButtons(state.current);
+  });
+
+  // Typing a smaller number is corrected on blur rather than on every key: the
+  // field has to stay usable while somebody is halfway through "25".
+  document.getElementById("diskRows").addEventListener("change", function (ev) {
+    var t = ev.target;
+    if (!t || !t.getAttribute || !t.getAttribute("data-disk") || !state.diskDraft) { return; }
+    var key = t.getAttribute("data-disk");
+    var cur = currentDiskSize(state.current, key);
+    var v = parseInt(t.value, 10);
+    if (isNaN(v) || v < cur) {
+      t.value = cur || "";
+      state.diskDraft[key] = cur || "";
+      state.pendingDisks = null;
+      state.pendingPlan = null;
+      updateDiskButtons(state.current);
+    }
   });
 
   document.getElementById("applyDisks").addEventListener("click", function () {
