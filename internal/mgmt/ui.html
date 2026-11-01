@@ -734,9 +734,13 @@
       return;
     }
     var plan = state.pendingPlan;
+    var where = " (no workers yet)";
+    if (plan.workers > 0) {
+      where = " on " + plan.workers + (plan.workers === 1 ? " worker" : " workers") +
+        (plan.total > 0 ? ", +" + plan.total + " GB total" : "");
+    }
     box.className = "confirmbox on";
-    box.innerHTML = "<span>" + "grow " + esc(plan.parts.join(", ")) + " on " + plan.workers +
-      " worker(s), +" + plan.total + " GB total?" + "</span>" +
+    box.innerHTML = "<span>" + "grow " + esc(plan.parts.join(", ")) + esc(where) + "?" + "</span>" +
       '<span><button class="ghost icon ok" id="diskYes">grow</button> ' +
       '<button class="ghost icon no" id="diskNo">cancel</button></span>';
   }
