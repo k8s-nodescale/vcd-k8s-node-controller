@@ -10,9 +10,20 @@ design doc).
 
 ## Status
 
-Working end to end on a dev tenant (vCD, NSX-V): adding a replica to a
-`K8sWorkerPool` creates a VM, lays out its data disks, boots the guest, joins it
-to the cluster and reports it Ready - about five minutes per worker.
+**0.17.0 is the first production-ready build.** The worker lifecycle, the
+management page, the capacity snapshot and the address windows are signed off and
+verified on a dev cluster (vCD, NSX-V): adding a replica to a `K8sWorkerPool`
+creates a VM, lays out and grows its disks, boots the guest, joins it to the
+cluster and reports it Ready - about five minutes per worker.
+
+### How work lands from here
+
+One branch per feature, cut from `main`, named for what it delivers
+(`vsphere-provider`, `admission-webhook`, ...). A feature is merged into `main`
+only when it is complete and has been tested on the dev cluster; `main` stays the
+released baseline, and no half-finished feature is committed to it. Releases are
+tagged from `main` (`v0.17.0`, ...), and the chart on GitHub Pages is built from
+that tag.
 
 Implemented:
 
