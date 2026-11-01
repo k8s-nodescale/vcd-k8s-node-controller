@@ -616,12 +616,21 @@ spec:
                             other compute change and a reduction is a recreate.
                           items:
                             properties:
+                              busNumber:
+                                description: |-
+                                  BusNumber and UnitNumber address the disk on its controller. Both are
+                                  needed: the provider matches a spec disk to a platform disk by the pair.
+                                format: int32
+                                type: integer
                               sizeGB:
                                 format: int32
                                 type: integer
                               unitNumber:
                                 format: int32
                                 type: integer
+                            required:
+                            - sizeGB
+                            - unitNumber
                             type: object
                           type: array
                         memoryMB:

@@ -79,17 +79,24 @@ func TestDataDiskShrinkNeedsRecreate(t *testing.T) {
 	}
 }
 
-// The provider is told which disks to grow, with sizes and unit numbers only.
-func TestResizeDisksSkipsUnsetSizes(t *testing.T) {
+// The provider matches a spec disk to a platform disk by bus and unit, so both
+// have to survive the conversion. A zero bus number matched nothing on the
+// first live grow (0.14.1).
+func TestResizeDisksKeepsTheBusNumber(t *testing.T) {
 	got := resizeDisks([]infrav1.DiskStatus{
-		{UnitNumber: 1, SizeGB: 10},
-		{UnitNumber: 2, SizeGB: 0},
-		{UnitNumber: 3, SizeGB: 30},
+		{BusNumber: 1, UnitNumber: 0, SizeGB: 10},
+		{BusNumber: 1, UnitNumber: 1, SizeGB: 0},
+		{BusNumber: 1, UnitNumber: 2, SizeGB: 30},
 	})
 	if len(got) != 2 {
 		t.Fatalf("%d disks, want 2: a zero size is not a request", len(got))
 	}
-	if got[0].UnitNumber != 1 || got[0].SizeGB != 10 || got[1].UnitNumber != 3 {
-		t.Fatalf("unexpected disks: %#v", got)
+	for i, want := range []infrav1.DiskStatus{
+		{BusNumber: 1, UnitNumber: 0, SizeGB: 10},
+		{BusNumber: 1, UnitNumber: 2, SizeGB: 30},
+	} {
+		if got[i].BusNumber != want.BusNumber || got[i].UnitNumber != want.UnitNumber || got[i].SizeGB != want.SizeGB {
+			t.Fatalf("disk %d = %#v, want %#v", i, got[i], want)
+		}
 	}
 }

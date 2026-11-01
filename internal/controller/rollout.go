@@ -145,15 +145,18 @@ func compareFlavor(have, want *infrav1.FlavorStatus) flavorDelta {
 }
 
 // resizeDisks turns the wanted data disks into what the provider needs to grow
-// them. The bus number is not part of the status: disks are addressed by unit
-// within the single SCSI controller the template defines.
+// them. Both numbers are passed on: the provider matches a spec disk to a
+// platform disk by bus and unit, and a zero bus number matches nothing on a
+// template whose disks sit on bus 1 (found on the first live grow, 0.14.1).
 func resizeDisks(disks []infrav1.DiskStatus) []cloud.DiskSpec {
 	out := make([]cloud.DiskSpec, 0, len(disks))
 	for _, d := range disks {
 		if d.SizeGB <= 0 {
 			continue
 		}
-		out = append(out, cloud.DiskSpec{UnitNumber: d.UnitNumber, SizeGB: d.SizeGB})
+		out = append(out, cloud.DiskSpec{
+			BusNumber: d.BusNumber, UnitNumber: d.UnitNumber, SizeGB: d.SizeGB,
+		})
 	}
 	return out
 }
@@ -169,7 +172,9 @@ func flavorOf(vm cloud.VM) *infrav1.FlavorStatus {
 		Template: vm.Template,
 	}
 	for _, d := range vm.DataDisks {
-		out.Disks = append(out.Disks, infrav1.DiskStatus{UnitNumber: d.UnitNumber, SizeGB: d.SizeGB})
+		out.Disks = append(out.Disks, infrav1.DiskStatus{
+			BusNumber: d.BusNumber, UnitNumber: d.UnitNumber, SizeGB: d.SizeGB,
+		})
 	}
 	return out
 }
@@ -253,7 +258,9 @@ func (r *WorkerPoolReconciler) reconcileRollout(ctx context.Context, pool *infra
 		Template: pool.Spec.Flavor.Template,
 	}
 	for _, d := range pool.Spec.Flavor.Disks {
-		target.Disks = append(target.Disks, infrav1.DiskStatus{UnitNumber: d.UnitNumber, SizeGB: d.SizeGB})
+		target.Disks = append(target.Disks, infrav1.DiskStatus{
+			BusNumber: d.BusNumber, UnitNumber: d.UnitNumber, SizeGB: d.SizeGB,
+		})
 	}
 
 	inFlight := rolloutInFlight(pool)

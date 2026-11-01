@@ -581,6 +581,10 @@ type FlavorStatus struct {
 
 // DiskStatus is one data disk of a worker, as the platform reports it.
 type DiskStatus struct {
+	// BusNumber and UnitNumber address the disk on its controller. Both are
+	// needed: the provider matches a spec disk to a platform disk by the pair,
+	// and a missing bus number silently matches nothing.
+	BusNumber  int32 `json:"busNumber,omitempty"`
 	UnitNumber int32 `json:"unitNumber"`
 	SizeGB     int32 `json:"sizeGB"`
 }
