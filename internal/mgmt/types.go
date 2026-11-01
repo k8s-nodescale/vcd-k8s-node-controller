@@ -146,7 +146,13 @@ type Pool struct {
 	IPWindowSize int32  `json:"ipWindowSize,omitempty"`
 	IPWindowUsed int32  `json:"ipWindowUsed,omitempty"`
 	IPWindowDecl bool   `json:"ipWindowDeclared,omitempty"`
-	Nodes        []Node `json:"nodes"`
+	// What is left of the network after every pool's window: the gaps, and the
+	// first place a new pool can start with the default window. The page shows
+	// it so an operator adding a pool does not have to do address arithmetic.
+	IPFree    []string `json:"ipFree,omitempty"`
+	IPSuggest string   `json:"ipSuggest,omitempty"`
+	IPNoGap   bool     `json:"ipNoGap,omitempty"`
+	Nodes     []Node   `json:"nodes"`
 	// Warning carries the first condition message when the pool is not
 	// converged, so the page can say why without the operator opening kubectl.
 	Warning string `json:"warning,omitempty"`

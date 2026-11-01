@@ -582,10 +582,18 @@
     var share = Math.min(100, used / size * 100);
     var lvl = share >= 90 ? "high" : share >= 80 ? "warn" : "ok";
     var range = p.ipWindowFrom + " - " + p.ipWindowTo;
-    var note = p.ipWindowDeclared
-      ? '<div class="capnote">window ' + esc(range) + " for this pool; another pool may own the rest of " +
-        esc(p.ipNetwork) + "</div>"
-      : "";
+    var note = '<div class="capnote">window ' + esc(range) + " of " + esc(p.ipNetwork) +
+      " belongs to this pool</div>";
+    if (p.ipSuggest) {
+      note += '<div class="capnote" title="' +
+        esc("free in " + p.ipNetwork + ": " + (p.ipFree || []).join(", ")) + '">next free window: ' +
+        esc(p.ipSuggest) + "</div>";
+    } else if (p.ipNoGap) {
+      note += '<div class="capnote warn">no free addresses left in ' + esc(p.ipNetwork) +
+        " for another pool</div>";
+    } else if (p.ipFree && p.ipFree.length) {
+      note += '<div class="capnote">free in ' + esc(p.ipNetwork) + ": " + esc(p.ipFree.join(", ")) + "</div>";
+    }
     return '<div class="caprow pod"><span class="caplbl">NODE IPS ' + esc(p.ipNetwork) + "</span></div>" +
       '<div class="caprow podbar" title="' + esc(range + " - " + used + " of " + size + " addresses used") + '">' +
         '<span class="dbar d-' + lvl + '"><i style="width:' + share.toFixed(1) + '%"></i></span>' +

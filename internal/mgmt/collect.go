@@ -3,6 +3,7 @@ package mgmt
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"net/netip"
 	"sort"
 	"strings"
@@ -131,9 +132,16 @@ func (c *Collector) collectPools(ctx context.Context) ([]Pool, error) {
 		real = c.metricsUsage(ctx)
 	}
 
+	spaces := buildAddressSpaces(pools.Items)
 	out := make([]Pool, 0, len(pools.Items))
 	for i := range pools.Items {
-		out = append(out, c.poolView(ctx, &pools.Items[i], byNode, used, volumes, exporters, real))
+		view := c.poolView(ctx, &pools.Items[i], byNode, used, volumes, exporters, real)
+		if sp, ok := spaces[pools.Items[i].Spec.IPPlan.CIDR]; ok {
+			view.IPFree = sp.free
+			view.IPSuggest = sp.suggest
+			view.IPNoGap = len(sp.free) == 0
+		}
+		out = append(out, view)
 	}
 	sort.Slice(out, func(i, j int) bool {
 		return out[i].Name < out[j].Name
@@ -169,6 +177,115 @@ func ipWindow(plan infrav1.IPPlan) (from, to string, size int32, declared bool) 
 		return netip.AddrFrom4(out).String()
 	}
 	return addr(start), addr(last), int32(last - start + 1), true
+}
+
+// defaultWindow is the CRD default for spec.ipPlan.nodeCount: what a pool gets
+// when the operator does not say otherwise, and therefore what the suggestion
+// assumes.
+const defaultWindow = 10
+
+// minSuggest is the smallest gap the page will propose as a new pool: one free
+// address is noise, not a suggestion.
+const minSuggest = 2
+
+// addressSpace is what is left of one CIDR after the windows of every pool on
+// it: the gaps, and a suggestion for the next pool.
+type addressSpace struct {
+	free    []string
+	suggest string
+}
+
+// buildAddressSpaces groups pools by CIDR and computes the gaps between their
+// windows. It deliberately ignores the infrastructure addresses below the first
+// window (gateway, VIPs, masters): those are never a candidate for a new pool.
+func buildAddressSpaces(pools []infrav1.K8sWorkerPool) map[string]addressSpace {
+	type span struct {
+		pool       int
+		start, end int64
+	}
+	byCIDR := map[string][]span{}
+	totalOf := map[string]int64{}
+	prefixOf := map[string]netip.Prefix{}
+
+	for i := range pools {
+		plan := pools[i].Spec.IPPlan
+		prefix, err := netip.ParsePrefix(plan.CIDR)
+		if err != nil || !prefix.Addr().Is4() || plan.NodeCount < 1 {
+			continue
+		}
+		prefix = prefix.Masked()
+		total := int64(1) << uint(32-prefix.Bits())
+		start := int64(plan.WNodeOffset)
+		if start < 0 {
+			start = 0
+		}
+		end := start + int64(plan.NodeCount) - 1
+		if end > total-2 {
+			end = total - 2
+		}
+		if end < start {
+			continue
+		}
+		byCIDR[plan.CIDR] = append(byCIDR[plan.CIDR], span{pool: i, start: start, end: end})
+		totalOf[plan.CIDR] = total
+		prefixOf[plan.CIDR] = prefix
+	}
+
+	out := map[string]addressSpace{}
+	for cidr, spans := range byCIDR {
+		sort.Slice(spans, func(i, j int) bool { return spans[i].start < spans[j].start })
+		first := spans[0].start
+		last := totalOf[cidr] - 2
+		var gaps [][2]int64
+		cursor := first
+		for _, sp := range spans {
+			if sp.start > cursor {
+				gaps = append(gaps, [2]int64{cursor, sp.start - 1})
+			}
+			if sp.end+1 > cursor {
+				cursor = sp.end + 1
+			}
+		}
+		if cursor <= last {
+			gaps = append(gaps, [2]int64{cursor, last})
+		}
+
+		addr := func(off int64) string {
+			b := prefixOf[cidr].Addr().As4()
+			v := uint32(int64(binary.BigEndian.Uint32(b[:])) + off)
+			var o [4]byte
+			binary.BigEndian.PutUint32(o[:], v)
+			return netip.AddrFrom4(o).String()
+		}
+		sp := addressSpace{}
+		for _, g := range gaps {
+			sp.free = append(sp.free, addr(g[0])+" - "+addr(g[1]))
+		}
+		// The first gap that holds a default-sized pool, otherwise the largest
+		// one that can hold at least two workers: a suggestion that does not fit,
+		// or that describes a single address, would be worse than none.
+		best := -1
+		bestSize := int64(0)
+		for i, g := range gaps {
+			size := g[1] - g[0] + 1
+			if size >= defaultWindow {
+				best = i
+				break
+			}
+			if size >= minSuggest && size > bestSize {
+				best, bestSize = i, size
+			}
+		}
+		if best >= 0 {
+			count := gaps[best][1] - gaps[best][0] + 1
+			if count > defaultWindow {
+				count = defaultWindow
+			}
+			sp.suggest = fmt.Sprintf("wNodeOffset %d, nodeCount %d", gaps[best][0], count)
+		}
+		out[cidr] = sp
+	}
+	return out
 }
 
 func (c *Collector) poolView(ctx context.Context, p *infrav1.K8sWorkerPool, byNode map[string]*corev1.Node,
