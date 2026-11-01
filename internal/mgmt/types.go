@@ -122,6 +122,18 @@ type Flavor struct {
 	MemoryMB int32  `json:"memoryMB"`
 	OSDiskGB int32  `json:"osDiskGB,omitempty"`
 	Template string `json:"template,omitempty"`
+	// Disks are the data disks of the pool's spec, by unit number. The page
+	// edits their sizes, so it needs the current values and the identity the
+	// controller uses.
+	Disks []FlavorDisk `json:"disks,omitempty"`
+}
+
+// FlavorDisk is one data disk of the pool's flavor.
+type FlavorDisk struct {
+	BusNumber  int32  `json:"busNumber"`
+	UnitNumber int32  `json:"unitNumber"`
+	Mount      string `json:"mount,omitempty"`
+	SizeGB     int32  `json:"sizeGB"`
 }
 
 // Pool is everything the page needs about one pool.

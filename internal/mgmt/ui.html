@@ -198,6 +198,17 @@
   .flavor .fl { display: flex; gap: 10px; font-size: 13px; }
   .flavor .fl span { color: var(--muted); min-width: 68px; }
   .flavor .fl b { font-weight: 600; font-variant-numeric: tabular-nums; }
+  /* the disk editor: the same sheet as the flavour, with the current size and a
+     "new value" input that stays dead until "change" is ticked */
+  .disks-title { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  .flag.change { display: inline-flex; align-items: center; gap: 6px; margin: 0;
+                 text-transform: none; letter-spacing: 0; font-size: 11px;
+                 color: var(--muted); cursor: pointer; }
+  .flag.change input { accent-color: var(--accent); margin: 0; }
+  .flavor .fl.diskrow { align-items: center; gap: 8px; }
+  .flavor .fl.diskrow input { width: 76px; padding: 2px 6px; font-size: 12px; }
+  .flavor .fl.diskrow input:disabled { opacity: .40; }
+  .disks-actions { justify-content: flex-end; }
   /* the pool is not being reconciled: impossible to miss */
   .banner { margin-top: 12px; display: none; border: 1px solid var(--warn);
             border-left: 4px solid var(--warn); border-radius: 8px;
@@ -277,6 +288,18 @@
           <button id="setFlavor" title="send this flavor to the controller">apply flavor</button>
         </div>
         <div class="small muted" id="flavorHint" style="margin-top:6px"></div>
+
+        <div class="pane-title disks-title" style="margin-top:14px">
+          <span>disks &middot; resize</span>
+          <label class="flag change" title="unlock the size fields">
+            <span>change</span><input type="checkbox" id="diskChange">
+          </label>
+        </div>
+        <div class="flavor" id="diskRows"><span class="small muted">loading&hellip;</span></div>
+        <div class="row disks-actions" id="diskActions" style="margin-top:10px">
+          <button id="applyDisks" disabled title="grow the disks; this asks for confirmation">apply</button>
+        </div>
+        <div class="small muted" id="diskHint" style="margin-top:6px"></div>
       </div>
       <div class="pane" id="replicasPane">
         <div class="pane-title">replicas &middot; scale-in / out</div>
@@ -340,7 +363,7 @@
     }
   } catch (e) {}
   var state = { pools: [], current: null, stamp: "", stale: false, me: null, draft: null,
-                flavorDraft: null, pendingDelete: null,
+                flavorDraft: null, pendingDelete: null, diskDraft: null, pendingDisks: null,
                 flags: { taints: false, volumes: false, sts: false, dense: false } };
   var pick = document.getElementById("poolPick");
 
@@ -601,6 +624,132 @@
       "</div>" + note;
   }
 
+  // The disk editor. Sizes are edited as a draft and only reach the CRD through
+  // "apply", which asks first: a disk cannot shrink, and the change restarts
+  // every worker of the pool one at a time.
+  function diskRows(p) {
+    var rows = '<div class="fl diskrow"><span>OS</span><b>' + esc(p.flavor.osDiskGB || "–") +
+      '</b><input type="number" min="1" step="1" data-disk="os" title="new size of the system disk, GB" disabled></div>';
+    (p.flavor.disks || []).forEach(function (d) {
+      rows += '<div class="fl diskrow"><span>' + esc(d.mount || ("unit " + d.unitNumber)) + "</span><b>" +
+        esc(d.sizeGB) + '</b><input type="number" min="1" step="1" data-disk="' + esc(d.unitNumber) +
+        '" title="new size, GB" disabled></div>';
+    });
+    return rows;
+  }
+
+  // diskPlan turns the draft into a request and refuses what the platform cannot
+  // do: a smaller disk is not a resize, it is a new VM.
+  function diskPlan(p) {
+    var d = state.diskDraft;
+    if (!d) { return null; }
+    var body = { disks: [] }, perWorker = 0, parts = [];
+    var size = function (v) { var n = parseInt(v, 10); return isNaN(n) ? null : n; };
+
+    if (d.os != null && d.os !== "") {
+      var os = size(d.os);
+      if (os == null || os <= 0) { return { err: "the OS disk needs a size" }; }
+      if (os < (p.flavor.osDiskGB || 0)) {
+        return { err: "the OS disk cannot shrink from " + p.flavor.osDiskGB + " GB; replace the worker instead" };
+      }
+      if (os !== p.flavor.osDiskGB) {
+        body.osDiskGB = os;
+        perWorker += os - (p.flavor.osDiskGB || 0);
+        parts.push("OS " + (p.flavor.osDiskGB || 0) + " -> " + os + " GB");
+      }
+    }
+
+    var disks = p.flavor.disks || [];
+    for (var i = 0; i < disks.length; i++) {
+      var disk = disks[i], key = String(disk.unitNumber);
+      if (d[key] == null || d[key] === "") { continue; }
+      var want = size(d[key]);
+      var where = disk.mount || ("unit " + disk.unitNumber);
+      if (want == null || want <= 0) { return { err: where + " needs a size" }; }
+      if (want < disk.sizeGB) {
+        return { err: where + " cannot shrink from " + disk.sizeGB + " GB; replace the worker instead" };
+      }
+      if (want !== disk.sizeGB) {
+        body.disks.push({ busNumber: disk.busNumber, unitNumber: disk.unitNumber, sizeGB: want });
+        perWorker += want - disk.sizeGB;
+        parts.push(where + " " + disk.sizeGB + " -> " + want + " GB");
+      }
+    }
+
+    if (!body.osDiskGB && body.disks.length === 0) { return { err: "nothing changed" }; }
+
+    var workers = p.replicas || (p.nodes || []).length;
+    var plan = { body: body, parts: parts, perWorker: perWorker, workers: workers, total: perWorker * workers, note: "" };
+    var c = p.capacity;
+    if (c && c.storageLimitMB > 0) {
+      var freeGB = Math.floor((c.storageLimitMB - c.storageMB) / 1024);
+      if (plan.total > freeGB) {
+        return { err: "not enough storage: the change needs " + plan.total + " GB across " + workers +
+          " worker(s), the storage profile has " + freeGB + " GB free" };
+      }
+      plan.note = ", " + freeGB + " GB free in " + (c.storageName || "the storage profile");
+    } else {
+      plan.note = "; storage capacity unknown, the controller will queue the rollout if it does not fit";
+    }
+    return plan;
+  }
+
+  function renderDiskHint(p) {
+    var hint = document.getElementById("diskHint");
+    if (!hint || !p) { return; }
+    hint.className = "small muted";
+    if (state.pendingDisks) {
+      var plan = state.pendingPlan || { parts: [], workers: 0, total: 0 };
+      hint.innerHTML = '<span class="confirm">grow ' + esc(plan.parts.join(", ")) + " on " + plan.workers +
+        " worker(s), +" + plan.total + " GB in total? every worker restarts one at a time. </span>" +
+        '<button class="icon" id="diskYes">grow</button> <button class="icon ghost" id="diskNo">cancel</button>';
+      return;
+    }
+    if (!state.diskDraft) {
+      hint.textContent = "tick change to edit the sizes; a disk cannot shrink, only grow";
+      return;
+    }
+    var plan2 = diskPlan(p);
+    if (!plan2) { return; }
+    if (plan2.err) {
+      hint.innerHTML = '<span class="confirm">' + esc(plan2.err) + "</span>";
+      return;
+    }
+    hint.textContent = "will grow " + plan2.parts.join(", ") + " on " + plan2.workers + " worker(s), +" +
+      plan2.total + " GB" + plan2.note;
+  }
+
+  function renderDisks(p) {
+    var box = document.getElementById("diskRows");
+    if (!box) { return; }
+    if (!p) { box.innerHTML = ""; return; }
+    var admin = isAdmin();
+    box.innerHTML = diskRows(p);
+
+    var change = document.getElementById("diskChange");
+    change.disabled = !admin;
+    change.checked = !!state.diskDraft;
+
+    var inputs = box.querySelectorAll("input[data-disk]");
+    for (var i = 0; i < inputs.length; i++) {
+      var key = inputs[i].getAttribute("data-disk");
+      inputs[i].disabled = !change.checked;
+      var current = key === "os" ? (p.flavor.osDiskGB || "") : "";
+      if (key !== "os") {
+        var disks = p.flavor.disks || [];
+        for (var j = 0; j < disks.length; j++) {
+          if (String(disks[j].unitNumber) === key) { current = disks[j].sizeGB; }
+        }
+      }
+      var drafted = state.diskDraft && state.diskDraft[key] != null ? state.diskDraft[key] : null;
+      inputs[i].value = drafted != null ? drafted : current;
+    }
+
+    document.getElementById("applyDisks").disabled = !change.checked || !admin;
+    document.getElementById("diskActions").style.display = admin ? "" : "none";
+    renderDiskHint(p);
+  }
+
   function renderCapacity(p) {
     var box = document.getElementById("capRows");
     var c = p && p.capacity;
@@ -711,6 +860,7 @@
 
     renderCapacity(p);
     renderWorkers();
+    renderDisks(p);
     alignPanes();
   }
 
@@ -953,6 +1103,53 @@
     state.flags[t.getAttribute("data-flag")] = t.checked;
     try { localStorage.setItem("nodescale-ui-nodeinfo", JSON.stringify(state.flags)); } catch (e) {}
     render();
+  });
+
+  document.getElementById("diskChange").addEventListener("change", function (ev) {
+    state.diskDraft = ev.target.checked ? {} : null;
+    state.pendingDisks = null;
+    state.pendingPlan = null;
+    renderDisks(state.current);
+  });
+
+  document.getElementById("diskRows").addEventListener("input", function (ev) {
+    var t = ev.target;
+    if (!t || !t.getAttribute || !t.getAttribute("data-disk") || !state.diskDraft) { return; }
+    state.diskDraft[t.getAttribute("data-disk")] = t.value;
+    state.pendingDisks = null;
+    state.pendingPlan = null;
+    renderDiskHint(state.current);
+  });
+
+  document.getElementById("applyDisks").addEventListener("click", function () {
+    var p = state.current;
+    if (!p) { return; }
+    var plan = diskPlan(p);
+    if (!plan || plan.err) {
+      toast((plan && plan.err) || "nothing to apply", true);
+      return;
+    }
+    state.pendingDisks = plan.body;
+    state.pendingPlan = plan;
+    renderDiskHint(p);
+  });
+
+  document.getElementById("diskHint").addEventListener("click", function (ev) {
+    var t = ev.target;
+    if (!t || !t.id) { return; }
+    if (t.id === "diskNo") {
+      state.pendingDisks = null;
+      state.pendingPlan = null;
+      renderDiskHint(state.current);
+      return;
+    }
+    if (t.id === "diskYes") {
+      var body = state.pendingDisks;
+      state.pendingDisks = null;
+      state.pendingPlan = null;
+      state.diskDraft = null;
+      post("disks", body);
+    }
   });
 
   document.getElementById("pools").addEventListener("change", function (ev) {

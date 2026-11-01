@@ -50,6 +50,11 @@ const (
 	flavorMixed
 	// flavorTemplate means the VM was cloned from another image.
 	flavorTemplate
+	// flavorDiskShrink means a disk in the platform is bigger than the spec.
+	// It is separated from the other shrinks because replacing the VM would
+	// destroy data somebody deliberately put there: a disk grown by hand in vCD
+	// must be reconciled by raising the spec, never by a silent recreate.
+	flavorDiskShrink
 )
 
 // String names the difference the way status and events report it.
@@ -63,6 +68,8 @@ func (d flavorDelta) String() string {
 		return "mixed"
 	case flavorTemplate:
 		return "template"
+	case flavorDiskShrink:
+		return "disk-shrink"
 	default:
 		return "equal"
 	}
@@ -74,6 +81,14 @@ func (d flavorDelta) String() string {
 // of power off and resize.
 func (d flavorDelta) needsRecreate() bool {
 	return d == flavorShrink || d == flavorMixed || d == flavorTemplate
+}
+
+// guarded reports a difference the controller refuses to apply by itself. A
+// disk that is bigger in the platform than in the spec is that case: it is what
+// a human who grew a disk in vCD by hand produces, and recreating the VM to
+// match the spec would throw the data away.
+func (d flavorDelta) guarded() bool {
+	return d == flavorDiskShrink
 }
 
 // recreateReason explains a delta that cannot be applied in place.
@@ -101,20 +116,22 @@ func compareFlavor(have, want *infrav1.FlavorStatus) flavorDelta {
 		// operating system itself would have to change.
 		return flavorTemplate
 	}
-	grow, shrink := false, false
-	cmp := func(h, w int32) {
+
+	// Disks are judged before CPU and memory, and a disk that is larger in the
+	// platform than in the spec is a guard rather than a recreate: a VM
+	// replaced to match a smaller spec loses whatever lives on that disk.
+	diskShrink, diskGrow := false, false
+	cmpDisk := func(h, w int32) {
 		if h <= 0 || w <= 0 || h == w {
 			return
 		}
-		if w > h {
-			grow = true
+		if h > w {
+			diskShrink = true
 		} else {
-			shrink = true
+			diskGrow = true
 		}
 	}
-	cmp(have.CPUs, want.CPUs)
-	cmp(have.MemoryMB, want.MemoryMB)
-	cmp(have.OSDiskGB, want.OSDiskGB)
+	cmpDisk(have.OSDiskGB, want.OSDiskGB)
 	// Data disks are matched by unit number, and a disk either side does not
 	// know about is "no opinion": an adopted worker whose disks the platform
 	// does not report must not turn into a rollout.
@@ -129,9 +146,27 @@ func compareFlavor(have, want *infrav1.FlavorStatus) flavorDelta {
 			continue
 		}
 		if h, ok := haveDisks[d.UnitNumber]; ok {
-			cmp(h, d.SizeGB)
+			cmpDisk(h, d.SizeGB)
 		}
 	}
+	if diskShrink {
+		return flavorDiskShrink
+	}
+
+	grow, shrink := diskGrow, false
+	cmp := func(h, w int32) {
+		if h <= 0 || w <= 0 || h == w {
+			return
+		}
+		if w > h {
+			grow = true
+		} else {
+			shrink = true
+		}
+	}
+	cmp(have.CPUs, want.CPUs)
+	cmp(have.MemoryMB, want.MemoryMB)
+
 	switch {
 	case grow && shrink:
 		return flavorMixed
@@ -177,6 +212,51 @@ func flavorOf(vm cloud.VM) *infrav1.FlavorStatus {
 		})
 	}
 	return out
+}
+
+// diskGuardMessage explains which disk is larger in vCD than in the spec, and
+// what the operator can do about it. It names the mount when the spec knows it,
+// because "unit 1" is not what someone reads in the page.
+func diskGuardMessage(pool *infrav1.K8sWorkerPool, guarded []int, target *infrav1.FlavorStatus) string {
+	const hint = " - raise spec.flavor.disks[].sizeGB to match, or shrink the disk in vCD; the worker is not recreated automatically"
+	parts := make([]string, 0, len(guarded))
+	for _, i := range guarded {
+		n := &pool.Status.Nodes[i]
+		if n.Flavor == nil {
+			continue
+		}
+		detail := ""
+		if target.OSDiskGB > 0 && n.Flavor.OSDiskGB > target.OSDiskGB {
+			detail = fmt.Sprintf("the OS disk is %d GB in vCD, the spec says %d GB", n.Flavor.OSDiskGB, target.OSDiskGB)
+		} else {
+			for _, h := range n.Flavor.Disks {
+				for _, w := range target.Disks {
+					if w.UnitNumber != h.UnitNumber || w.SizeGB <= 0 || h.SizeGB <= w.SizeGB {
+						continue
+					}
+					where := fmt.Sprintf("unit %d", h.UnitNumber)
+					for _, sd := range pool.Spec.Flavor.Disks {
+						if sd.UnitNumber == h.UnitNumber && sd.Mount != "" {
+							where = sd.Mount
+						}
+					}
+					detail = fmt.Sprintf("%s is %d GB in vCD, the spec says %d GB", where, h.SizeGB, w.SizeGB)
+					break
+				}
+				if detail != "" {
+					break
+				}
+			}
+		}
+		if detail == "" {
+			detail = "a disk is larger in vCD than in the spec"
+		}
+		parts = append(parts, n.Name+": "+detail)
+	}
+	if len(parts) == 0 {
+		return "a disk is larger in vCD than in the spec" + hint
+	}
+	return strings.Join(parts, "; ") + hint
 }
 
 func rolloutMaxUnavailable(pool *infrav1.K8sWorkerPool, workers int) int {
@@ -269,6 +349,7 @@ func (r *WorkerPoolReconciler) reconcileRollout(ctx context.Context, pool *infra
 	// leaves service either way - so both share one queue, and only the steps
 	// after the drain differ.
 	var pending []int
+	var guarded []int
 	deltas := make(map[int]flavorDelta)
 	for i := range pool.Status.Nodes {
 		n := &pool.Status.Nodes[i]
@@ -280,8 +361,28 @@ func (r *WorkerPoolReconciler) reconcileRollout(ctx context.Context, pool *infra
 		if d == flavorEqual {
 			continue
 		}
+		// A disk bigger in vCD than in the spec is refused, not repaired: the
+		// only repair is a new VM, which would destroy what lives on the disk.
+		// The pool says so and waits for a human to raise the spec (or to shrink
+		// the disk in vCD again).
+		if d.guarded() {
+			guarded = append(guarded, i)
+			continue
+		}
 		pending = append(pending, i)
 		deltas[i] = d
+	}
+
+	if len(guarded) > 0 {
+		msg := diskGuardMessage(pool, guarded, target)
+		r.setCondition(pool, metav1.ConditionFalse, "DiskLargerThanSpec", msg)
+		r.eventf(pool, corev1.EventTypeWarning, "DiskLargerThanSpec", msg)
+		if len(pending) == 0 && inFlight == 0 {
+			if pool.Status.Rollout.Phase != infrav1.RolloutPhaseIdle && pool.Status.Rollout.Phase != "" {
+				pool.Status.Rollout = infrav1.RolloutStatus{Phase: infrav1.RolloutPhaseIdle, Message: msg}
+			}
+			return true, ctrl.Result{RequeueAfter: requeueConverged}, nil
+		}
 	}
 
 	// A Failed slot is not in flight, but it may still be closable when the VM

@@ -7,8 +7,9 @@ import (
 )
 
 // A data disk is a compute dimension like CPU or memory: raising it in the spec
-// is a rollout, lowering it is a recreate, and a disk one side does not know
-// about is "no opinion" so adoption never turns into a rollout.
+// is a rollout, lowering it is... guarded. A disk that is bigger in the platform
+// than in the spec is what a hand-grown disk looks like, and recreating the VM
+// to match a smaller spec would destroy the data.
 func TestCompareFlavorWithDataDisks(t *testing.T) {
 	have := func(disks ...infrav1.DiskStatus) *infrav1.FlavorStatus {
 		return &infrav1.FlavorStatus{CPUs: 2, MemoryMB: 8192, OSDiskGB: 20, Disks: disks}
@@ -35,27 +36,47 @@ func TestCompareFlavorWithDataDisks(t *testing.T) {
 			name:  "a smaller data disk",
 			have:  have(infrav1.DiskStatus{UnitNumber: 1, SizeGB: 40}),
 			want:  have(infrav1.DiskStatus{UnitNumber: 1, SizeGB: 10}),
+			delta: flavorDiskShrink,
+		},
+		{
+			name: "a smaller system disk",
+			have: func() *infrav1.FlavorStatus {
+				f := have()
+				f.OSDiskGB = 40
+				return f
+			}(),
+			want:  have(),
+			delta: flavorDiskShrink,
+		},
+		{
+			name: "a smaller vCPU is still a recreate",
+			have: func() *infrav1.FlavorStatus {
+				f := have()
+				f.CPUs = 8
+				return f
+			}(),
+			want:  have(),
 			delta: flavorShrink,
+		},
+		{
+			name: "disk shrink wins over a CPU grow",
+			have: func() *infrav1.FlavorStatus {
+				f := have(infrav1.DiskStatus{UnitNumber: 1, SizeGB: 40})
+				f.CPUs = 1
+				return f
+			}(),
+			want: func() *infrav1.FlavorStatus {
+				f := have(infrav1.DiskStatus{UnitNumber: 1, SizeGB: 10})
+				f.CPUs = 2
+				return f
+			}(),
+			delta: flavorDiskShrink,
 		},
 		{
 			name:  "a disk the platform does not report",
 			have:  have(),
 			want:  have(infrav1.DiskStatus{UnitNumber: 1, SizeGB: 10}),
 			delta: flavorEqual,
-		},
-		{
-			name: "disk growth together with a shrink of memory",
-			have: func() *infrav1.FlavorStatus {
-				f := have(infrav1.DiskStatus{UnitNumber: 1, SizeGB: 10})
-				f.MemoryMB = 16384
-				return f
-			}(),
-			want: func() *infrav1.FlavorStatus {
-				f := have(infrav1.DiskStatus{UnitNumber: 1, SizeGB: 40})
-				f.MemoryMB = 8192
-				return f
-			}(),
-			delta: flavorMixed,
 		},
 	}
 	for _, tc := range cases {
@@ -67,12 +88,22 @@ func TestCompareFlavorWithDataDisks(t *testing.T) {
 	}
 }
 
-// A shrink cannot be applied in place, so it must take the recreate path.
-func TestDataDiskShrinkNeedsRecreate(t *testing.T) {
-	for _, d := range []flavorDelta{flavorShrink, flavorMixed} {
-		if !d.needsRecreate() {
-			t.Fatalf("%s should need a recreate", d)
+// A disk shrink must never take the recreate path: that is the whole point of
+// separating it from the other shrinks.
+func TestDiskShrinkIsGuardedNotRecreated(t *testing.T) {
+	if flavorDiskShrink.needsRecreate() {
+		t.Fatal("a disk shrink would recreate the worker and destroy its data")
+	}
+	if !flavorDiskShrink.guarded() {
+		t.Fatal("a disk shrink must be guarded")
+	}
+	for _, d := range []flavorDelta{flavorShrink, flavorMixed, flavorTemplate} {
+		if d.guarded() {
+			t.Fatalf("%s must not be guarded", d)
 		}
+	}
+	if !flavorShrink.needsRecreate() {
+		t.Fatal("a vCPU or memory shrink is still a recreate")
 	}
 	if flavorGrow.needsRecreate() {
 		t.Fatal("a grow must be applied in place, not by recreating the worker")

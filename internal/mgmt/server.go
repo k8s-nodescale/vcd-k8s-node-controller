@@ -69,6 +69,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST "+p+"/api/pools/{name}/replicas", s.postReplicas)
 	mux.HandleFunc("POST "+p+"/api/pools/{name}/flavor", s.postFlavor)
 	mux.HandleFunc("POST "+p+"/api/pools/{name}/delete-workers", s.postDeleteWorkers)
+	mux.HandleFunc("POST "+p+"/api/pools/{name}/disks", s.postDisks)
 	if p != "" {
 		mux.HandleFunc("GET "+p, func(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, p+"/", http.StatusFound)
@@ -221,6 +222,22 @@ func (s *Server) postFlavor(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.SetFlavor(r.Context(), r.PathValue("name"), body); err != nil {
+		writeError(w, statusFor(err), err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) postDisks(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		OSDiskGB int32        `json:"osDiskGB"`
+		Disks    []DiskTarget `json:"disks"`
+	}
+	if err := decode(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := s.SetDisks(r.Context(), r.PathValue("name"), body.OSDiskGB, body.Disks); err != nil {
 		writeError(w, statusFor(err), err)
 		return
 	}

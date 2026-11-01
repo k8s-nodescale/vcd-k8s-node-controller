@@ -349,6 +349,12 @@ func (c *Collector) poolView(ctx context.Context, p *infrav1.K8sWorkerPool, byNo
 		}
 	}
 
+	for _, d := range p.Spec.Flavor.Disks {
+		view.Flavor.Disks = append(view.Flavor.Disks, FlavorDisk{
+			BusNumber: d.BusNumber, UnitNumber: d.UnitNumber, Mount: d.Mount, SizeGB: d.SizeGB,
+		})
+	}
+
 	removing := map[string]bool{}
 	for _, name := range p.Spec.ScaleDown.DeleteWorkers {
 		removing[name] = true

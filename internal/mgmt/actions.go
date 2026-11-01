@@ -59,6 +59,69 @@ func (s *Server) SetFlavor(ctx context.Context, name string, f Flavor) error {
 	})
 }
 
+// DiskTarget is one disk the page wants to grow, addressed the way the
+// controller and the platform address it.
+type DiskTarget struct {
+	BusNumber  int32 `json:"busNumber"`
+	UnitNumber int32 `json:"unitNumber"`
+	SizeGB     int32 `json:"sizeGB"`
+}
+
+// SetDisks grows the system disk and the data disks. A shrink is refused here as
+// well as in the controller: vCD cannot shrink a disk, and the only way to get a
+// smaller one is a new VM, which an operator has to ask for deliberately
+// (delete the worker), never by accident.
+func (s *Server) SetDisks(ctx context.Context, name string, osDiskGB int32, disks []DiskTarget) error {
+	if osDiskGB <= 0 && len(disks) == 0 {
+		return fmt.Errorf("%w: nothing to change", ErrInvalid)
+	}
+	parts := []string{}
+	if osDiskGB > 0 {
+		parts = append(parts, fmt.Sprintf("os=%d", osDiskGB))
+	}
+	for _, d := range disks {
+		if d.SizeGB > 0 {
+			parts = append(parts, fmt.Sprintf("unit%d=%d", d.UnitNumber, d.SizeGB))
+		}
+	}
+	action := "disks=" + strings.Join(parts, ",")
+	return s.update(ctx, name, action, func(p *infrav1.K8sWorkerPool) error {
+		if osDiskGB > 0 {
+			if osDiskGB < p.Spec.Flavor.OSDiskGB {
+				return fmt.Errorf("%w: the OS disk is %d GB and a disk cannot shrink; replace the worker instead",
+					ErrInvalid, p.Spec.Flavor.OSDiskGB)
+			}
+			p.Spec.Flavor.OSDiskGB = osDiskGB
+		}
+		for _, want := range disks {
+			if want.SizeGB <= 0 {
+				continue
+			}
+			idx := -1
+			for i := range p.Spec.Flavor.Disks {
+				if p.Spec.Flavor.Disks[i].UnitNumber == want.UnitNumber {
+					idx = i
+					break
+				}
+			}
+			if idx < 0 {
+				return fmt.Errorf("%w: the pool has no data disk at unit %d", ErrInvalid, want.UnitNumber)
+			}
+			cur := p.Spec.Flavor.Disks[idx].SizeGB
+			if want.SizeGB < cur {
+				where := p.Spec.Flavor.Disks[idx].Mount
+				if where == "" {
+					where = fmt.Sprintf("unit %d", want.UnitNumber)
+				}
+				return fmt.Errorf("%w: %s is %d GB and a disk cannot shrink; replace the worker instead",
+					ErrInvalid, where, cur)
+			}
+			p.Spec.Flavor.Disks[idx].SizeGB = want.SizeGB
+		}
+		return nil
+	})
+}
+
 // DeleteWorkers appends names to spec.scaleDown.deleteWorkers. An entry is
 // processed like a scale-down and leaves the pool one worker smaller; the
 // controller drops unknown names with a warning event.
