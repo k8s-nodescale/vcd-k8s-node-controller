@@ -836,8 +836,12 @@
     var admin = isAdmin();
     if (state.diskDraft) {
       // Editing: only the sizes and the progress are refreshed, the inputs stay
-      // exactly as the operator left them.
+      // exactly as the operator left them - but they still have to be unlocked,
+      // which is what the light path used to forget (found the moment the
+      // checkbox was ticked, 0.16.1).
       if (refreshDiskRows(p)) {
+        var open = box.querySelectorAll("input[data-disk]");
+        for (var k = 0; k < open.length; k++) { open[k].disabled = false; }
         document.getElementById("diskActions").style.display = admin ? "" : "none";
         updateDiskButtons(p);
         return;
