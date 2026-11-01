@@ -211,6 +211,8 @@
                   font-size: 12px; color: var(--muted); }
   .flavor .fl.diskrow .delta { font-size: 11px; color: var(--muted); white-space: nowrap; }
   .flavor .fl.diskrow .delta.changed { color: var(--fg); }
+  /* in-flight growth, in the pod line's blue so it reads as "working" */
+  .flavor .fl.diskrow .resize-note { font-size: 11px; color: var(--pod); white-space: nowrap; }
   #diskHint { min-height: 16px; }
   button.ghost.ok { color: var(--ok); }
   button.ghost.no { color: var(--high); }
@@ -647,15 +649,24 @@
   // sent while the numbers say the spec already matches.
   function diskRows(p) {
     var gb = function (n) { return n ? n + " GB" : "&ndash;"; };
-    var rows = '<div class="fl diskrow"><span>OS</span><b>' + gb(p.flavor.osDiskGB) +
+    var rows = '<div class="fl diskrow" data-row="os"><span>OS</span><b>' + gb(p.flavor.osDiskGB) +
       '</b><input type="number" min="1" step="1" data-disk="os" title="new size of the system disk, GB" disabled>' +
-      '<span class="delta"></span></div>';
+      '<span class="delta"></span>' + resizeNote(p.flavor.osResize, p.flavor.osDiskGB) + "</div>";
     (p.flavor.disks || []).forEach(function (d) {
-      rows += '<div class="fl diskrow"><span>' + esc(d.mount || ("unit " + d.unitNumber)) + "</span><b>" +
-        gb(d.sizeGB) + '</b><input type="number" min="1" step="1" data-disk="' + esc(d.unitNumber) +
-        '" title="new size, GB" disabled><span class="delta"></span></div>';
+      rows += '<div class="fl diskrow" data-row="' + esc(d.unitNumber) + '"><span>' +
+        esc(d.mount || ("unit " + d.unitNumber)) + "</span><b>" + gb(d.sizeGB) +
+        '</b><input type="number" min="1" step="1" data-disk="' + esc(d.unitNumber) +
+        '" title="new size, GB" disabled><span class="delta"></span>' + resizeNote(d.resize, d.sizeGB) + "</div>";
     });
     return rows;
+  }
+
+  // resizeNote says how far the growth of one disk has got, and is empty as
+  // soon as every worker reports the wanted size.
+  function resizeNote(progress, want) {
+    if (!progress || !progress.total || progress.done >= progress.total) { return ""; }
+    return '<span class="resize-note">' + esc("resizing " + progress.from + " GB \u2192 " +
+      want + " GB (" + progress.done + " of " + progress.total + ")") + "</span>";
   }
 
   // currentDiskSize is the size in the spec for one row: "os" or a unit number.
@@ -790,11 +801,48 @@
     renderDiskConfirm(p);
   }
 
+  // Updating a row without rebuilding it keeps the caret in the field somebody
+  // is typing in: the page refreshes every five seconds.
+  function refreshDiskRows(p) {
+    var box = document.getElementById("diskRows");
+    var rows = box.querySelectorAll(".diskrow");
+    var want = 1 + (p.flavor.disks || []).length;
+    if (rows.length !== want) { return false; }
+    for (var i = 0; i < rows.length; i++) {
+      var key = rows[i].getAttribute("data-row");
+      var b = rows[i].querySelector("b");
+      var note = rows[i].querySelector(".resize-note");
+      var size = currentDiskSize(p, key);
+      if (b) { b.textContent = size ? size + " GB" : "\u2013"; }
+      var progress = null;
+      if (key === "os") {
+        progress = p.flavor.osResize;
+      } else {
+        (p.flavor.disks || []).forEach(function (d) {
+          if (String(d.unitNumber) === key) { progress = d.resize; }
+        });
+      }
+      if (note) {
+        note.outerHTML = resizeNote(progress, size) || '<span class="resize-note"></span>';
+      }
+    }
+    return true;
+  }
+
   function renderDisks(p) {
     var box = document.getElementById("diskRows");
     if (!box) { return; }
     if (!p) { box.innerHTML = ""; return; }
     var admin = isAdmin();
+    if (state.diskDraft) {
+      // Editing: only the sizes and the progress are refreshed, the inputs stay
+      // exactly as the operator left them.
+      if (refreshDiskRows(p)) {
+        document.getElementById("diskActions").style.display = admin ? "" : "none";
+        updateDiskButtons(p);
+        return;
+      }
+    }
     box.innerHTML = diskRows(p);
 
     var change = document.getElementById("diskChange");

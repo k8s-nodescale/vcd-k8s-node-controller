@@ -149,6 +149,49 @@ func (c *Collector) collectPools(ctx context.Context) ([]Pool, error) {
 	return out, nil
 }
 
+// diskProgress reports the growth of one disk across the pool: how many workers
+// already report the wanted size out of those that carry the disk, and the size
+// they still come from. It returns nil when there is nothing in flight, which is
+// what makes the page drop the line once every worker is there.
+func diskProgress(p *infrav1.K8sWorkerPool, unit int32, want int32) *DiskProgress {
+	if want <= 0 {
+		return nil
+	}
+	var total, done int32
+	var from int32
+	for i := range p.Status.Nodes {
+		n := &p.Status.Nodes[i]
+		if n.Flavor == nil {
+			continue
+		}
+		have := int32(0)
+		if unit < 0 {
+			have = n.Flavor.OSDiskGB
+		} else {
+			for _, d := range n.Flavor.Disks {
+				if d.UnitNumber == unit {
+					have = d.SizeGB
+				}
+			}
+		}
+		if have <= 0 {
+			continue
+		}
+		total++
+		if have == want {
+			done++
+			continue
+		}
+		if from == 0 {
+			from = have
+		}
+	}
+	if total == 0 || done == total || from == 0 {
+		return nil
+	}
+	return &DiskProgress{From: from, Done: done, Total: total}
+}
+
 // ipWindow describes the part of the CIDR this pool may hand out: wNodeOffset
 // for nodeCount addresses. The broadcast address is never in it.
 func ipWindow(plan infrav1.IPPlan) (from, to string, size int32, declared bool) {
@@ -352,8 +395,10 @@ func (c *Collector) poolView(ctx context.Context, p *infrav1.K8sWorkerPool, byNo
 	for _, d := range p.Spec.Flavor.Disks {
 		view.Flavor.Disks = append(view.Flavor.Disks, FlavorDisk{
 			BusNumber: d.BusNumber, UnitNumber: d.UnitNumber, Mount: d.Mount, SizeGB: d.SizeGB,
+			Resize: diskProgress(p, d.UnitNumber, d.SizeGB),
 		})
 	}
+	view.Flavor.OSResize = diskProgress(p, -1, p.Spec.Flavor.OSDiskGB)
 
 	removing := map[string]bool{}
 	for _, name := range p.Spec.ScaleDown.DeleteWorkers {

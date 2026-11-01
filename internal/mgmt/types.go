@@ -126,6 +126,8 @@ type Flavor struct {
 	// edits their sizes, so it needs the current values and the identity the
 	// controller uses.
 	Disks []FlavorDisk `json:"disks,omitempty"`
+	// OSResize is the same progress for the system disk.
+	OSResize *DiskProgress `json:"osResize,omitempty"`
 }
 
 // FlavorDisk is one data disk of the pool's flavor.
@@ -134,6 +136,18 @@ type FlavorDisk struct {
 	UnitNumber int32  `json:"unitNumber"`
 	Mount      string `json:"mount,omitempty"`
 	SizeGB     int32  `json:"sizeGB"`
+	// Resize is set while the workers are being brought to SizeGB; the page
+	// shows it as "resizing 30 GB -> 40 GB (2 of 5)" next to the disk.
+	Resize *DiskProgress `json:"resize,omitempty"`
+}
+
+// DiskProgress is how far a disk's growth has got: how many workers already
+// report the wanted size, out of how many carry that disk at all, and the size
+// they are coming from.
+type DiskProgress struct {
+	From  int32 `json:"from"`
+	Done  int32 `json:"done"`
+	Total int32 `json:"total"`
 }
 
 // Pool is everything the page needs about one pool.
