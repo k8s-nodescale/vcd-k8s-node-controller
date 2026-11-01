@@ -712,6 +712,22 @@ touches the root volume group - that one is grown by `vcd-grow-root.sh`. The
 `DISKS` column of the page is the filesystem size, so the result is visible the
 moment the worker comes back.
 
+**A disk bigger in vCD than in the spec is not repaired, it is reported.** That
+shape is what a human who grew the disk by hand produces, and the only way to
+"fix" it would be a new VM - which destroys what is on the disk. The pool goes
+`Ready=False` with reason `DiskLargerThanSpec`, names the mount and the sizes,
+and touches nothing until the spec is raised to match (or the disk is shrunk
+back). Replacing a worker for a smaller disk is a deliberate act: delete the
+worker, and the replacement is created with the spec's size.
+
+**The page can do it.** Under the flavour sheet there is a `DISKS RESIZE`
+section: the OS disk, /var and /var/lib with their current sizes and an input
+for the new one. The inputs stay disabled until `change` is ticked; `apply`
+checks that nothing shrinks, counts the storage the change needs across every
+worker against the storage profile's free space, and then asks before it sends
+the request - the same confirmation the delete button uses. The rollout restarts
+the workers one at a time, exactly as the API path does.
+
 A resize that fails leaves the worker **powered off** and its step in `Failed`
 rather than booting it with a shape that does not match the spec. Fix the cause,
 then clear the step to retry it:
@@ -1360,7 +1376,7 @@ Service, no Ingress, no Secret.
 ## Terraform integration contract
 
 - The Terraform module installs this chart behind a `node_controller.enabled`
-  toggle and pins `chart_version` / `image_tag` (currently `0.15.0`).
+  toggle and pins `chart_version` / `image_tag` (currently `0.15.1`).
 - **Once the controller is enabled, do not use Terraform to manage worker count
   or worker LB pool membership.** Use the CRD instead. The Terraform module's
   README must state this explicitly.
@@ -1391,7 +1407,7 @@ Build locally (the Dockerfile uses `golang:1.27.1-alpine` and
 `gcr.io/distroless/static:nonroot`):
 
 ```
-docker build -t docker.io/werton13/vcd-k8s-node-controller:0.15.0 .
+docker build -t docker.io/werton13/vcd-k8s-node-controller:0.15.1 .
 ```
 
 Public module defaults are used inside the build. On a restricted network,
@@ -1401,14 +1417,14 @@ override them:
 docker build \
   --build-arg GOPROXY=https://nexus.example.com/repository/golang/ \
   --build-arg GOSUMDB=off \
-  -t docker.io/werton13/vcd-k8s-node-controller:0.15.0 .
+  -t docker.io/werton13/vcd-k8s-node-controller:0.15.1 .
 ```
 
 Push (or use `make image-push`):
 
 ```
 docker login docker.io
-docker push docker.io/werton13/vcd-k8s-node-controller:0.15.0
+docker push docker.io/werton13/vcd-k8s-node-controller:0.15.1
 docker push docker.io/werton13/vcd-k8s-node-controller:latest
 ```
 
