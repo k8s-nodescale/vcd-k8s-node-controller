@@ -914,30 +914,35 @@ func setDiskSizes(vm *govcd.VM, sizeGB int32, disks []cloud.DiskSpec) error {
 		return fmt.Errorf("VM %q has no disk section", vm.VM.Name)
 	}
 
-	wantMB := int64(sizeGB) * 1024
-	var system *types.DiskSettings
-	for _, disk := range spec.DiskSection.DiskSettings {
-		if disk != nil && disk.BusNumber == 0 && disk.UnitNumber == 0 {
-			system = disk
-			break
+	// A zero size means "no opinion" on the system disk - a pool may leave it
+	// at the template's size - and must not be read as "shrink it to zero".
+	grew := false
+	if sizeGB > 0 {
+		wantMB := int64(sizeGB) * 1024
+		var system *types.DiskSettings
+		for _, disk := range spec.DiskSection.DiskSettings {
+			if disk != nil && disk.BusNumber == 0 && disk.UnitNumber == 0 {
+				system = disk
+				break
+			}
+		}
+		if system == nil {
+			return fmt.Errorf("VM %q has no system disk at bus 0/unit 0", vm.VM.Name)
+		}
+		if system.SizeMb > wantMB {
+			// vCD cannot shrink a disk, and a template larger than the requested
+			// size is a configuration mismatch, not something to paper over.
+			return fmt.Errorf("VM %q system disk is %d MB, cannot shrink to %d MB", vm.VM.Name, system.SizeMb, wantMB)
+		}
+		if system.SizeMb < wantMB {
+			system.SizeMb = wantMB
+			grew = true
 		}
 	}
-	if system == nil {
-		return fmt.Errorf("VM %q has no system disk at bus 0/unit 0", vm.VM.Name)
-	}
-	switch {
-	case system.SizeMb == wantMB:
-		return nil
-	case system.SizeMb > wantMB:
-		// vCD cannot shrink a disk, and a template larger than the requested
-		// size is a configuration mismatch, not something to paper over.
-		return fmt.Errorf("VM %q system disk is %d MB, cannot shrink to %d MB", vm.VM.Name, system.SizeMb, wantMB)
-	}
 
-	if system.SizeMb != wantMB {
-		system.SizeMb = wantMB
-	}
-	grew := system.SizeMb == wantMB
+	// The data disks are independent of the system disk: one that already
+	// matches must not stop the others from growing (found on the first live
+	// grow, 0.14.2).
 	for _, want := range disks {
 		if want.SizeGB <= 0 {
 			continue
