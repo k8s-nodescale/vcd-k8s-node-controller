@@ -160,14 +160,11 @@ write_files:
       #    below fills it. Grow the root before anything needs the space. It is
       #    idempotent and deliberately outside the marker: a disk extended
       #    later (spec.flavor.osDiskGB) is picked up on the next boot.
-      if [[ -x /usr/local/sbin/vcd-grow-root.sh ]]; then
-        /usr/local/sbin/vcd-grow-root.sh || log "root grow failed; continuing with the filesystem as it is"
-      fi
-      # The data disks are mounted by vcd-ensure-layout, which runs before this
-      # unit; growing them is the same three steps as the root, per volume
-      # group. A worker created before the disks were in the spec has none.
-      if [[ -x /usr/local/sbin/vcd-grow-data-disks.sh ]]; then
-        /usr/local/sbin/vcd-grow-data-disks.sh || log "data disk grow failed; continuing"
+      # The growth itself is vcd-grow-disks.service, ordered before this unit:
+      # it must also run on every later boot, and this stage runs once.
+      if [[ ! -f /etc/kubernetes/grow-disks.done ]]; then
+        systemctl start vcd-grow-disks.service || log "growing the filesystems failed; continuing"
+        touch /etc/kubernetes/grow-disks.done
       fi
 
       MARKER=/etc/kubernetes/prereqs.done
@@ -310,6 +307,28 @@ write_files:
       touch "$MARKER"
       log "join finished"
 
+  # Runs on every boot, before anything needs the space: a disk grown by a
+  # later resize is only useful once the guest has grown into it. Both scripts
+  # are idempotent, so a boot that changes nothing costs a few milliseconds.
+  - path: /etc/systemd/system/vcd-grow-disks.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Grow the root and data filesystems into the space vCD gave us
+      After=local-fs.target vcd-ensure-layout.service
+      Before=k8s-node-prereqs.service k8s-node-join.service
+      StartLimitIntervalSec=0
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/vcd-grow-root.sh
+      ExecStart=/usr/local/sbin/vcd-grow-data-disks.sh
+      RemainAfterExit=yes
+      TimeoutStartSec=10min
+
+      [Install]
+      WantedBy=multi-user.target
+
   - path: /etc/systemd/system/vcd-ensure-layout.service
     permissions: '0644'
     content: |
@@ -378,6 +397,7 @@ write_files:
 
 runcmd:
   - systemctl daemon-reload
+  - systemctl enable vcd-grow-disks.service
   - systemctl enable vcd-ensure-layout.service
   - systemctl start --no-block vcd-ensure-layout.service
   - systemctl enable --now --no-block k8s-node-prereqs.service

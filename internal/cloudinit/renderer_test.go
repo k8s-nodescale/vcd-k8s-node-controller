@@ -355,18 +355,21 @@ func TestUserDataMatchesTheTerraformBaseline(t *testing.T) {
 		}
 	}
 
-	// The root filesystem: the pre-requisites stage grows it before apt needs
-	// the space, and the grow happens before the marker short-circuit so a
-	// later osDiskGB change is picked up on the next boot.
+	// The root filesystem: grown by a unit that runs on every boot, before
+	// anything needs the space. The pre-requisites stage runs once and disables
+	// itself with a marker, so a disk grown by a later resize would never reach
+	// the guest if the growth lived there (found on the first live resize).
+	growUnit, ok := files["/etc/systemd/system/vcd-grow-disks.service"]
+	if !ok {
+		t.Fatal("vcd-grow-disks.service is missing")
+	}
+	if !strings.Contains(growUnit, "ExecStart=/usr/local/sbin/vcd-grow-root.sh") {
+		t.Error("the boot unit does not grow the root filesystem")
+	}
+	if !strings.Contains(growUnit, "Before=k8s-node-prereqs.service") {
+		t.Error("the boot unit is not ordered before the stage that needs the space")
+	}
 	prereqs := files["/usr/local/sbin/k8s-node-prereqs.sh"]
-	growAt := strings.Index(prereqs, "vcd-grow-root.sh")
-	markerAt := strings.Index(prereqs, "MARKER=/etc/kubernetes/prereqs.done")
-	if growAt < 0 {
-		t.Fatal("the pre-requisites stage does not grow the root filesystem")
-	}
-	if markerAt < 0 || growAt > markerAt {
-		t.Error("the root grow sits behind the done marker; a grown disk would be missed")
-	}
 	if !strings.Contains(prereqs, "unattended-upgrades") {
 		t.Error("the pre-requisites stage does not remove unattended-upgrades")
 	}
@@ -416,14 +419,20 @@ func TestDataDisksAreGrownAtBoot(t *testing.T) {
 		}
 	}
 
-	prereqs := files["/usr/local/sbin/k8s-node-prereqs.sh"]
-	rootAt := strings.Index(prereqs, "vcd-grow-root.sh")
-	dataAt := strings.Index(prereqs, "vcd-grow-data-disks.sh")
-	if dataAt < 0 {
-		t.Fatal("the pre-requisites stage does not grow the data disks")
+	unit, ok := files["/etc/systemd/system/vcd-grow-disks.service"]
+	if !ok {
+		t.Fatal("vcd-grow-disks.service is missing")
 	}
+	if !strings.Contains(unit, "ExecStart=/usr/local/sbin/vcd-grow-data-disks.sh") {
+		t.Error("the boot unit does not grow the data disks")
+	}
+	rootAt := strings.Index(unit, "vcd-grow-root.sh")
+	dataAt := strings.Index(unit, "vcd-grow-data-disks.sh")
 	if rootAt < 0 || dataAt < rootAt {
 		t.Error("the data disks are grown before the root, which is the wrong order")
+	}
+	if !strings.Contains(ud, "systemctl enable vcd-grow-disks.service") {
+		t.Error("the boot unit is never enabled")
 	}
 }
 

@@ -776,6 +776,30 @@ spec:
                       cpus:
                         format: int32
                         type: integer
+                      disks:
+                        description: |-
+                          Disks are the data disks, by unit number. They are compared with
+                          spec.flavor.disks on every pass, so raising one is a rollout like any
+                          other compute change and a reduction is a recreate.
+                        items:
+                          properties:
+                            busNumber:
+                              description: |-
+                                BusNumber and UnitNumber address the disk on its controller. Both are
+                                needed: the provider matches a spec disk to a platform disk by the pair.
+                              format: int32
+                              type: integer
+                            sizeGB:
+                              format: int32
+                              type: integer
+                            unitNumber:
+                              format: int32
+                              type: integer
+                          required:
+                          - sizeGB
+                          - unitNumber
+                          type: object
+                        type: array
                       memoryMB:
                         format: int32
                         type: integer
