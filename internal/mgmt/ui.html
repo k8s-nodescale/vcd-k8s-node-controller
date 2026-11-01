@@ -308,7 +308,7 @@
         <div class="pane-title disks-title">
           <span>disks &middot; resize</span>
           <label class="flag change" title="unlock the size fields">
-            <span>change</span><input type="checkbox" id="diskChange">
+            <span>edit</span><input type="checkbox" id="diskChange">
           </label>
         </div>
         <div class="flavor" id="diskRows"><span class="small muted">loading&hellip;</span></div>
@@ -717,7 +717,7 @@
     if (!hint || !p) { return; }
     hint.className = "small muted";
     if (!state.diskDraft) {
-      hint.textContent = "tick change to edit the sizes; a disk cannot shrink, only grow";
+      hint.textContent = "tick edit to set new sizes; a disk cannot shrink, only grow";
       return;
     }
     var plan = diskPlan(p);
@@ -745,7 +745,7 @@
         (plan.total > 0 ? ", +" + plan.total + " GB" : "");
     }
     slot.innerHTML = "<span>" + esc(where) + "</span>" +
-      '<button class="ghost icon ok" id="diskYes" title="send the new sizes">grow</button>' +
+      '<button class="ghost icon ok" id="diskYes" title="send the new sizes">confirm</button>' +
       '<button class="ghost icon no" id="diskNo" title="discard the change">cancel</button>';
     apply.style.display = "none";
   }
