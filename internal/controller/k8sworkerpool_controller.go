@@ -59,6 +59,15 @@ type WorkerPoolReconciler struct {
 	Org string
 	VDC string
 
+	// VSphereDatacenter and VSphereFolderRoot are the vCenter boundary the
+	// vSphere factory is configured with (VSPHERE_DATACENTER and
+	// VSPHERE_FOLDER_ROOT). The folder root is checked here as well so a CR
+	// that points outside the granted folder is rejected with a message that
+	// names it, instead of failing on the first platform call. The provider
+	// checks the resolved inventory path, which is the authority.
+	VSphereDatacenter string
+	VSphereFolderRoot string
+
 	// PodName and PodNamespace identify this controller's Pod (downward API).
 	// They let the last-worker guard refuse to delete the worker the pass
 	// itself runs on.
@@ -704,6 +713,26 @@ func placementFor(pool *infrav1.K8sWorkerPool) cloud.Placement {
 			CatalogOrg: v.CatalogOrg,
 		}
 	}
+	if v := pool.Spec.VSphere; v != nil {
+		// The guest network is derived the same way the renderer derives it:
+		// the gateway is the first host of the subnet and the prefix is the
+		// one that subnet declares, so the placement cannot disagree with the
+		// user-data the guest is given. The interface name and the resolvers
+		// are the bootstrap ones, shared with vCD.
+		prefix, _ := strconv.Atoi(cidrPrefix(pool.Spec.IPPlan.CIDR))
+		pl.VSphere = &cloud.VSpherePlacement{
+			Datacenter:   v.Datacenter,
+			Cluster:      v.Cluster,
+			ResourcePool: v.ResourcePool,
+			Datastore:    v.Datastore,
+			Network:      v.Network,
+			Folder:       v.Folder,
+			NICName:      pool.Spec.Bootstrap.NICName,
+			Gateway:      gatewayIP(pool.Spec.IPPlan.CIDR),
+			DNSServers:   pool.Spec.Bootstrap.DNS,
+			PrefixLen:    prefix,
+		}
+	}
 	return pl
 }
 
@@ -740,7 +769,26 @@ func (r *WorkerPoolReconciler) validateSpec(pool *infrav1.K8sWorkerPool) string 
 			return fmt.Sprintf("spec.vcd.vdc %q does not match the controller VDC %q (VCD_VDC)", pool.Spec.VCD.VDC, r.VDC)
 		}
 	case cloud.ProviderVSphere:
-		return "spec.provider vsphere is a stub: the vSphere provider is not implemented yet, only vcd is"
+		v := pool.Spec.VSphere
+		switch {
+		case v == nil:
+			return "spec.vsphere is required when spec.provider is vsphere"
+		case strings.TrimSpace(v.Cluster) == "":
+			return "spec.vsphere.cluster is required"
+		case strings.TrimSpace(v.Folder) == "":
+			return "spec.vsphere.folder is required"
+		case strings.TrimSpace(v.Datastore) == "":
+			return "spec.vsphere.datastore is required"
+		case strings.TrimSpace(v.Network) == "":
+			return "spec.vsphere.network is required"
+		}
+		if root := strings.TrimSpace(r.VSphereFolderRoot); root != "" {
+			folder := normalizeVSphereFolder(r.VSphereDatacenter, v.Folder)
+			rootPath := normalizeVSphereFolder(r.VSphereDatacenter, root)
+			if folder != rootPath && !strings.HasPrefix(folder, rootPath+"/") {
+				return fmt.Sprintf("spec.vsphere.folder %q is outside the allowed root %q (VSPHERE_FOLDER_ROOT)", v.Folder, root)
+			}
+		}
 	default:
 		return fmt.Sprintf("spec.provider %q is not supported (vcd)", pool.Spec.Provider)
 	}
@@ -762,6 +810,19 @@ func (r *WorkerPoolReconciler) validateSpec(pool *infrav1.K8sWorkerPool) string 
 		return err.Error()
 	}
 	return ""
+}
+
+// normalizeVSphereFolder reduces a folder to the path below the datacenter
+// VM folder, so spec.vsphere.folder written as "HUB/dev", "/HUB/dev",
+// "vm/HUB/dev" or "/DC/vm/HUB/dev" all compare the same way.
+func normalizeVSphereFolder(dc, folder string) string {
+	rel := strings.TrimSpace(folder)
+	rel = strings.TrimPrefix(rel, "/")
+	if dc = strings.TrimSpace(dc); dc != "" {
+		rel = strings.TrimPrefix(rel, dc+"/vm/")
+	}
+	rel = strings.TrimPrefix(rel, "vm/")
+	return strings.Trim(rel, "/")
 }
 
 // validateIPWindow checks that the window is usable and fits the network. It is

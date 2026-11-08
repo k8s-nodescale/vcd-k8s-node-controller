@@ -81,6 +81,45 @@ spec:
                   name: {{ .Values.vcd.existingSecret }}
                   key: insecure
                   optional: true
+            # The vSphere connection is optional and shared by every pool that
+            # sets spec.provider: vsphere. The manager logs in on the first
+            # such pool, so a release without one has no vSphere env and needs
+            # no vCenter at all.
+            {{- if .Values.vsphere.existingSecret }}
+            - name: VSPHERE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.vsphere.existingSecret }}
+                  key: url
+            - name: VSPHERE_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.vsphere.existingSecret }}
+                  key: user
+            - name: VSPHERE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.vsphere.existingSecret }}
+                  key: password
+            - name: VSPHERE_DATACENTER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.vsphere.existingSecret }}
+                  key: datacenter
+                  optional: true
+            - name: VSPHERE_FOLDER_ROOT
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.vsphere.existingSecret }}
+                  key: folderRoot
+                  optional: true
+            - name: VSPHERE_INSECURE
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.vsphere.existingSecret }}
+                  key: insecure
+                  optional: true
+            {{- end }}
           ports:
             - name: metrics
               containerPort: 8080

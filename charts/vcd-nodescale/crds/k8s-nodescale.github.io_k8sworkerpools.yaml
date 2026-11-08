@@ -119,6 +119,10 @@ spec:
                         a worker VM.
                       properties:
                         busNumber:
+                          description: |-
+                            BusNumber and UnitNumber are always written, zero included: a disk on
+                            bus 1 unit 0 is not "a disk without a unit number", and a manifest that
+                            omits it reads that way.
                           format: int32
                           type: integer
                         busType:
@@ -134,7 +138,9 @@ spec:
                           format: int32
                           type: integer
                       required:
+                      - busNumber
                       - sizeGB
+                      - unitNumber
                       type: object
                     type: array
                   memoryMB:
@@ -201,12 +207,13 @@ spec:
                   nodeCount:
                     default: 10
                     description: |-
-                      NodeCount is how many worker addresses this pool may take: its
-                      window is wNodeOffset .. wNodeOffset+nodeCount-1. Two pools can
-                      share one CIDR as long as their windows do not overlap, and a
-                      pool that outgrows its window fails instead of borrowing a
-                      neighbour's address. The default is 10, so every pool states a
-                      limit; a pool that needs the whole network says so with a number.
+                      NodeCount is how many worker addresses this pool may take: its window is
+                      wNodeOffset .. wNodeOffset+nodeCount-1. Two pools can share one CIDR as
+                      long as their windows do not overlap, and a pool that outgrows its window
+                      fails instead of borrowing a neighbour's address. The default is
+                      materialised into every pool by the API server, so "not set" is not a
+                      hidden mode and zero is not a sentinel: an operator who needs a larger
+                      pool says so.
                     format: int32
                     minimum: 1
                     type: integer
@@ -218,6 +225,7 @@ spec:
                     type: integer
                 required:
                 - cidr
+                - nodeCount
                 type: object
               join:
                 description: Join controls how new nodes join the cluster.
@@ -440,6 +448,51 @@ spec:
                 - vapp
                 - vdc
                 type: object
+              vsphere:
+                description: |-
+                  VSphere points at the vSphere objects one pool lives in. Required when
+                  spec.provider is vsphere, ignored otherwise.
+                properties:
+                  cluster:
+                    description: |-
+                      Cluster is the compute cluster the pool runs in. Its hosts are the
+                      capacity of the pool: a worker is never placed on a host of another
+                      cluster.
+                    type: string
+                  datacenter:
+                    description: |-
+                      Datacenter is the vCenter datacenter, e.g. MSK_Dev_DC. Empty means the
+                      one the controller was configured with (VSPHERE_DATACENTER).
+                    type: string
+                  datastore:
+                    description: |-
+                      Datastore holds the worker disks and is the storage the capacity
+                      pre-flight reads.
+                    type: string
+                  folder:
+                    description: |-
+                      Folder is where the VMs of the pool are created. It must be at or
+                      below the controller root (VSPHERE_FOLDER_ROOT) when that is set,
+                      which keeps a pool inside the boundary vCenter grants it.
+                    type: string
+                  network:
+                    description: |-
+                      Network is the port group the worker NIC is attached to. The guest
+                      address comes from spec.ipPlan.cidr; the interface name and the
+                      resolvers come from spec.bootstrap.nicName and spec.bootstrap.dns, so
+                      there is one place to change them.
+                    type: string
+                  resourcePool:
+                    description: |-
+                      ResourcePool is the resource pool inside the cluster. Empty means the
+                      root resource pool of the cluster.
+                    type: string
+                required:
+                - cluster
+                - datastore
+                - folder
+                - network
+                type: object
             required:
             - flavor
             - ipPlan
@@ -451,49 +504,81 @@ spec:
             properties:
               capacity:
                 description: |-
-                  Capacity is the platform's own view of the vDC the pool lives in: what is used and what the vDC caps, plus the pod subnet budget. It is a snapshot, taken when a scale operation completed and refreshed on a slow timer.
+                  Capacity is the platform's own view of the vDC the pool lives in: what
+                  is used and what the vDC caps, plus the pod subnet budget. The page
+                  cannot ask vCD, and the controller is the only thing that talks to the
+                  platform, so the numbers are published here. A nil Capacity means no
+                  snapshot was taken yet.
                 properties:
                   at:
+                    description: At is when the snapshot was taken.
                     format: date-time
                     type: string
                   cpuLimitMHz:
                     format: int64
                     type: integer
                   cpuMHz:
+                    description: CPUMHz is what vCD counts as used and the ceiling
+                      it enforces.
                     format: int64
                     type: integer
                   memoryLimitMB:
                     format: int64
                     type: integer
                   memoryMB:
+                    description: MemoryMB is the same pair for memory.
                     format: int64
                     type: integer
                   model:
+                    description: Model is the vDC allocation model, informational.
                     type: string
                   observedReplicas:
+                    description: |-
+                      ObservedReplicas is the pool size the snapshot was taken at, which is
+                      what makes "refresh after a scale completed" decidable.
                     format: int32
                     type: integer
                   podBlockSize:
+                    description: |-
+                      PodBlockSize and PodUsablePerBlock describe the CNI's block: a /26 is 64
+                      addresses of which Calico keeps one, so 63 pods fit in a block.
                     format: int32
                     type: integer
                   podBlocks:
+                    description: |-
+                      PodBlocks and PodBlocksUsed are the CNI's own view: a range can have
+                      addresses left and still have no block to hand out.
                     format: int32
                     type: integer
                   podBlocksUsed:
                     format: int32
                     type: integer
                   podCIDR:
+                    description: |-
+                      PodCIDR is the cluster's pod network. Its address count sized against
+                      the per-node allowance (110 pods, the kubelet default) is what decides
+                      whether another node can be added at all.
                     type: string
                   podIPs:
+                    description: PodIPs is how many addresses the pod network holds.
                     format: int64
                     type: integer
                   podMaxPerNode:
+                    description: |-
+                      PodMaxPerNode is the fullest block in the pool: what the nodes carry
+                      today, which is what the low-density reading is sized from.
                     format: int32
                     type: integer
                   podNodes:
+                    description: |-
+                      PodNodes is every node of the cluster, masters included: they run pods
+                      and cost the same slice.
                     format: int32
                     type: integer
                   podRemainingNodes:
+                    description: |-
+                      PodRemainingNodes is how many more nodes the range can carry:
+                      (PodIPs - PodNodes*110) / 110, floored at zero.
                     format: int32
                     type: integer
                   podUsablePerBlock:
@@ -506,6 +591,9 @@ spec:
                     format: int64
                     type: integer
                   storageName:
+                    description: |-
+                      Storage names the storage profile the numbers belong to, so a bar is
+                      never a sum of profiles with different limits.
                     type: string
                 type: object
               conditions:
@@ -615,11 +703,14 @@ spec:
                             spec.flavor.disks on every pass, so raising one is a rollout like any
                             other compute change and a reduction is a recreate.
                           items:
+                            description: DiskStatus is one data disk of a worker,
+                              as the platform reports it.
                             properties:
                               busNumber:
                                 description: |-
                                   BusNumber and UnitNumber address the disk on its controller. Both are
-                                  needed: the provider matches a spec disk to a platform disk by the pair.
+                                  needed: the provider matches a spec disk to a platform disk by the pair,
+                                  and a missing bus number silently matches nothing.
                                 format: int32
                                 type: integer
                               sizeGB:
@@ -629,6 +720,7 @@ spec:
                                 format: int32
                                 type: integer
                             required:
+                            - busNumber
                             - sizeGB
                             - unitNumber
                             type: object
@@ -782,11 +874,14 @@ spec:
                           spec.flavor.disks on every pass, so raising one is a rollout like any
                           other compute change and a reduction is a recreate.
                         items:
+                          description: DiskStatus is one data disk of a worker, as
+                            the platform reports it.
                           properties:
                             busNumber:
                               description: |-
                                 BusNumber and UnitNumber address the disk on its controller. Both are
-                                needed: the provider matches a spec disk to a platform disk by the pair.
+                                needed: the provider matches a spec disk to a platform disk by the pair,
+                                and a missing bus number silently matches nothing.
                               format: int32
                               type: integer
                             sizeGB:
@@ -796,6 +891,7 @@ spec:
                               format: int32
                               type: integer
                           required:
+                          - busNumber
                           - sizeGB
                           - unitNumber
                           type: object

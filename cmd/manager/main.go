@@ -74,11 +74,23 @@ func main() {
 		os.Exit(1)
 	}
 
+	// The vSphere factory connects on first use: a deployment that serves only
+	// vCD pools does not need VSPHERE_* at all, and the first vsphere pool
+	// gets the error that names what is missing.
+	vsphereFactory := vsphere.New(vsphere.Config{
+		URL:        os.Getenv("VSPHERE_URL"),
+		User:       os.Getenv("VSPHERE_USER"),
+		Password:   os.Getenv("VSPHERE_PASSWORD"),
+		Datacenter: os.Getenv("VSPHERE_DATACENTER"),
+		FolderRoot: os.Getenv("VSPHERE_FOLDER_ROOT"),
+		Insecure:   os.Getenv("VSPHERE_INSECURE") == "true",
+	})
+
 	// The platform is a property of the pool (spec.provider), not of the
 	// process: the registry hands out the provider each pool asks for.
 	cloudProvider := cloud.Registry{
 		cloud.ProviderVCD:     vcdFactory,
-		cloud.ProviderVSphere: vsphere.New(),
+		cloud.ProviderVSphere: vsphereFactory,
 	}
 
 	cs, err := kubernetes.NewForConfig(cfg)
@@ -94,16 +106,18 @@ func main() {
 	}
 
 	if err := (&controller.WorkerPoolReconciler{
-		Client:       mgr.GetClient(),
-		Scheme:       mgr.GetScheme(),
-		Cloud:        cloudProvider,
-		Kube:         kube.NewClient(cs),
-		Renderer:     renderer,
-		Recorder:     mgr.GetEventRecorderFor("k8sworkerpool-controller"),
-		Org:          vcdOrg,
-		VDC:          vcdVDC,
-		PodName:      os.Getenv("POD_NAME"),
-		PodNamespace: os.Getenv("POD_NAMESPACE"),
+		Client:            mgr.GetClient(),
+		Scheme:            mgr.GetScheme(),
+		Cloud:             cloudProvider,
+		Kube:              kube.NewClient(cs),
+		Renderer:          renderer,
+		Recorder:          mgr.GetEventRecorderFor("k8sworkerpool-controller"),
+		Org:               vcdOrg,
+		VDC:               vcdVDC,
+		VSphereDatacenter: os.Getenv("VSPHERE_DATACENTER"),
+		VSphereFolderRoot: os.Getenv("VSPHERE_FOLDER_ROOT"),
+		PodName:           os.Getenv("POD_NAME"),
+		PodNamespace:      os.Getenv("POD_NAMESPACE"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller")
 		os.Exit(1)

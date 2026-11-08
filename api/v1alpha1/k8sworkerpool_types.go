@@ -107,6 +107,11 @@ type K8sWorkerPoolSpec struct {
 	// +optional
 	VCD *VCDRef `json:"vcd,omitempty"`
 
+	// VSphere points at the vSphere objects one pool lives in. Required when
+	// spec.provider is vsphere, ignored otherwise.
+	// +optional
+	VSphere *VSphereRef `json:"vsphere,omitempty"`
+
 	// IPPlan mirrors the Terraform ip_plan variable so the controller
 	// never collides with Terraform-managed infrastructure or reserved VIPs.
 	IPPlan IPPlan `json:"ipPlan"`
@@ -299,6 +304,44 @@ type VCDRef struct {
 	// provider-neutral.
 	// +optional
 	DVMOffset int `json:"dvmOffset,omitempty"`
+}
+
+// VSphereRef names the vSphere objects and the guest network one pool uses.
+//
+// The capacity pre-flight reads the same two objects the create uses: the
+// compute cluster (the free CPU and memory of its hosts) and the datastore
+// (its free space), so "the platform has room" means "the cluster this pool
+// runs in has room", not "some host in the datacenter has room".
+type VSphereRef struct {
+	// Datacenter is the vCenter datacenter, e.g. MSK_Dev_DC. Empty means the
+	// one the controller was configured with (VSPHERE_DATACENTER).
+	// +optional
+	Datacenter string `json:"datacenter,omitempty"`
+
+	// Cluster is the compute cluster the pool runs in. Its hosts are the
+	// capacity of the pool: a worker is never placed on a host of another
+	// cluster.
+	Cluster string `json:"cluster"`
+
+	// ResourcePool is the resource pool inside the cluster. Empty means the
+	// root resource pool of the cluster.
+	// +optional
+	ResourcePool string `json:"resourcePool,omitempty"`
+
+	// Folder is where the VMs of the pool are created. It must be at or
+	// below the controller root (VSPHERE_FOLDER_ROOT) when that is set,
+	// which keeps a pool inside the boundary vCenter grants it.
+	Folder string `json:"folder"`
+
+	// Datastore holds the worker disks and is the storage the capacity
+	// pre-flight reads.
+	Datastore string `json:"datastore"`
+
+	// Network is the port group the worker NIC is attached to. The guest
+	// address comes from spec.ipPlan.cidr; the interface name and the
+	// resolvers come from spec.bootstrap.nicName and spec.bootstrap.dns, so
+	// there is one place to change them.
+	Network string `json:"network"`
 }
 
 // IPPlan mirrors Terraform's ip_plan variable. It carries only the

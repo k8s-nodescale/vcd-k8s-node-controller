@@ -14,6 +14,30 @@ vcd:
   #   url, user, password, org, vdc, insecure (optional)
   existingSecret: vcd-credentials
 
+# vSphere is optional: a deployment that serves only vCD pools leaves
+# existingSecret empty and gets no VSPHERE_* environment at all. Set it when a
+# pool carries spec.provider: vsphere.
+#
+# The Secret lives in the release namespace and holds the connection the
+# controller process logs in with once, shared by every vSphere pool:
+#   url          https://97dev-vcp01.mtscloud.local (a bare host works too)
+#   user         terraform@mtsdevp97.local
+#   password     the account password
+#   datacenter   MSK_Dev_DC          (optional; a pool may name its own)
+#   folderRoot   /HUB Infrastructure/dev/k8s-test-lab
+#   insecure     true               (optional; self-signed vCenter)
+#
+# Example:
+#   kubectl -n vcd-nodescale-system create secret generic vsphere-credentials \
+#     --from-literal=url=https://97dev-vcp01.mtscloud.local \
+#     --from-literal=user=terraform@mtsdevp97.local \
+#     --from-literal=password=... \
+#     --from-literal=datacenter=MSK_Dev_DC \
+#     --from-literal=folderRoot="/HUB Infrastructure/dev/k8s-test-lab" \
+#     --from-literal=insecure=true
+vsphere:
+  existingSecret: ""
+
 leaderElection: true
 
 serviceAccount:

@@ -62,9 +62,9 @@ type VCDPlacement struct {
 	CatalogOrg string
 }
 
-// VSpherePlacement names the vSphere objects one pool lives in. It is declared
-// so the stub has a shape to fill in; the vSphere implementation is not
-// written yet.
+// VSpherePlacement names the vSphere objects one pool lives in. The cluster is
+// the unit of capacity: the hosts of other clusters are not candidates, so a
+// pool cannot be placed on a host that has room but belongs elsewhere.
 type VSpherePlacement struct {
 	Datacenter   string
 	Cluster      string
@@ -72,6 +72,13 @@ type VSpherePlacement struct {
 	Datastore    string
 	Network      string
 	Folder       string
+
+	// Guest network: the subnet prefix comes from the pool ipPlan.cidr, so
+	// only the gateway, the interface name and the resolvers live here.
+	NICName    string
+	Gateway    string
+	DNSServers []string
+	PrefixLen  int
 }
 
 // DiskSpec describes an internal disk to attach to a worker VM.

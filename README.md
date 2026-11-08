@@ -135,12 +135,18 @@ One `K8sWorkerPool` describes the worker set of a single cluster. You own
 | `bootstrap.k8sMinorRepo` | no | `pkgs.k8s.io` minor repo, e.g. `v1.35`. |
 | `flavor.cpus` / `flavor.memoryMB` | yes | VM shape. |
 | `flavor.osDiskGB` | no | Grows the cloned template's system disk (bus 0/unit 0) before the first power-on. Terraform nodes use `disks_config.osdisk.sizegb`; a clone without this keeps the template size (10 GB on the current Ubuntu template). A smaller value replaces the worker (see [Rolling compute-spec changes](#rolling-compute-spec-changes)). |
-| `flavor.template` | no | vCD catalog template (must expose `disk.EnableUUID`). Another value replaces the worker: a different image is a different VM. |
+| `flavor.template` | no | Image to clone: a vCD catalog item, or on vSphere a VM name or inventory path (e.g. `noble-template_1.1.0_k8s`). Must expose `disk.EnableUUID`. Another value replaces the worker: a different image is a different VM. |
 | `flavor.disks[]` | no | Data disks: `sizeGB`, `mount` (`/var`, `/var/lib`), `busType`, `busNumber`, `unitNumber`, `storageProfile`. Mirrors Terraform `diskw1` / `diskw2`. |
-| `provider` | no | Platform that runs the workers: `vcd` (default) or `vsphere`. The block for the selected platform is required. `vsphere` is a stub: a pool that names it is rejected as `InvalidSpec` instead of half-working. See [Platform providers](#platform-providers). |
+| `provider` | no | Platform that runs the workers: `vcd` (default) or `vsphere`. The block for the selected platform is required; the other is ignored. See [Platform providers](#platform-providers). |
 | `vcd.org` / `vcd.vdc` / `vcd.vapp` / `vcd.orgNetwork` | yes* | Placement of the VM. Required when `provider` is `vcd`. |
 | `vcd.catalog` / `vcd.catalogOrg` | no | Catalog holding the template (defaults to the controller org). |
 | `vcd.dvmOffset` | no | Address offset of the deployment VM in Terraform's `ip_plan`; the controller reserves it so no worker gets that address. Only the vCD bootstrap has a DVM. |
+| `vsphere.cluster` | yes* | Compute cluster the pool runs in (e.g. `mskdev`). Its hosts are the pool's capacity: a worker is never placed on a host of another cluster. Required when `provider` is `vsphere`. |
+| `vsphere.datastore` | yes* | Datastore holding the worker disks; also the storage the capacity pre-flight reads. |
+| `vsphere.folder` | yes* | VM folder the workers are cloned into. It must be at or below `VSPHERE_FOLDER_ROOT` when the controller is configured with one. |
+| `vsphere.network` | yes* | Port group the worker NIC is attached to. |
+| `vsphere.datacenter` | no | vCenter datacenter, e.g. `MSK_Dev_DC`. Defaults to `VSPHERE_DATACENTER`. |
+| `vsphere.resourcePool` | no | Resource pool inside the cluster. Empty means the root pool of the cluster. |
 | `ipPlan` | yes | Mirrors Terraform's `ip_plan`: `cidr`, `mNodeOffset`, `wNodeOffset`, `kubeapiLB`, `ingressLB`, `masterCount`, `reserved[]`. Workers are allocated from `wNodeOffset` upwards. |
 | `join.endpoint` | no | Control-plane address, `host:port` of the API VIP. |
 | `join.tokenTTL` | no | Lifetime of the per-VM bootstrap token (default `1h`). |
@@ -172,12 +178,49 @@ The controller talks to a platform through a narrow contract (`internal/cloud`):
 provider to one pool's `Placement`, so no call carries a vApp or network name
 and the platform is a property of the pool, not of the process.
 
-`spec.provider` picks the implementation. `vcd` (the default) is the
-complete one: `internal/cloud/vcd` authenticates once and hands out a provider
-per pool, bound to `spec.vcd`. `vsphere` is a stub in
-`internal/cloud/vsphere`: it satisfies the same contract and refuses every
-call with `cloud.ErrNotImplemented`, so a pool that names it is rejected as
-`InvalidSpec` before anything is created.
+`spec.provider` picks the implementation.
+
+**`vcd`** (the default) - `internal/cloud/vcd` authenticates once and hands out
+a provider per pool, bound to `spec.vcd`. The vApp is the scope of the pool;
+the template comes from a catalog and the guest is customised by vCD (network,
+hostname, credentials) with this controller's initscript running in its two
+customization phases.
+
+**`vsphere`** - `internal/cloud/vsphere` clones `spec.flavor.template` into
+`spec.vsphere.folder`, in the named compute cluster, with the disks on the
+named datastore. The controller account is not granted guest customization
+(`VirtualMachine.Provisioning.Customize`), so the guest is configured the way
+the Terraform module does it: the rendered cloud-config goes into
+`guestinfo.userdata` and a network document into `guestinfo.metadata`, both
+recursively base64 with the matching `.encoding` key, which is what cloud-init's
+VMware datasource reads on the first boot. Nothing is uploaded to a datastore
+and no agent runs inside the guest - the user-data itself writes netplan,
+grows the disks and joins the cluster. A clone gets a regenerated MAC address;
+a copied one would collide on the port group.
+
+What the controller knows about a worker it created is recorded in the VM
+annotation as JSON (`{"apiVersion":"nodescale.k8s/v1","metadata":{...},
+"ip":"...","template":"..."}`) - the identity it was created with, the image it
+was cloned from and the address it was given, because a guest that never boots
+never reports an address either. Any other annotation (a human note, a VM
+Terraform created) is not ours and is left alone, which is what lets a
+Terraform-created worker be adopted by name without being rewritten. The VM id
+is the vSphere managed object id, so `status.nodes[].providerID` is a bare
+moRef value, not a URN.
+
+The scope of a vSphere pool is its folder, the way a vApp is for vCD: VMs are
+listed recursively below it and filtered by `namePrefix`, so the shared lab
+folder that also holds the control plane and the deployment VM is not a
+problem. `VSPHERE_FOLDER_ROOT` is the boundary: a pool that names a folder
+outside it is rejected before the first API call.
+
+Capacity is read in the terms of the same block the create uses: compute is the
+named **compute cluster** - its hosts only, with the hosts in maintenance mode
+or disconnected left out - and storage is the named **datastore**, reported as
+the default profile. A host of another cluster is not a candidate for a worker,
+so counting it would report room the pool cannot use. `spec.capacity.cpuMhzPerCore`
+falls back to the host clock speed vCenter reports instead of the 2 GHz vCD
+assumption.
 
 vSphere has no load-balancer pool, which is why membership is a separate
 optional interface rather than part of the main contract: a provider that
@@ -191,7 +234,7 @@ reports `ErrPoolNotConfigured` for a pool it cannot address (NSX-T today).
 | --- | --- |
 | `observedReplicas` | Worker **slots** the controller knows about: VMs that exist, slots whose VM disappeared and stay reserved (`Missing` / parked `Failed`), and slots waiting for capacity (`Queued`). |
 | `ledger.nextIndex` / `used[]` / `free[]` | Address book. `used` holds every allocated worker IP; addresses of deleted VMs are never released automatically. |
-| `nodes[]` | Per worker: `name` (the vCD VM name), `nodeName` (the Kubernetes Node object name, lower case - the only name the controller passes to the Kubernetes API), `ip`, `providerID` (the VM id in the platform, today `urn:vcloud:vm:...`), `phase`, `cpu`, `memoryMB`, `diskGB`, `k8sReady`, `kubeletVersion`, `message`, `deleteStartedAt`, `flavor` (what the VM actually runs with, template included, read back from the platform), `healAttempts` / `healLastAttempt` (the AutoHeal budget), `resize` (the per-worker rollout step: `phase`, `recreate`, `drainStartedAt`, `message`), `provisioningStartedAt` (when the watchdog clock started for a VM that has no Node yet), `bootstrapTokenID` (the token kept alive until the join, then revoked; never the secret half). `message` is where a blocked removal explains itself (the PDB, the attached volume, the local PV). |
+| `nodes[]` | Per worker: `name` (the VM name in the platform), `nodeName` (the Kubernetes Node object name, lower case - the only name the controller passes to the Kubernetes API), `ip`, `providerID` (the VM id in the platform: `urn:vcloud:vm:...` on vCD, the managed object id on vSphere), `phase`, `cpu`, `memoryMB`, `diskGB`, `k8sReady`, `kubeletVersion`, `message`, `deleteStartedAt`, `flavor` (what the VM actually runs with, template included, read back from the platform), `healAttempts` / `healLastAttempt` (the AutoHeal budget), `resize` (the per-worker rollout step: `phase`, `recreate`, `drainStartedAt`, `message`), `provisioningStartedAt` (when the watchdog clock started for a VM that has no Node yet), `bootstrapTokenID` (the token kept alive until the join, then revoked; never the secret half). `message` is where a blocked removal explains itself (the PDB, the attached volume, the local PV). |
 | `rollout` | `phase` (`Idle`, `Progressing`, `Paused`, `Queued`), `message` (why a roll is waiting, e.g. the capacity it needs), `targetFlavor`, `workersTotal`, `workersDone`, `currentWorker`, `lastError`, `startedAt`. |
 | `conditions[]` | `Ready`, with reason `Converged` (`3/3 workers Ready`), `Progressing` while a worker is not Ready yet, `WorkerMissing` when a slot lost its VM, `WorkerFailed` when a worker is parked (drain timeout, exhausted AutoHeal, or no Node within `provisioning.timeout`), `LastWorkerProtected` / `WorkerHostsController` on a refused emptying, `RolloutInProgress` while a roll holds the pool, `NoResourceAvailable` when workers are queued for vDC capacity, plus `ScaleUpFailed`, `ScaleDownFailed`, `RolloutFailed` and `InvalidSpec` on errors. |
 
@@ -276,6 +319,76 @@ spec:
     deleteWorkers: []  # e.g. [demo-cluster-wrk-02]
 ```
 
+#### The same pool on vSphere
+
+`spec.vsphere` replaces `spec.vcd`: the placement is one compute cluster plus
+one datastore, and the folder is the scope the workers are created in. There is
+no catalog, no vApp and no deployment VM. The guest address still comes from
+`ipPlan.cidr`; the gateway and the prefix are taken from that CIDR, while the
+interface name and the resolvers come from `bootstrap.nicName` /
+`bootstrap.dns`, so the two can never disagree.
+
+```yaml
+apiVersion: k8s-nodescale.github.io/v1alpha1
+kind: K8sWorkerPool
+metadata:
+  name: lab-cluster
+spec:
+  replicas: 3
+  namePrefix: lab-cluster
+  bootstrap:
+    osUser: ubuntu
+    osPasswordHash: "$6$REPLACE_WITH_HASH"
+    sshAuthorizedKey: "ssh-ed25519 AAAA... ops@example.com"
+    nicName: ens192
+    dns: ["10.74.64.91"]
+    k8sVersion: "1.28.15-1.1"
+    k8sMinorRepo: "v1.28"
+  flavor:
+    cpus: 4
+    memoryMB: 8192
+    osDiskGB: 40
+    template: noble-template_1.1.0_k8s
+    disks:
+      - sizeGB: 60
+        mount: /var/lib
+        busType: paravirtual
+        busNumber: 1
+        unitNumber: 0
+  provider: vsphere
+  vsphere:
+    datacenter: MSK_Dev_DC
+    cluster: mskdev
+    datastore: 99DOR13_DEV_NFS_L11
+    network: Avantage_VL_DEV_MGMT_CNO-330
+    folder: /HUB Infrastructure/dev/k8s-test-lab
+    # resourcePool: ""   # empty means the cluster root pool
+  ipPlan:
+    cidr: 10.99.96.64/26
+    mNodeOffset: 4
+    wNodeOffset: 10
+    kubeapiLB: 2
+    ingressLB: 3
+    masterCount: 3
+    reserved:
+      - 10.99.96.65
+      - 10.99.96.66
+      - 10.99.96.67
+  join:
+    endpoint: 10.99.96.66:6443
+    tokenTTL: 1h
+  scaleDown:
+    minReplicas: 1
+    drainTimeout: 10m
+```
+
+The controller needs the vCenter connection once for the whole process: point
+`vsphere.existingSecret` at a Secret with `url`, `user`, `password` and
+optionally `datacenter`, `folderRoot`, `insecure` (see
+[Where the platform credentials live](#where-the-platform-credentials-live)).
+`VSPHERE_FOLDER_ROOT` is worth setting in a shared datacenter: it is the one
+boundary every pool folder is checked against.
+
 ## Layout
 
 ```
@@ -285,7 +398,8 @@ internal/controller/     WorkerPool reconciler (+ Node watch)
 internal/cloud/          platform contract: WorkerCompute, CapacityReader,
                          optional PoolMembership, Factory + Placement
 internal/cloud/vcd/      vCloud Director factory + per-pool provider
-internal/cloud/vsphere/  vSphere stub (same contract, ErrNotImplemented)
+internal/cloud/vsphere/  vSphere factory + per-pool provider: clone, guestinfo,
+                         annotation record, cluster/datastore capacity
 internal/kube/           kube.Provider interface + client-go implementation
 internal/ipam/           ip_plan-aware IP ledger/allocator (+ tests)
 internal/cloudinit/      renderer + embedded templates
@@ -1239,8 +1353,13 @@ Two consequences worth knowing before doing it:
   only thing that reads them. The Ansible role creates the Secret from
   `lookup('password')` on the control host when it is missing, so a manual
   rotation survives a re-run.
-- **vSphere** - not implemented yet. When it is, the connection belongs in the
-  placement's Secret, so a pool references it instead of carrying credentials.
+- **vSphere** - optional, `vsphere.existingSecret` in the release namespace,
+  keys `url`, `user`, `password` and optionally `datacenter`, `folderRoot`,
+  `insecure`. The chart renders the `VSPHERE_*` variables only when the name is
+  set, so a vCD-only release needs no vCenter. The connection is process-wide
+  (one login, shared by every vSphere pool), not per placement: a pool says
+  where it runs, not who it authenticates as, and `VSPHERE_FOLDER_ROOT` is the
+  tenant boundary the controller enforces on every pool folder.
 - **What protects them.** A Kubernetes Secret is base64, not encryption: it is
   protected by the API server's RBAC (only the controller's ServiceAccount and
   whoever may read Secrets in that namespace), by etcd access control, and by
