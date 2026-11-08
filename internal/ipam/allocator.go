@@ -8,20 +8,139 @@ import (
 	"sort"
 )
 
-// Plan mirrors Terraform's ip_plan variable.
+// Plan mirrors Terraform's ip_plan variable. Offsets are written relative to
+// the start of the VM range, and VMIPOffset says where that range begins inside
+// the prefix: address = prefix + VMIPOffset + offset. New applies the shift
+// once, so every offset the allocator stores and reports afterwards is absolute
+// inside the prefix.
 type Plan struct {
-	CIDR        string
-	MNodeOffset int
-	WNodeOffset int
-	DVMOffset   int
-	KubeAPILB   int
-	IngressLB   int
-	MasterCount int32
-	// NodeCount is the size of the worker window: wNodeOffset .. wNodeOffset+
-	// NodeCount-1. It is never zero - the CRD defaults it to 10 and validates a
-	// minimum of 1, so "unset" cannot mean "the whole network".
+	CIDR         string
+	VMIPOffset   int
+	MNodeOffset  int
+	WNodeOffset  int
+	DVMOffset    int
+	KubeAPILB    int
+	IngressLB    int
+	LBNodeOffset int
+	LBNodeCount  int32
+	MasterCount  int32
+	// NodeCount is the size of the worker window: WNodeOffset .. WNodeOffset+
+	// NodeCount-1, both already shifted. It is never zero - the CRD defaults it
+	// to 10 and validates a minimum of 1, so "unset" cannot mean "the whole
+	// network".
 	NodeCount int32
 	Reserved  []string
+}
+
+// Shift applies vm_ip_offset to a named offset. Negative offsets count from the
+// end of the prefix (Terraform's cidrhost) and are never shifted: "-3" is the
+// third address from the end of the subnet, whatever vm_ip_offset says.
+//
+// It is exported because the controller's pre-flight and the management page
+// render the window from spec.ipPlan without building an allocator.
+func Shift(off, vmIPOffset int) int {
+	if off < 0 {
+		return off
+	}
+	return off + vmIPOffset
+}
+
+// shiftPlan returns the plan with every named offset made absolute. VMIPOffset
+// is zeroed afterwards: the shift is applied exactly once, at construction.
+func shiftPlan(plan Plan) Plan {
+	plan.MNodeOffset = Shift(plan.MNodeOffset, plan.VMIPOffset)
+	plan.WNodeOffset = Shift(plan.WNodeOffset, plan.VMIPOffset)
+	plan.DVMOffset = Shift(plan.DVMOffset, plan.VMIPOffset)
+	plan.KubeAPILB = Shift(plan.KubeAPILB, plan.VMIPOffset)
+	plan.IngressLB = Shift(plan.IngressLB, plan.VMIPOffset)
+	plan.LBNodeOffset = Shift(plan.LBNodeOffset, plan.VMIPOffset)
+	plan.VMIPOffset = 0
+	return plan
+}
+
+// validatePlan refuses a plan whose window or named offsets cannot be honoured.
+// A wrong offset is expensive - it either silently protects the wrong address
+// or hands out an address the cluster already uses - so nothing here is
+// clamped: the plan is refused and the operator sees which number is wrong.
+func validatePlan(plan Plan, total uint64) error {
+	if plan.NodeCount < 1 {
+		return fmt.Errorf("nodeCount %d must be at least 1: a pool without a window would take the whole network", plan.NodeCount)
+	}
+	if plan.VMIPOffset < 0 {
+		return fmt.Errorf("vmIPOffset %d must not be negative: it moves the VM range into the prefix", plan.VMIPOffset)
+	}
+	// The last usable offset is the one before the broadcast address.
+	last := int64(total) - 2
+	if last < 1 {
+		return fmt.Errorf("cidr %s is too small for a pool", plan.CIDR)
+	}
+	start := int64(Shift(plan.WNodeOffset, plan.VMIPOffset))
+	switch {
+	case start <= 1:
+		return fmt.Errorf("wNodeOffset %d with vmIPOffset %d starts at %d, at or below the gateway of %s",
+			plan.WNodeOffset, plan.VMIPOffset, start, plan.CIDR)
+	case start > last:
+		return fmt.Errorf("wNodeOffset %d with vmIPOffset %d is outside %s",
+			plan.WNodeOffset, plan.VMIPOffset, plan.CIDR)
+	case start+int64(plan.NodeCount)-1 > last:
+		return fmt.Errorf("nodeCount %d from offset %d (wNodeOffset %d, vmIPOffset %d) does not fit %s: the window would end past the last usable address (%d available)",
+			plan.NodeCount, start, plan.WNodeOffset, plan.VMIPOffset, plan.CIDR, last-start+1)
+	}
+	// Infrastructure offsets are reserved, so one that falls outside the prefix
+	// would be a silent no-op and the address would be handed to a worker.
+	named := []struct {
+		field string
+		off   int
+	}{
+		{"dvmOffset", plan.DVMOffset},
+		{"kubeapiLB", plan.KubeAPILB},
+		{"ingressLB", plan.IngressLB},
+		{"lbNodeOffset", plan.LBNodeOffset},
+		{"mNodeOffset", plan.MNodeOffset},
+	}
+	for _, n := range named {
+		if n.off <= 0 {
+			continue
+		}
+		off := int64(Shift(n.off, plan.VMIPOffset))
+		if off > last {
+			return fmt.Errorf("%s %d with vmIPOffset %d is outside %s", n.field, n.off, plan.VMIPOffset, plan.CIDR)
+		}
+	}
+	masters := int64(0)
+	if plan.MasterCount > 0 && plan.MNodeOffset > 0 {
+		masters = int64(Shift(plan.MNodeOffset, plan.VMIPOffset)) + int64(plan.MasterCount) - 1
+	}
+	if masters > last {
+		return fmt.Errorf("mNodeOffset %d for masterCount %d with vmIPOffset %d is outside %s",
+			plan.MNodeOffset, plan.MasterCount, plan.VMIPOffset, plan.CIDR)
+	}
+	lbCount := int64(plan.LBNodeCount)
+	if lbCount < 1 {
+		lbCount = 1
+	}
+	if plan.LBNodeOffset > 0 {
+		if int64(Shift(plan.LBNodeOffset, plan.VMIPOffset))+lbCount-1 > last {
+			return fmt.Errorf("lbNodeOffset %d for lbNodeCount %d with vmIPOffset %d is outside %s",
+				plan.LBNodeOffset, plan.LBNodeCount, plan.VMIPOffset, plan.CIDR)
+		}
+	}
+	return nil
+}
+
+// Validate reports whether a plan can allocate at all, without building an
+// allocator. The controller uses it for the InvalidSpec condition and the
+// management page for its window warning, so both agree with what New enforces.
+func Validate(plan Plan) error {
+	p, err := netip.ParsePrefix(plan.CIDR)
+	if err != nil {
+		return fmt.Errorf("parse cidr %q: %w", plan.CIDR, err)
+	}
+	if !p.Addr().Is4() {
+		return fmt.Errorf("only IPv4 CIDRs are supported, got %q", plan.CIDR)
+	}
+	total := uint64(1) << uint(32-p.Masked().Bits())
+	return validatePlan(plan, total)
 }
 
 // Ledger is the persisted allocation state.
@@ -57,11 +176,15 @@ func New(plan Plan, ledger Ledger) (*Allocator, error) {
 		return nil, fmt.Errorf("only IPv4 CIDRs are supported, got %q", plan.CIDR)
 	}
 	p = p.Masked()
+	total := uint64(1) << uint(32-p.Bits())
+	if err := validatePlan(plan, total); err != nil {
+		return nil, err
+	}
 
 	a := &Allocator{
-		plan:     plan,
+		plan:     shiftPlan(plan),
 		prefix:   p,
-		total:    uint64(1) << uint(32-p.Bits()),
+		total:    total,
 		reserved: map[netip.Addr]struct{}{},
 		used:     map[netip.Addr]struct{}{},
 		ledger: Ledger{
@@ -71,16 +194,14 @@ func New(plan Plan, ledger Ledger) (*Allocator, error) {
 		},
 	}
 	a.windowStart, a.windowEnd = a.window()
-	if err := a.validateWindow(); err != nil {
-		return nil, err
-	}
 	a.buildReserved()
 	a.buildUsed()
 	return a, nil
 }
 
-// window is the range of offsets this pool may allocate from: wNodeOffset for
-// NodeCount addresses. The end is exclusive here.
+// window is the range of offsets this pool may allocate from: WNodeOffset for
+// NodeCount addresses, both already absolute inside the prefix. The end is
+// exclusive here.
 func (a *Allocator) window() (start, end uint64) {
 	start = 0
 	if a.plan.WNodeOffset > 0 {
@@ -93,21 +214,6 @@ func (a *Allocator) window() (start, end uint64) {
 	return start, end
 }
 
-// validateWindow refuses a window that is empty or does not fit the network.
-// There is no "unbounded" mode: a pool that may take everything says so with a
-// number, so the limit is visible in the object rather than implied by a zero.
-func (a *Allocator) validateWindow() error {
-	if a.plan.NodeCount < 1 {
-		return fmt.Errorf("nodeCount %d must be at least 1: a pool without a window would take the whole network", a.plan.NodeCount)
-	}
-	// The last offset is the broadcast address, so a window may end at total-2.
-	if a.windowStart+uint64(a.plan.NodeCount) > a.total-1 {
-		return fmt.Errorf("nodeCount %d from wNodeOffset %d does not fit %s (%d addresses available)",
-			a.plan.NodeCount, a.plan.WNodeOffset, a.plan.CIDR, a.total-1-a.windowStart)
-	}
-	return nil
-}
-
 // inWindow reports whether an offset belongs to this pool. Addresses outside it
 // belong to another pool that declared a neighbouring window.
 func (a *Allocator) inWindow(off uint64) bool {
@@ -115,7 +221,7 @@ func (a *Allocator) inWindow(off uint64) bool {
 }
 
 func (a *Allocator) buildReserved() {
-	a.reserveOffset(1) // default gateway
+	a.reserveOffset(1) // the subnet's gateway: never shifted by vmIPOffset
 	if a.plan.KubeAPILB > 0 {
 		a.reserveOffset(a.plan.KubeAPILB)
 	}
@@ -124,6 +230,15 @@ func (a *Allocator) buildReserved() {
 	}
 	if a.plan.DVMOffset != 0 {
 		a.reserveOffset(a.plan.DVMOffset)
+	}
+	if a.plan.LBNodeOffset > 0 {
+		count := int(a.plan.LBNodeCount)
+		if count < 1 {
+			count = 1
+		}
+		for i := 0; i < count; i++ {
+			a.reserveOffset(a.plan.LBNodeOffset + i)
+		}
 	}
 	if a.plan.MasterCount > 0 && a.plan.MNodeOffset > 0 {
 		for i := int32(0); i < a.plan.MasterCount; i++ {

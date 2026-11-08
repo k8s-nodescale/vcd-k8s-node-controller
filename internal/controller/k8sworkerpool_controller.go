@@ -198,7 +198,7 @@ func (r *WorkerPoolReconciler) reconcile(ctx context.Context, before, pool *infr
 	}
 	actual := ownedWorkerVMs(pool, all)
 
-	alloc, err := ipam.New(toIPAMPlan(pool.Spec.IPPlan, pool.Spec.VCD), toIPAMLedger(pool.Status.Ledger))
+	alloc, err := ipam.New(toIPAMPlan(pool.Spec.IPPlan), toIPAMLedger(pool.Status.Ledger))
 	if err != nil {
 		r.setCondition(pool, metav1.ConditionFalse, "InvalidIPPlan", err.Error())
 		return ctrl.Result{RequeueAfter: requeueInvalidSpec}, nil
@@ -828,6 +828,10 @@ func normalizeVSphereFolder(dc, folder string) string {
 // validateIPWindow checks that the window is usable and fits the network. It is
 // a per-object check: whether the window overlaps another pool's is the job of
 // the admission webhook, because that needs the other objects.
+//
+// The arithmetic - vm_ip_offset, the gateway, the named offsets - lives in the
+// allocator, so the condition an operator sees names the same numbers New will
+// enforce.
 func validateIPWindow(plan infrav1.IPPlan) string {
 	if plan.NodeCount < 1 {
 		return fmt.Sprintf("spec.ipPlan.nodeCount %d must be at least 1: a pool without a window would take the whole network", plan.NodeCount)
@@ -836,21 +840,13 @@ func validateIPWindow(plan infrav1.IPPlan) string {
 	if err != nil {
 		return fmt.Sprintf("spec.ipPlan.cidr %q is not a CIDR: %v", plan.CIDR, err)
 	}
-	ones, bits := network.Mask.Size()
-	if bits != 32 {
+	if ones, bits := network.Mask.Size(); bits != 32 {
 		return fmt.Sprintf("spec.ipPlan.cidr %q is not IPv4", plan.CIDR)
+	} else if ones > 30 {
+		return fmt.Sprintf("spec.ipPlan.cidr %q is too small for a pool", plan.CIDR)
 	}
-	total := int64(1) << uint(32-ones)
-	start := int64(plan.WNodeOffset)
-	if start < 0 {
-		start = 0
-	}
-	if start >= total-1 {
-		return fmt.Sprintf("spec.ipPlan.wNodeOffset %d is outside %s", plan.WNodeOffset, plan.CIDR)
-	}
-	if start+int64(plan.NodeCount) > total-1 {
-		return fmt.Sprintf("spec.ipPlan.nodeCount %d from wNodeOffset %d does not fit %s: the window would end past the last usable address (%d available)",
-			plan.NodeCount, plan.WNodeOffset, plan.CIDR, total-1-start)
+	if err := ipam.Validate(toIPAMPlan(plan)); err != nil {
+		return "spec.ipPlan: " + err.Error()
 	}
 	return ""
 }
@@ -1354,21 +1350,20 @@ func buildJoinCommand(endpoint, token, caHash string) (string, error) {
 	return fmt.Sprintf("kubeadm join %s --token %s --discovery-token-ca-cert-hash %s", endpoint, token, caHash), nil
 }
 
-func toIPAMPlan(p infrav1.IPPlan, v *infrav1.VCDRef) ipam.Plan {
-	dvm := 0
-	if v != nil {
-		dvm = v.DVMOffset
-	}
+func toIPAMPlan(p infrav1.IPPlan) ipam.Plan {
 	return ipam.Plan{
-		CIDR:        p.CIDR,
-		MNodeOffset: p.MNodeOffset,
-		WNodeOffset: p.WNodeOffset,
-		DVMOffset:   dvm,
-		KubeAPILB:   p.KubeAPILB,
-		IngressLB:   p.IngressLB,
-		MasterCount: p.MasterCount,
-		NodeCount:   p.NodeCount,
-		Reserved:    p.Reserved,
+		CIDR:         p.CIDR,
+		VMIPOffset:   p.VMIPOffset,
+		MNodeOffset:  p.MNodeOffset,
+		WNodeOffset:  p.WNodeOffset,
+		DVMOffset:    p.DVMOffset,
+		KubeAPILB:    p.KubeAPILB,
+		IngressLB:    p.IngressLB,
+		LBNodeOffset: p.LBNodeOffset,
+		LBNodeCount:  p.LBNodeCount,
+		MasterCount:  p.MasterCount,
+		NodeCount:    p.NodeCount,
+		Reserved:     p.Reserved,
 	}
 }
 

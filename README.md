@@ -140,14 +140,13 @@ One `K8sWorkerPool` describes the worker set of a single cluster. You own
 | `provider` | no | Platform that runs the workers: `vcd` (default) or `vsphere`. The block for the selected platform is required; the other is ignored. See [Platform providers](#platform-providers). |
 | `vcd.org` / `vcd.vdc` / `vcd.vapp` / `vcd.orgNetwork` | yes* | Placement of the VM. Required when `provider` is `vcd`. |
 | `vcd.catalog` / `vcd.catalogOrg` | no | Catalog holding the template (defaults to the controller org). |
-| `vcd.dvmOffset` | no | Address offset of the deployment VM in Terraform's `ip_plan`; the controller reserves it so no worker gets that address. Only the vCD bootstrap has a DVM. |
 | `vsphere.cluster` | yes* | Compute cluster the pool runs in (e.g. `mskdev`). Its hosts are the pool's capacity: a worker is never placed on a host of another cluster. Required when `provider` is `vsphere`. |
 | `vsphere.datastore` | yes* | Datastore holding the worker disks; also the storage the capacity pre-flight reads. |
 | `vsphere.folder` | yes* | VM folder the workers are cloned into. It must be at or below `VSPHERE_FOLDER_ROOT` when the controller is configured with one. |
 | `vsphere.network` | yes* | Port group the worker NIC is attached to. |
 | `vsphere.datacenter` | no | vCenter datacenter, e.g. `MSK_Dev_DC`. Defaults to `VSPHERE_DATACENTER`. |
 | `vsphere.resourcePool` | no | Resource pool inside the cluster. Empty means the root pool of the cluster. |
-| `ipPlan` | yes | Mirrors Terraform's `ip_plan`: `cidr`, `mNodeOffset`, `wNodeOffset`, `kubeapiLB`, `ingressLB`, `masterCount`, `reserved[]`. Workers are allocated from `wNodeOffset` upwards. |
+| `ipPlan` | yes | Mirrors Terraform's `ip_plan`: `cidr`, `vmIPOffset`, `dvmOffset`, `kubeapiLB`, `ingressLB`, `lbNodeOffset`/`lbNodeCount`, `mNodeOffset`/`masterCount`, `wNodeOffset`, `nodeCount`, `reserved[]`. Every offset is relative to `vmIPOffset`: `address = prefix + vmIPOffset + offset`. Workers are allocated from `vmIPOffset+wNodeOffset` upwards. |
 | `join.endpoint` | no | Control-plane address, `host:port` of the API VIP. |
 | `join.tokenTTL` | no | Lifetime of the per-VM bootstrap token (default `1h`). |
 | `join.labels` / `join.taints` | no | Pool-wide, applied to every Ready worker (`taints` in `key[=value]:Effect` form). |
@@ -291,20 +290,21 @@ spec:
     vapp: demo-cluster
     orgNetwork: demo-cluster-net
     catalog: Templates
-    dvmOffset: -3
   ipPlan:
     cidr: 10.10.0.0/24
-    mNodeOffset: 4
-    wNodeOffset: 7
-    kubeapiLB: 2
-    ingressLB: 3
-    masterCount: 3
+    dvmOffset: 2          # .2  - the Terraform bootstrap host
+    kubeapiLB: 3          # .3  - the API VIP
+    ingressLB: 4          # .4  - optional ingress VIP
+    lbNodeOffset: 5       # .5  - first load-balancer VM
+    lbNodeCount: 2        # .5-.6
+    mNodeOffset: 7        # .7  - first master
+    masterCount: 3        # .7-.9
+    wNodeOffset: 10       # .10 - first worker
+    nodeCount: 10         # .10-.19
     reserved:
-      - 10.10.0.1
-      - 10.10.0.2
-      - 10.10.0.3
+      - 10.10.0.200
   join:
-    endpoint: 10.10.0.2:6443
+    endpoint: 10.10.0.3:6443
     tokenTTL: 1h
     labels:
       node-role.kubernetes.io/worker: ""
@@ -365,17 +365,17 @@ spec:
     # resourcePool: ""   # empty means the cluster root pool
   ipPlan:
     cidr: 10.99.96.64/26
-    mNodeOffset: 4
-    wNodeOffset: 10
-    kubeapiLB: 2
-    ingressLB: 3
-    masterCount: 3
-    reserved:
-      - 10.99.96.65
-      - 10.99.96.66
-      - 10.99.96.67
+    vmIPOffset: 35         # the VM range starts at .99; the gateway stays .65
+    dvmOffset: 2           # .101 - the Terraform bootstrap host
+    kubeapiLB: 3           # .102 - the API VIP
+    lbNodeOffset: 5        # .104 - first load-balancer VM
+    lbNodeCount: 2         # .104-.105
+    mNodeOffset: 7         # .106 - first master
+    masterCount: 3         # .106-.108
+    wNodeOffset: 10        # .109 - first worker
+    nodeCount: 17          # .109-.125
   join:
-    endpoint: 10.99.96.66:6443
+    endpoint: 10.99.96.102:6443
     tokenTTL: 1h
   scaleDown:
     minReplicas: 1
@@ -987,18 +987,43 @@ object. There is deliberately no "whole network" mode - a pool that may take
 everything says so with a number, so the size is visible in `kubectl get -o yaml`
 and in review.
 
+`vmIPOffset` moves the whole VM range into the subnet. Terraform's `ip_plan`
+writes the named offsets relative to the start of that range, and `vm_ip_offset`
+says where the range begins, so the rule is
+`address = prefix + vmIPOffset + offset`. The gateway is the one address that
+does not move: it belongs to the subnet, not to the range. This is the
+acceptance case, the lab subnet `10.99.96.64/26` with offset 35:
+
+```yaml
+ipPlan:
+  cidr: 10.99.96.64/26
+  vmIPOffset: 35      # the range starts at .99
+  dvmOffset: 2        # .101
+  kubeapiLB: 3        # .102
+  lbNodeOffset: 5     # .104 (lbNodeCount: 2 covers .104-.105)
+  mNodeOffset: 7      # .106, three masters: .106-.108
+  wNodeOffset: 10     # .109, the first worker
+  nodeCount: 17       # .109-.125; the gateway .65 is untouched
+```
+
+A plan whose shifted window starts at or below the gateway, or ends past the last
+usable address, is refused as `InvalidSpec` - nothing is clamped and nothing is
+silently moved. The named offsets are checked the same way: a VIP or master range
+that falls outside the prefix would otherwise be a reservation that protects
+nothing.
+
 What the controller always keeps out of a window, whatever it is set to: the
 network and broadcast addresses, the gateway (offset 1), `kubeapiLB`,
-`ingressLB`, the masters (`mNodeOffset` for `masterCount`), `dvmOffset`, and
-everything listed in `reserved`. Ordinals in worker names are relative to
-`wNodeOffset`, so the first worker of a pool whose window starts at .40 is still
-`namePrefix-wrk-01`.
+`ingressLB`, `lbNodeOffset`/`lbNodeCount`, the masters (`mNodeOffset` for
+`masterCount`), `dvmOffset`, and everything listed in `reserved`. Ordinals in
+worker names are relative to the (shifted) `wNodeOffset`, so the first worker of
+a pool whose window starts at .40 is still `namePrefix-wrk-01`.
 
 ### The rules, including every edge
 
-1. **The window must fit.** `wNodeOffset + nodeCount - 1` may not pass the last
-   usable address (the broadcast, so `total - 2`). A pool that asks for more is
-   refused with `InvalidSpec` and nothing is created.
+1. **The window must fit.** `vmIPOffset + wNodeOffset + nodeCount - 1` may not
+   pass the last usable address (the broadcast, so `total - 2`). A pool that asks
+   for more is refused with `InvalidSpec` and nothing is created.
 2. **`nodeCount: 0` is not a mode.** The CRD minimum is 1 and the controller
    repeats the check, because a zero used to be read as "unbounded" and a typo
    would have handed a pool the entire subnet.
@@ -1031,6 +1056,17 @@ everything listed in `reserved`. Ordinals in worker names are relative to
     the same address. Keep windows disjoint by hand; the admission webhook
     (roadmap 5) is what makes the API refuse the second one, and a
     controller-side guard reports the conflict until then.
+11. **`vmIPOffset` moves the range, not the subnet.** Every named offset is
+    applied on top of it; the gateway stays at `prefix+1`. `dvmOffset` used to
+    live in `spec.vcd` and is now part of `spec.ipPlan`, because it is an address,
+    not a platform detail: **move it when upgrading** - the CRD prunes the old
+    field, so a pool that keeps `spec.vcd.dvmOffset` would silently stop
+    reserving the deployment VM. `lbNodeOffset` with `lbNodeCount` covers the
+    load-balancer pair; anything the block does not name still goes in
+    `reserved[]`. The ledger stores addresses rather than offsets, so changing
+    only `vmIPOffset` never moves a worker that is already allocated - but it
+    does change which addresses are free, so check `status.ledger.used` before
+    changing it on a live pool.
 
 ### A worked example on a /24
 
@@ -1522,6 +1558,30 @@ Service, no Ingress, no Secret.
 - `spec.reconciliation.policy` defaults to `Notify` from 0.4.0: a worker that
   disappears without a request is reported, not replaced. `AutoHeal` is an
   explicit opt-in.
+
+### Address plan: the Terraform block and the CRD field
+
+The controller reads the numbers the cluster was built with, so a manifest can be
+read next to the tfvars it mirrors. Names are kept where they differ only in
+spelling:
+
+| `ip_plan` (Terraform) | `spec.ipPlan` (CRD) | Meaning |
+| --- | --- | --- |
+| `cidr` | `cidr` | The node subnet; the gateway is `prefix+1`. |
+| `vm_ip_offset` | `vmIPOffset` | How many addresses are skipped before the VM range starts. |
+| `dvm` | `dvmOffset` | The deployment VM (bootstrap host). |
+| `kubeapi_lb` | `kubeapiLB` | The API VIP. |
+| `ingress_lb` | `ingressLB` | A dedicated ingress VIP, when there is one. |
+| `lb_node` | `lbNodeOffset` | The first load-balancer VM; `lbNodeCount` says how many follow (Terraform states only the first). |
+| `m_node` | `mNodeOffset` | The first master; `masterCount` says how many. |
+| `w_node` | `wNodeOffset` | The first worker. |
+| - | `nodeCount` | The size of the pool's window, default 10. Terraform does not state it: the pool owns that part of the range. |
+| - | `reserved[]` | Addresses the block does not name (a second ingress VIP, a jump host, ...). |
+
+`vmIPOffset` defaults to 0, which is exactly the older shape where the offsets are
+absolute inside the subnet. The vCloud project keeps that shape until it is
+updated to write `vm_ip_offset` like the vSphere one; a manifest does not change
+in that move except that the range start becomes explicit.
 
 ## Design
 

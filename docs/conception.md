@@ -232,16 +232,21 @@ spec:
     vapp:   k8s-lab-vapp
     orgNetwork: routed-k8s-net
     catalog: Templates
-    dvmOffset:       -3            # deployment VM slot, vCD bootstrap only
   ipPlan:                        # mirrors Terraform var.ip_plan
     cidr:            192.168.100.0/24
-    mNodeOffset:     4
-    wNodeOffset:     7
-    kubeapiLB:       2
-    ingressLB:       3
-    reserved:        [192.168.100.1, 192.168.100.2, 192.168.100.3]
+    vmIPOffset:      0            # addresses are absolute until the plan shifts the range
+    dvmOffset:       2            # deployment VM slot
+    kubeapiLB:       3
+    ingressLB:       4
+    lbNodeOffset:    5            # first load-balancer VM
+    lbNodeCount:     2
+    mNodeOffset:     7
+    masterCount:     3
+    wNodeOffset:     10
+    nodeCount:       10
+    reserved:        [192.168.100.200]
   join:
-    endpoint: 192.168.100.2:6443
+    endpoint: 192.168.100.3:6443
     tokenTTL: 1h
   ingressPool:
     type: nsxv            # nsxv | nsxt

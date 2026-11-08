@@ -90,3 +90,35 @@ func TestAddressSpacesDoNotSuggestASingleAddress(t *testing.T) {
 		t.Fatalf("suggest = %q, want none for a one-address gap", sp.suggest)
 	}
 }
+
+// The page reads the window through vm_ip_offset, exactly like the allocator:
+// for the lab plan it must show .109, not .74.
+func TestIPWindowAppliesVMIPOffset(t *testing.T) {
+	plan := infrav1.IPPlan{
+		CIDR: "10.99.96.64/26", VMIPOffset: 35, WNodeOffset: 10, NodeCount: 17,
+	}
+	from, to, size, declared := ipWindow(plan)
+	if !declared {
+		t.Fatal("the lab window was not declared")
+	}
+	if from != "10.99.96.109" || to != "10.99.96.125" || size != 17 {
+		t.Fatalf("got %s-%s (%d), want 10.99.96.109-10.99.96.125 (17)", from, to, size)
+	}
+}
+
+// The gap suggestion is computed on the same shifted windows, so adding a pool
+// to the lab subnet does not propose the skipped addresses.
+func TestAddressSpacesUseShiftedWindows(t *testing.T) {
+	pool := infrav1.K8sWorkerPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "lab"},
+		Spec: infrav1.K8sWorkerPoolSpec{
+			IPPlan: infrav1.IPPlan{
+				CIDR: "10.99.96.64/26", VMIPOffset: 35, WNodeOffset: 10, NodeCount: 17,
+			},
+		},
+	}
+	sp := buildAddressSpaces([]infrav1.K8sWorkerPool{pool})["10.99.96.64/26"]
+	if len(sp.free) != 1 || sp.free[0] != "10.99.96.126 - 10.99.96.126" {
+		t.Fatalf("free = %v, want only .126 after the shifted window", sp.free)
+	}
+}

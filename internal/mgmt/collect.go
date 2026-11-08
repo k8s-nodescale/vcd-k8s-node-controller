@@ -14,6 +14,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	infrav1 "github.com/k8s-nodescale/vcd-k8s-node-controller/api/v1alpha1"
+	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/ipam"
 )
 
 type Collector struct {
@@ -192,8 +193,9 @@ func diskProgress(p *infrav1.K8sWorkerPool, unit int32, want int32) *DiskProgres
 	return &DiskProgress{From: from, Done: done, Total: total}
 }
 
-// ipWindow describes the part of the CIDR this pool may hand out: wNodeOffset
-// for nodeCount addresses. The broadcast address is never in it.
+// ipWindow describes the part of the CIDR this pool may hand out:
+// vmIPOffset+wNodeOffset for nodeCount addresses. The broadcast address is never
+// in it.
 func ipWindow(plan infrav1.IPPlan) (from, to string, size int32, declared bool) {
 	prefix, err := netip.ParsePrefix(plan.CIDR)
 	if err != nil || !prefix.Addr().Is4() {
@@ -201,7 +203,7 @@ func ipWindow(plan infrav1.IPPlan) (from, to string, size int32, declared bool) 
 	}
 	prefix = prefix.Masked()
 	total := int64(1) << uint(32-prefix.Bits())
-	start := int64(plan.WNodeOffset)
+	start := int64(ipam.Shift(plan.WNodeOffset, plan.VMIPOffset))
 	if start < 0 {
 		start = 0
 	}
@@ -258,7 +260,7 @@ func buildAddressSpaces(pools []infrav1.K8sWorkerPool) map[string]addressSpace {
 		}
 		prefix = prefix.Masked()
 		total := int64(1) << uint(32-prefix.Bits())
-		start := int64(plan.WNodeOffset)
+		start := int64(ipam.Shift(plan.WNodeOffset, plan.VMIPOffset))
 		if start < 0 {
 			start = 0
 		}

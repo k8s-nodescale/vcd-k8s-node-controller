@@ -195,9 +195,32 @@ spec:
                 properties:
                   cidr:
                     type: string
+                  dvmOffset:
+                    description: |-
+                      DVMOffset is the deployment VM (the Terraform bootstrap host) inside
+                      the range. The controller reserves it so no worker is ever handed that
+                      address; a deployment without a DVM leaves it at 0. It moved here from
+                      spec.vcd because the offset belongs to the address plan, not to the
+                      platform.
+                    type: integer
                   ingressLB:
                     type: integer
                   kubeapiLB:
+                    type: integer
+                  lbNodeCount:
+                    default: 0
+                    description: |-
+                      LBNodeCount is how many load-balancer VMs follow LBNodeOffset. Zero and
+                      one both mean "only the first": Terraform states the first host and not
+                      the count, so the field exists to say "there are two" without writing a
+                      hand-made reservation for the second.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  lbNodeOffset:
+                    description: |-
+                      LBNodeOffset is Terraform's lb_node: the first load-balancer VM. The
+                      reference Terraform runs two of them; LBNodeCount says how many.
                     type: integer
                   mNodeOffset:
                     type: integer
@@ -208,12 +231,12 @@ spec:
                     default: 10
                     description: |-
                       NodeCount is how many worker addresses this pool may take: its window is
-                      wNodeOffset .. wNodeOffset+nodeCount-1. Two pools can share one CIDR as
-                      long as their windows do not overlap, and a pool that outgrows its window
-                      fails instead of borrowing a neighbour's address. The default is
-                      materialised into every pool by the API server, so "not set" is not a
-                      hidden mode and zero is not a sentinel: an operator who needs a larger
-                      pool says so.
+                      vmIPOffset+wNodeOffset .. vmIPOffset+wNodeOffset+nodeCount-1. Two pools
+                      can share one CIDR as long as their windows do not overlap, and a pool
+                      that outgrows its window fails instead of borrowing a neighbour's
+                      address. The default is materialised into every pool by the API server,
+                      so "not set" is not a hidden mode and zero is not a sentinel: an
+                      operator who needs a larger pool says so.
                     format: int32
                     minimum: 1
                     type: integer
@@ -221,6 +244,15 @@ spec:
                     items:
                       type: string
                     type: array
+                  vmIPOffset:
+                    default: 0
+                    description: |-
+                      VMIPOffset is Terraform's vm_ip_offset: how many addresses of the
+                      subnet are skipped before the VM range begins. It exists for the case
+                      where the cluster cannot sit at the start of a clean subnet. The
+                      default of 0 keeps a plan that starts at the prefix.
+                    minimum: 0
+                    type: integer
                   wNodeOffset:
                     type: integer
                 required:
@@ -426,14 +458,6 @@ spec:
                     type: string
                   catalogOrg:
                     type: string
-                  dvmOffset:
-                    description: |-
-                      DVMOffset is the address offset of the deployment VM, the bootstrap
-                      host Terraform creates. The controller reserves that address so no
-                      worker is ever handed it. It lives here rather than in spec.ipPlan
-                      because only the vCD bootstrap has a DVM; the address plan itself is
-                      provider-neutral.
-                    type: integer
                   org:
                     type: string
                   orgNetwork:

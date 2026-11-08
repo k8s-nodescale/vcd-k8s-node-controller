@@ -378,11 +378,12 @@ func testPool(replicas int32) *infrav1.K8sWorkerPool {
 			},
 			VCD: &infrav1.VCDRef{
 				Org: "myorg", VDC: "My-VDC", VApp: "vapp",
-				OrgNetwork: "net", Catalog: "Templates", DVMOffset: -3,
+				OrgNetwork: "net", Catalog: "Templates",
 			},
 			IPPlan: infrav1.IPPlan{
 				CIDR: "192.168.100.0/24", MNodeOffset: 4, WNodeOffset: 7,
-				KubeAPILB: 2, IngressLB: 3, MasterCount: 3, NodeCount: 200,
+				KubeAPILB: 2, IngressLB: 3, DVMOffset: -3,
+				MasterCount: 3, NodeCount: 200,
 			},
 			Join: infrav1.JoinConfig{
 				Endpoint: "192.168.100.2:6443",

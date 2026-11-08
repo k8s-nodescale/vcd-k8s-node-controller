@@ -37,20 +37,21 @@ spec:
     vapp: k8s-lab-vapp
     orgNetwork: routed-k8s-net
     catalog: Templates
-    dvmOffset: -3
   ipPlan:
     cidr: 192.168.100.0/24
-    mNodeOffset: 4
-    wNodeOffset: 7
-    kubeapiLB: 2
-    ingressLB: 3
-    masterCount: 3
+    dvmOffset: 2          # .2  - the Terraform bootstrap host
+    kubeapiLB: 3          # .3  - the API VIP
+    ingressLB: 4          # .4  - optional ingress VIP
+    lbNodeOffset: 5       # .5  - first load-balancer VM
+    lbNodeCount: 2        # .5-.6
+    mNodeOffset: 7        # .7  - first master
+    masterCount: 3        # .7-.9
+    wNodeOffset: 10       # .10 - first worker
+    nodeCount: 10         # .10-.19
     reserved:
-      - 192.168.100.1
-      - 192.168.100.2
-      - 192.168.100.3
+      - 192.168.100.200
   join:
-    endpoint: 192.168.100.2:6443
+    endpoint: 192.168.100.3:6443
     tokenTTL: 1h
     labels:
       node-role.kubernetes.io/worker: ""

@@ -296,14 +296,6 @@ type VCDRef struct {
 	OrgNetwork string `json:"orgNetwork"`
 	Catalog    string `json:"catalog,omitempty"`
 	CatalogOrg string `json:"catalogOrg,omitempty"`
-
-	// DVMOffset is the address offset of the deployment VM, the bootstrap
-	// host Terraform creates. The controller reserves that address so no
-	// worker is ever handed it. It lives here rather than in spec.ipPlan
-	// because only the vCD bootstrap has a DVM; the address plan itself is
-	// provider-neutral.
-	// +optional
-	DVMOffset int `json:"dvmOffset,omitempty"`
 }
 
 // VSphereRef names the vSphere objects and the guest network one pool uses.
@@ -346,20 +338,59 @@ type VSphereRef struct {
 
 // IPPlan mirrors Terraform's ip_plan variable. It carries only the
 // provider-neutral address plan.
+//
+// Every offset below is relative to the start of the VM range, and VMIPOffset
+// says where that range starts inside the prefix:
+//
+//	address = prefix + vmIPOffset + offset
+//
+// The gateway (prefix+1) belongs to the subnet rather than to the range, so it
+// is not shifted.
 type IPPlan struct {
-	CIDR        string `json:"cidr"`
-	MNodeOffset int    `json:"mNodeOffset,omitempty"`
-	WNodeOffset int    `json:"wNodeOffset,omitempty"`
-	KubeAPILB   int    `json:"kubeapiLB,omitempty"`
-	IngressLB   int    `json:"ingressLB,omitempty"`
-	MasterCount int32  `json:"masterCount,omitempty"`
+	CIDR string `json:"cidr"`
+
+	// VMIPOffset is Terraform's vm_ip_offset: how many addresses of the
+	// subnet are skipped before the VM range begins. It exists for the case
+	// where the cluster cannot sit at the start of a clean subnet. The
+	// default of 0 keeps a plan that starts at the prefix.
+	// +kubebuilder:default=0
+	// +kubebuilder:validation:Minimum=0
+	VMIPOffset int `json:"vmIPOffset,omitempty"`
+
+	// DVMOffset is the deployment VM (the Terraform bootstrap host) inside
+	// the range. The controller reserves it so no worker is ever handed that
+	// address; a deployment without a DVM leaves it at 0. It moved here from
+	// spec.vcd because the offset belongs to the address plan, not to the
+	// platform.
+	// +optional
+	DVMOffset int `json:"dvmOffset,omitempty"`
+
+	MNodeOffset int `json:"mNodeOffset,omitempty"`
+	WNodeOffset int `json:"wNodeOffset,omitempty"`
+	KubeAPILB   int `json:"kubeapiLB,omitempty"`
+	IngressLB   int `json:"ingressLB,omitempty"`
+
+	// LBNodeOffset is Terraform's lb_node: the first load-balancer VM. The
+	// reference Terraform runs two of them; LBNodeCount says how many.
+	// +optional
+	LBNodeOffset int `json:"lbNodeOffset,omitempty"`
+
+	// LBNodeCount is how many load-balancer VMs follow LBNodeOffset. Zero and
+	// one both mean "only the first": Terraform states the first host and not
+	// the count, so the field exists to say "there are two" without writing a
+	// hand-made reservation for the second.
+	// +kubebuilder:default=0
+	// +kubebuilder:validation:Minimum=0
+	LBNodeCount int32 `json:"lbNodeCount,omitempty"`
+
+	MasterCount int32 `json:"masterCount,omitempty"`
 	// NodeCount is how many worker addresses this pool may take: its window is
-	// wNodeOffset .. wNodeOffset+nodeCount-1. Two pools can share one CIDR as
-	// long as their windows do not overlap, and a pool that outgrows its window
-	// fails instead of borrowing a neighbour's address. The default is
-	// materialised into every pool by the API server, so "not set" is not a
-	// hidden mode and zero is not a sentinel: an operator who needs a larger
-	// pool says so.
+	// vmIPOffset+wNodeOffset .. vmIPOffset+wNodeOffset+nodeCount-1. Two pools
+	// can share one CIDR as long as their windows do not overlap, and a pool
+	// that outgrows its window fails instead of borrowing a neighbour's
+	// address. The default is materialised into every pool by the API server,
+	// so "not set" is not a hidden mode and zero is not a sentinel: an
+	// operator who needs a larger pool says so.
 	// +kubebuilder:default=10
 	// +kubebuilder:validation:Minimum=1
 	NodeCount int32    `json:"nodeCount"`

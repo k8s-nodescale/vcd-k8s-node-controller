@@ -62,7 +62,7 @@ func (r *WorkerPoolReconciler) reconcilePoolDeletion(ctx context.Context, pool *
 		r.setCondition(pool, metav1.ConditionFalse, "CloudError", err.Error())
 		return ctrl.Result{}, err
 	}
-	alloc, err := ipam.New(toIPAMPlan(pool.Spec.IPPlan, pool.Spec.VCD), toIPAMLedger(pool.Status.Ledger))
+	alloc, err := ipam.New(toIPAMPlan(pool.Spec.IPPlan), toIPAMLedger(pool.Status.Ledger))
 	if err != nil {
 		// The ledger cannot be rebuilt, but the VMs can still be removed. A
 		// bad IP plan must not pin the finalizer forever.
