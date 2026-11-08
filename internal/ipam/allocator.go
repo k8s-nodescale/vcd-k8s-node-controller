@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/netip"
 	"sort"
+	"strings"
 )
 
 // Plan mirrors Terraform's ip_plan variable. Offsets are written relative to
@@ -424,6 +425,25 @@ func (a *Allocator) Reserve(ip string) error {
 		a.ledger.NextIndex = ord
 	}
 	return nil
+}
+
+// Block marks addresses that are in use outside this pool's ledger: a VM the
+// controller did not adopt, a VIP the plan forgot, a machine someone cloned by
+// hand. They are never allocated, and unlike Reserve they do not enter the
+// ledger, because the pool does not own them - it only must not take them.
+//
+// This is the guard against a duplicate address: the ledger alone cannot know
+// about a VM it did not recognise, so a wrong namePrefix used to hand out an
+// address another machine already answered on.
+func (a *Allocator) Block(ips ...string) {
+	for _, s := range ips {
+		addr, err := netip.ParseAddr(strings.TrimSpace(s))
+		if err != nil || !a.prefix.Contains(addr) {
+			continue
+		}
+		a.used[addr] = struct{}{}
+		a.removeFree(addr)
+	}
 }
 
 // Free releases an allocated IP and makes it eligible for reuse.

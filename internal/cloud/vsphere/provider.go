@@ -539,7 +539,7 @@ func (p *Provider) CreateVM(ctx context.Context, spec cloud.CreateVMSpec) (cloud
 	}
 	vm := object.NewVirtualMachine(cl.Client, ref)
 
-	if err := p.applyDisks(ctx, vm, dsRef, spec.OSDiskGB, spec.Disks); err != nil {
+	if err := p.applyDisks(ctx, vm, ds, spec.Name, spec.OSDiskGB, spec.Disks); err != nil {
 		// A clone that never got its disks is not a worker: remove it so the
 		// next pass starts from a clean slot instead of resuming a broken VM.
 		if derr := destroyVM(ctx, vm); derr != nil {
@@ -584,7 +584,7 @@ func (p *Provider) finishCreate(ctx context.Context, vm *object.VirtualMachine, 
 // controllers the data disks need are added, and each data disk is grown or
 // attached at its bus/unit. Every step is a separate reconfigure so the keys
 // the API assigns are read back before they are referenced.
-func (p *Provider) applyDisks(ctx context.Context, vm *object.VirtualMachine, ds types.ManagedObjectReference, osDiskGB int32, disks []cloud.DiskSpec) error {
+func (p *Provider) applyDisks(ctx context.Context, vm *object.VirtualMachine, ds *object.Datastore, vmName string, osDiskGB int32, disks []cloud.DiskSpec) error {
 	devices, err := vm.Device(ctx)
 	if err != nil {
 		return fmt.Errorf("vsphere: read devices of VM %q: %w", vm.Reference().Value, err)
@@ -597,7 +597,7 @@ func (p *Provider) applyDisks(ctx context.Context, vm *object.VirtualMachine, ds
 			return errors.New("vsphere: the template has no system disk at bus 0/unit 0")
 		}
 		if want := capacityKB(osDiskGB); disk.CapacityInKB < want {
-			disk.CapacityInKB = want
+			setDiskCapacity(disk, want)
 			changes = append(changes, editDevice(disk))
 		}
 	}
@@ -647,7 +647,7 @@ func (p *Provider) applyDisks(ctx context.Context, vm *object.VirtualMachine, ds
 		want := capacityKB(d.SizeGB)
 		if disk := diskAt(devices, d.BusNumber, d.UnitNumber); disk != nil {
 			if disk.CapacityInKB < want {
-				disk.CapacityInKB = want
+				setDiskCapacity(disk, want)
 				changes = append(changes, editDevice(disk))
 			}
 			continue
@@ -656,10 +656,45 @@ func (p *Provider) applyDisks(ctx context.Context, vm *object.VirtualMachine, ds
 		if ctrl == nil {
 			return fmt.Errorf("vsphere: disk %d: no SCSI controller at bus %d", i, d.BusNumber)
 		}
-		changes = append(changes, addDevice(newDisk(devices, ctrl, ds, d.UnitNumber, want)))
+		// The backing name is the full "[datastore] vm/disk.vmdk" form the API
+		// expects; a bare relative path is rejected as invalid. The datastore
+		// name comes from the placement rather than from Datastore.Path: the
+		// object handed to the create has no inventory path loaded, and Path
+		// would render an empty bracket ("[]/vmfs/volumes/...").
+		name := fmt.Sprintf("[%s] %s/%s-data-%d-%d.vmdk",
+			p.placement.Datastore, vmName, vmName, d.BusNumber, d.UnitNumber)
+		changes = append(changes, addDiskDevice(newDisk(devices, ctrl, ds.Reference(), name, d.UnitNumber, want)))
 	}
 	if len(changes) > 0 {
-		return reconfigure(ctx, vm, types.VirtualMachineConfigSpec{DeviceChange: changes})
+		if err := reconfigure(ctx, vm, types.VirtualMachineConfigSpec{DeviceChange: changes}); err != nil {
+			return err
+		}
+	}
+
+	// A device the API accepted but stored without capacity would only surface
+	// at power-on, as "Unable to enumerate all disks", and would leave a
+	// half-built VM behind. Check the stored shape here, while the create can
+	// still fail with a message that names the disk.
+	if len(disks) == 0 {
+		return nil
+	}
+	devices, err = vm.Device(ctx)
+	if err != nil {
+		return fmt.Errorf("vsphere: re-read devices of VM %q: %w", vm.Reference().Value, err)
+	}
+	for i, d := range disks {
+		if d.SizeGB <= 0 {
+			continue
+		}
+		want := capacityKB(d.SizeGB)
+		disk := diskAt(devices, d.BusNumber, d.UnitNumber)
+		if disk == nil {
+			return fmt.Errorf("vsphere: disk %d (bus %d unit %d) is not on the VM after the reconfigure", i, d.BusNumber, d.UnitNumber)
+		}
+		if disk.CapacityInKB < want {
+			return fmt.Errorf("vsphere: disk %d (bus %d unit %d) is %d KB after the reconfigure, want %d KB",
+				i, d.BusNumber, d.UnitNumber, disk.CapacityInKB, want)
+		}
 	}
 	return nil
 }
@@ -821,7 +856,7 @@ func (p *Provider) ResizeVM(ctx context.Context, id string, cpus, memoryMB, osDi
 		if disk == nil {
 			return cloud.VM{}, fmt.Errorf("vsphere: VM %q has no system disk at bus 0/unit 0", name)
 		}
-		disk.CapacityInKB = capacityKB(osDiskGB)
+		setDiskCapacity(disk, capacityKB(osDiskGB))
 		changes = append(changes, editDevice(disk))
 	}
 	for _, d := range disks {
@@ -833,7 +868,7 @@ func (p *Provider) ResizeVM(ctx context.Context, id string, cpus, memoryMB, osDi
 			continue // a disk the template does not have is not ours to add here
 		}
 		if wantKB := capacityKB(d.SizeGB); disk.CapacityInKB < wantKB {
-			disk.CapacityInKB = wantKB
+			setDiskCapacity(disk, wantKB)
 			changes = append(changes, editDevice(disk))
 		}
 	}
@@ -925,6 +960,17 @@ func capacityKB(gb int32) int64 {
 	return int64(gb) * 1024 * 1024
 }
 
+// setDiskCapacity writes both capacity fields. capacityInBytes is the one
+// vSphere 8 reads when a disk is created or grown - "clients must initialize it
+// when creating a new non-RDM disk" - while capacityInKB is deprecated. With
+// only the deprecated field set the API accepts the device and creates it with
+// 0 bytes, and the VM then fails to power on with "Unable to enumerate all
+// disks".
+func setDiskCapacity(disk *types.VirtualDisk, kb int64) {
+	disk.CapacityInKB = kb
+	disk.CapacityInBytes = kb * 1024
+}
+
 func kbToGB(kb int64) int32 {
 	if kb <= 0 {
 		return 0
@@ -1003,8 +1049,13 @@ func systemDisk(devices object.VirtualDeviceList) *types.VirtualDisk {
 	return diskAt(devices, 0, 0)
 }
 
-func newDisk(devices object.VirtualDeviceList, ctrl types.BaseVirtualDevice, ds types.ManagedObjectReference, unit int32, kb int64) *types.VirtualDisk {
-	disk := devices.CreateDisk(ctrl.(types.BaseVirtualController), ds, "")
+func newDisk(devices object.VirtualDeviceList, ctrl types.BaseVirtualDevice, ds types.ManagedObjectReference, fileName string, unit int32, kb int64) *types.VirtualDisk {
+	// The file name is explicit on purpose: an empty backing name is documented
+	// as "one will be chosen for you", but on this vCenter it produced a
+	// zero-byte device that could not be powered on ("Unable to enumerate all
+	// disks"). A path inside the VM's own directory is also what Terraform and
+	// the vSphere UI create.
+	disk := devices.CreateDisk(ctrl.(types.BaseVirtualController), ds, fileName)
 	disk.ControllerKey = ctrl.GetVirtualDevice().Key
 	u := unit
 	disk.UnitNumber = &u
@@ -1014,6 +1065,18 @@ func newDisk(devices object.VirtualDeviceList, ctrl types.BaseVirtualDevice, ds 
 
 func addDevice(device types.BaseVirtualDevice) types.BaseVirtualDeviceConfigSpec {
 	return &types.VirtualDeviceConfigSpec{Operation: types.VirtualDeviceConfigSpecOperationAdd, Device: device}
+}
+
+// addDiskDevice is addDevice for a disk whose backing file does not exist yet.
+// Without FileOperation=create vCenter treats the file name as an existing disk
+// and fails with "File [...] ... was not found"; govc's vm.disk.create sets the
+// same flag.
+func addDiskDevice(device types.BaseVirtualDevice) types.BaseVirtualDeviceConfigSpec {
+	return &types.VirtualDeviceConfigSpec{
+		Operation:     types.VirtualDeviceConfigSpecOperationAdd,
+		FileOperation: types.VirtualDeviceConfigSpecFileOperationCreate,
+		Device:        device,
+	}
 }
 
 func editDevice(device types.BaseVirtualDevice) types.BaseVirtualDeviceConfigSpec {

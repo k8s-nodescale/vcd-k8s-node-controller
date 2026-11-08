@@ -25,6 +25,20 @@ users:
 # the one the cluster's own images are built with.
 ssh_pwauth: true
 
+{{- if .OSPasswordHash }}
+# The image may already carry the account (the Terraform images create it).
+# cloud-init's users module leaves an existing account's password alone, so the
+# hash from the pool has to be applied through chpasswd as well - otherwise a
+# worker built by the controller has a locked-out or unknown password while the
+# spec says which one it must have.
+chpasswd:
+  expire: false
+  users:
+    - name: {{ .OSUser }}
+      password: {{ .OSPasswordHash }}
+      type: hash
+{{- end }}
+
 # Same apt policy as the Terraform baseline: retry a slow mirror, wait for the
 # dpkg lock instead of failing, and never update or upgrade on its own.
 apt:
@@ -45,6 +59,22 @@ package_upgrade: false
 # customization-phases.md §4.2 - work that can fail slowly or needs a retry
 # belongs in a systemd unit, not here.
 bootcmd:
+{{- if .OSPasswordHash }}
+  # Early and unconditional: a worker whose disk stage fails must still be
+  # reachable with the password the pool says it has. The users module skips an
+  # account the image already carries, so the hash is applied here as well. The
+  # hash is single-quoted: unquoted, the shell expands "$6$..." into nothing and
+  # chpasswd receives a corrupted hash.
+  - |
+    printf '%s\n' '{{ .OSUser }}:{{ .OSPasswordHash }}' | chpasswd -e || true
+{{- end }}
+  # The image ships /etc/security/access.conf ending in "-:ALL:ALL" with
+  # pam_access enabled for login and sshd, so an account without an allow line
+  # cannot log in at all - console included. The Terraform baseline inserts the
+  # same line for the cluster account.
+  - |
+    grep -q '^+:{{ .OSUser }}:ALL$' /etc/security/access.conf 2>/dev/null ||
+      sed -i '/^-:ALL:ALL/i +:{{ .OSUser }}:ALL' /etc/security/access.conf
   - |
     if [ -x /usr/local/sbin/prepare-data-disks.sh ]; then
       /usr/local/sbin/prepare-data-disks.sh || echo "prepare-data-disks.sh failed, continuing"
@@ -75,6 +105,14 @@ write_files:
   # worker has to be rescued by hand. 0600 because sshd refuses a group- or
   # world-writable include file. The matching apt policy is written by the
   # pre-requisites script, after the Pro packages that own 10periodic are gone.
+  - path: /etc/sudoers.d/{{ .OSUser }}
+    permissions: '0440'
+    content: |
+      # Written by the node controller, mirroring the Terraform baseline so a
+      # worker that failed a stage can be inspected without a password prompt.
+      Defaults:{{ .OSUser }} !requiretty
+      {{ .OSUser }} ALL=(ALL) NOPASSWD: ALL
+
   - path: /etc/ssh/sshd_config.d/01-k8s-auth.conf
     content: |
       PubkeyAuthentication yes
@@ -136,6 +174,15 @@ write_files:
     permissions: '0700'
     content: |
 {{ .GrowScript }}
+
+  # The same Option A script the vCD initscript runs in postCustomization:
+  # LVM on the data disks, copy /var and /var/lib into the new volumes, fstab by
+  # UUID. vCD reboots the guest after customization; here the guest does it once
+  # from runcmd below, because moving /var only takes effect on the next boot.
+  - path: /usr/local/sbin/prepare-data-disks.sh
+    permissions: '0700'
+    content: |
+{{ .DiskSetupScript }}
 
   - path: /usr/local/sbin/vcd-grow-data-disks.sh
     permissions: '0700'
@@ -397,13 +444,34 @@ write_files:
 
 runcmd:
   - systemctl daemon-reload
-  - systemctl enable vcd-grow-disks.service
-  - systemctl enable vcd-ensure-layout.service
+  - systemctl enable vcd-grow-disks.service vcd-ensure-layout.service
+  - systemctl enable k8s-node-prereqs.service k8s-node-join.service
+{{- if .Disks }}
+  # Prepare the data disks and reboot once, exactly like vCD after the
+  # post-customization phase. The reboot is what makes /var and /var/lib mount
+  # from fstab; on the next boot the enabled units install the packages and
+  # join. A failed preparation does not reboot, so the VM stays inspectable.
+  - /usr/local/sbin/prepare-data-disks.sh && /sbin/reboot
+{{- else }}
   - systemctl start --no-block vcd-ensure-layout.service
   - systemctl enable --now --no-block k8s-node-prereqs.service
-  # --now, not just enable: on the first boot of a worker the prerequisites
-  # have just finished and the node should join in this boot, not the next one.
   - systemctl enable --now --no-block k8s-node-join.service
+{{- end }}
+{{- if .SSHAllowedSources }}
+  # The image restricts sshd with an AllowUsers line; the Terraform baseline
+  # appends allowed_ssh_ips to it. Add the pool's sources the same way, once
+  # each, before sshd is restarted below.
+  - |
+    for src in {{ range .SSHAllowedSources }}{{ . }} {{ end }}; do
+      [ -z "$src" ] && continue
+      grep -q -- "$src" /etc/ssh/sshd_config && continue
+      if grep -q '^AllowUsers' /etc/ssh/sshd_config; then
+        sed -i "/^AllowUsers/ s|$| $src|" /etc/ssh/sshd_config
+      else
+        echo "AllowUsers $src" >> /etc/ssh/sshd_config
+      fi
+    done
+{{- end }}
   # The sshd drop-in above is read at start, and the image's socket unit may be
   # the one that answers: restart all three the way the Terraform baseline does.
   - systemctl restart ssh ssh.socket ssh.service || true

@@ -244,13 +244,21 @@ type RolloutPolicy struct {
 
 // BootstrapConfig carries the OS-level inputs for generated cloud-init.
 type BootstrapConfig struct {
-	OSUser           string   `json:"osUser,omitempty"`
-	OSPasswordHash   string   `json:"osPasswordHash,omitempty"`
-	SSHAuthorizedKey string   `json:"sshAuthorizedKey,omitempty"`
-	NICName          string   `json:"nicName,omitempty"`
-	DNS              []string `json:"dns,omitempty"`
-	K8sVersion       string   `json:"k8sVersion,omitempty"`
-	K8sMinorRepo     string   `json:"k8sMinorRepo,omitempty"`
+	OSUser           string `json:"osUser,omitempty"`
+	OSPasswordHash   string `json:"osPasswordHash,omitempty"`
+	SSHAuthorizedKey string `json:"sshAuthorizedKey,omitempty"`
+
+	// SSHAllowedSources are extra sshd AllowUsers patterns the worker admits,
+	// e.g. "*@10.99.96.64/26". The images ship a restrictive AllowUsers line
+	// (the Terraform baseline appends the same values from allowed_ssh_ips); a
+	// worker that omits this list keeps the image's list, which may not include
+	// the operator's network.
+	// +optional
+	SSHAllowedSources []string `json:"sshAllowedSources,omitempty"`
+	NICName           string   `json:"nicName,omitempty"`
+	DNS               []string `json:"dns,omitempty"`
+	K8sVersion        string   `json:"k8sVersion,omitempty"`
+	K8sMinorRepo      string   `json:"k8sMinorRepo,omitempty"`
 }
 
 // NodeFlavor describes a worker VM shape.

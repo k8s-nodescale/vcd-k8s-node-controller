@@ -48,20 +48,21 @@ type DiskParam struct {
 
 // Params is the full input for rendering a worker bootstrap.
 type Params struct {
-	NodeName         string
-	NodeIP           string
-	CIDRPrefix       string // e.g. "24"
-	GatewayIP        string
-	NICName          string
-	DNSServersJSON   string // JSON array, e.g. ["8.8.8.8","1.1.1.1"]
-	OSUser           string
-	OSPasswordHash   string
-	SSHAuthorizedKey string
-	K8sVersion       string // apt version, e.g. "1.35.9-1.1"
-	K8sMinorRepo     string // e.g. "v1.35"
-	JoinEndpoint     string // e.g. "192.168.100.2:6443"
-	JoinCommand      string
-	Disks            []DiskParam
+	NodeName          string
+	NodeIP            string
+	CIDRPrefix        string // e.g. "24"
+	GatewayIP         string
+	NICName           string
+	DNSServersJSON    string // JSON array, e.g. ["8.8.8.8","1.1.1.1"]
+	OSUser            string
+	OSPasswordHash    string
+	SSHAuthorizedKey  string
+	SSHAllowedSources []string
+	K8sVersion        string // apt version, e.g. "1.35.9-1.1"
+	K8sMinorRepo      string // e.g. "v1.35"
+	JoinEndpoint      string // e.g. "192.168.100.2:6443"
+	JoinCommand       string
+	Disks             []DiskParam
 	// HostsLines is what /etc/hosts gains beyond the guest's own line: the
 	// cluster's nodes by name and address, the way the Terraform baseline
 	// writes them.
@@ -151,26 +152,28 @@ func (r *Renderer) Render(p Params) (userData string, initscript string, err err
 		return "", "", fmt.Errorf("render data disk grow: %w", err)
 	}
 
+	var ds bytes.Buffer
+	if err := r.diskSetupTpl.Execute(&ds, p); err != nil {
+		return "", "", fmt.Errorf("render disk setup: %w", err)
+	}
+
 	var ud bytes.Buffer
 	if err := r.userDataTpl.Execute(&ud, struct {
 		Params
-		RenderStamp    string
-		LayoutScript   string
-		EnsureScript   string
-		GrowScript     string
-		GrowDataScript string
+		RenderStamp     string
+		LayoutScript    string
+		EnsureScript    string
+		GrowScript      string
+		GrowDataScript  string
+		DiskSetupScript string
 	}{p, r.stamp, indentLines(layout.String(), 6), indentLines(ensure.String(), 6),
-		indentLines(grow.String(), 6), indentLines(growData.String(), 6)}); err != nil {
+		indentLines(grow.String(), 6), indentLines(growData.String(), 6),
+		indentLines(ds.String(), 6)}); err != nil {
 		return "", "", fmt.Errorf("render user-data: %w", err)
 	}
 	gz, err := base64Gzip(ud.Bytes())
 	if err != nil {
 		return "", "", err
-	}
-
-	var ds bytes.Buffer
-	if err := r.diskSetupTpl.Execute(&ds, p); err != nil {
-		return "", "", fmt.Errorf("render disk setup: %w", err)
 	}
 
 	var is bytes.Buffer

@@ -64,7 +64,12 @@ func (p *Provider) Capacity(ctx context.Context) (cloud.PlatformCapacity, error)
 	// of a cluster do not report the same speed.
 	sort.Slice(mhs, func(i, j int) bool { return mhs[i].Name < mhs[j].Name })
 
-	out := cloud.PlatformCapacity{Model: "vSphere " + p.placement.Cluster}
+	// A pinned host is the only host a worker can use, so it is the only host
+	// whose room is real for this pool. Counting the whole cluster would tell
+	// the caller there is space where the create can never go.
+	model := "vSphere " + p.placement.Cluster
+
+	out := cloud.PlatformCapacity{Model: model}
 	usable := 0
 	for i := range mhs {
 		m := &mhs[i]

@@ -159,3 +159,31 @@ func TestValidateSpecChecksTheVSphereFolderRoot(t *testing.T) {
 		}
 	}
 }
+
+// The pool's scope holds more than its workers: masters, load balancers, the
+// deployment VM. Their addresses must never be handed to a worker, and the
+// ledger must not claim them.
+func TestForeignAddressesExcludeThePoolsOwnVMs(t *testing.T) {
+	owned := []cloud.VM{
+		{Name: "lab-wrk-01", IP: "10.99.96.109"},
+		{Name: "lab-wrk-02", IP: "10.99.96.110"},
+	}
+	all := []cloud.VM{
+		{Name: "lab-wrk-01", IP: "10.99.96.109"},
+		{Name: "lab-wrk-02", IP: "10.99.96.110"},
+		{Name: "lab-mst-01", IP: "10.99.96.106"},
+		{Name: "lab-k8s-lb-01", IP: "10.99.96.104"},
+		{Name: "lab-lb-02", IP: ""}, // powered off: no address to block
+		{Name: "dvm", IP: "10.99.96.101"},
+	}
+	got := foreignAddresses(owned, all)
+	want := map[string]bool{"10.99.96.106": true, "10.99.96.104": true, "10.99.96.101": true}
+	if len(got) != len(want) {
+		t.Fatalf("foreign addresses = %v, want %d entries", got, len(want))
+	}
+	for _, ip := range got {
+		if !want[ip] {
+			t.Fatalf("foreign addresses = %v, want %v", got, want)
+		}
+	}
+}

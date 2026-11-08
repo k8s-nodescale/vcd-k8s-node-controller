@@ -1,6 +1,9 @@
 package ipam
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 func basePlan() Plan {
 	return Plan{
@@ -178,4 +181,45 @@ func TestAdoptRejectsAddressOutsidePlan(t *testing.T) {
 	if err := a.Adopt("10.0.0.5"); err == nil {
 		t.Fatal("expected an error for an address outside the plan CIDR")
 	}
+}
+
+// An address another machine already answers on is not free, even though the
+// pool does not own it - and it must not appear in the ledger, which records
+// only what this pool allocated.
+func TestBlockKeepsForeignAddressesOutOfThePool(t *testing.T) {
+	a, err := New(basePlan(), Ledger{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A master at .7 (the window start), and two values that are not addresses
+	// in this prefix: they are ignored rather than failing the pass.
+	a.Block("192.168.100.7", "not-an-ip", "10.0.0.5")
+
+	got, err := a.Allocate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == "192.168.100.7" {
+		t.Fatal("a blocked address was handed out")
+	}
+	for _, used := range a.Ledger().Used {
+		if used == "192.168.100.7" {
+			t.Fatal("a blocked address entered the ledger: the pool does not own it")
+		}
+	}
+
+	// Block is what turns a wrong namePrefix into "no free IPs" instead of a
+	// duplicate: with every address of the window blocked, allocation fails.
+	var everything []string
+	for off := 7; off <= 206; off++ {
+		everything = append(everything, addrAtForTest(off))
+	}
+	a.Block(everything...)
+	if _, err := a.Allocate(); err == nil {
+		t.Fatal("allocation succeeded with the whole window blocked")
+	}
+}
+
+func addrAtForTest(off int) string {
+	return fmt.Sprintf("192.168.100.%d", off)
 }

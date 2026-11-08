@@ -130,13 +130,14 @@ One `K8sWorkerPool` describes the worker set of a single cluster. You own
 | `bootstrap.osPasswordHash` | no | `/etc/shadow` hash, not a plain password. |
 | `bootstrap.sshAuthorizedKey` | no | Public key installed for `osUser`. |
 | `bootstrap.nicName` | no | Guest NIC name (`ens192` on the Ubuntu template). |
+| `bootstrap.sshAllowedSources[]` | no | Extra sshd `AllowUsers` patterns for the workers, e.g. `*@10.99.96.64/26`. The image ships a restrictive `AllowUsers` line; these are appended to it exactly like the Terraform baseline appends `allowed_ssh_ips`. |
 | `bootstrap.dns` | no | Resolvers written into the guest. |
 | `bootstrap.k8sVersion` | no | Full apt version pinned in the guest, e.g. `1.35.9-1.1`. |
 | `bootstrap.k8sMinorRepo` | no | `pkgs.k8s.io` minor repo, e.g. `v1.35`. |
 | `flavor.cpus` / `flavor.memoryMB` | yes | VM shape. |
 | `flavor.osDiskGB` | no | Grows the cloned template's system disk (bus 0/unit 0) before the first power-on. Terraform nodes use `disks_config.osdisk.sizegb`; a clone without this keeps the template size (10 GB on the current Ubuntu template). A smaller value replaces the worker (see [Rolling compute-spec changes](#rolling-compute-spec-changes)). |
 | `flavor.template` | no | Image to clone: a vCD catalog item, or on vSphere a VM name or inventory path (e.g. `noble-template_1.1.0_k8s`). Must expose `disk.EnableUUID`. Another value replaces the worker: a different image is a different VM. |
-| `flavor.disks[]` | no | Data disks: `sizeGB`, `mount` (`/var`, `/var/lib`), `busType`, `busNumber`, `unitNumber`, `storageProfile`. Mirrors Terraform `diskw1` / `diskw2`. |
+| `flavor.disks[]` | no | Data disks: `sizeGB`, `mount` (`/var`, `/var/lib`), `busType`, `busNumber`, `unitNumber`, `storageProfile`. Mirrors Terraform `diskw1` / `diskw2`, but `busNumber`/`unitNumber` must match the controllers the image actually has, not the Terraform variable: `govc device.info -vm <worker>` shows the controller's `BusNumber` and each disk's `UnitNumber` (the reference image has one paravirtual SCSI controller on bus 0, so its data disks are bus 0, units 1 and 2). A mismatch is read as drift and starts a resize. |
 | `provider` | no | Platform that runs the workers: `vcd` or `vsphere`. Empty means the platform this installation serves, which is the normal case because one installation serves one platform; a value naming the other platform is refused with `InvalidSpec`. See [Platform providers](#platform-providers). |
 | `vcd.org` / `vcd.vdc` / `vcd.vapp` / `vcd.orgNetwork` | yes* | Placement of the VM. Required when `provider` is `vcd`. |
 | `vcd.catalog` / `vcd.catalogOrg` | no | Catalog holding the template (defaults to the controller org). |
@@ -480,6 +481,7 @@ answers. `$DC` is the datacenter, for example `MSK_Dev_DC`.
 | `vsphere.network` | `govc device.info -vm <worker>`: the network adapter summary names the port group |
 | `flavor.template` | `govc vm.info -r <worker>`, or the image the cluster owner names; a VM built by hand has no template and any image that carries the same k8s packages will do |
 | `flavor.cpus` / `memoryMB` / `osDiskGB` | `govc vm.info <worker>` |
+| `flavor.disks[]` | `govc device.info -vm <worker>`: the SCSI controller's `BusNumber` and each data disk's `UnitNumber`/size |
 | `bootstrap.nicName` | `ip -br link` inside a worker (`ens192` on the reference image) |
 | `bootstrap.dns` | `cat /etc/resolv.conf` inside a worker |
 
@@ -491,7 +493,7 @@ datastore, and two places to name it would be two places to disagree.
 
 | Field | Where to read it |
 | --- | --- |
-| `namePrefix` | the workers' names: `kubectl get nodes -o name` and strip the `-NN` suffix. Nodes are `<namePrefix>-wrk-NN`, where `NN` is the **address ordinal** inside the pool window - not a counter. If the names and the addresses disagree, the cluster was built with a different plan: stop and ask, do not "fix" it by renaming. |
+| `namePrefix` | the workers' names: `kubectl get nodes -o name` and strip the whole `-wrk-NN` suffix, so `nscl-test-avntg-wrk-01` gives `nscl-test-avntg`. The controller appends `-wrk-NN` itself, and `NN` is the **address ordinal** inside the pool window - not a counter. A prefix that keeps `-wrk` produces `...-wrk-wrk-01`, which matches no existing VM and starts a duplicate; if the names and the addresses disagree, stop and ask instead of renaming. |
 | `replicas` | the number of worker Nodes **now**. The first apply describes the current size; scaling comes afterwards. |
 | `join.endpoint` | `kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}'`, or the `kubernetes` Service in `default`; the API VIP and port. The controller mints join tokens itself and reads the CA hash from the cluster, so no token or certificate goes into the object. |
 | `join.tokenTTL` | `1h` is a good default: long enough for a clone plus first boot, short enough that a leaked token is useless. |
@@ -567,11 +569,14 @@ spec:
     memoryMB: 4096
     osDiskGB: 40
     disks:                           # omit for no data disks
+      # bus/unit must be where the disk really is: `govc device.info -vm <worker>`
+      # prints the controller's BusNumber and each disk's UnitNumber. A mismatched
+      # bus/unit is drift, and drift starts a resize that power-cycles live nodes.
       - sizeGB: 60
         mount: /var/lib
         busType: paravirtual
-        busNumber: 1
-        unitNumber: 0
+        busNumber: 0
+        unitNumber: 1
   ipPlan:
     cidr: 10.99.96.64/26
     vmIPOffset: 35                   # 10.99.96.64 + 35 = the VM range starts at .99

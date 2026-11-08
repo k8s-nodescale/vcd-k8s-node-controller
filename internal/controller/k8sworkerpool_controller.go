@@ -212,6 +212,13 @@ func (r *WorkerPoolReconciler) reconcile(ctx context.Context, before, pool *infr
 		return ctrl.Result{RequeueAfter: requeueInvalidSpec}, nil
 	}
 
+	// An address another VM in the pool's scope already answers on is not free,
+	// even when that VM is not ours: the masters, the load balancers, the
+	// deployment VM, a machine someone cloned by hand. The ledger cannot know
+	// about a VM the pool did not adopt, so without this a wrong namePrefix
+	// turns into a duplicate address.
+	alloc.Block(foreignAddresses(actual, all)...)
+
 	nodes, adopted, err := mergeNodes(pool, actual, alloc)
 	if err != nil {
 		r.setCondition(pool, metav1.ConditionFalse, "InvalidIPPlan", err.Error())
@@ -1147,21 +1154,22 @@ func (r *WorkerPoolReconciler) createWorker(ctx context.Context, pool *infrav1.K
 	}
 
 	userData, initscript, err := r.Renderer.Render(cloudinit.Params{
-		NodeName:         name,
-		NodeIP:           ip,
-		CIDRPrefix:       cidrPrefix(pool.Spec.IPPlan.CIDR),
-		GatewayIP:        gatewayIP(pool.Spec.IPPlan.CIDR),
-		NICName:          pool.Spec.Bootstrap.NICName,
-		DNSServersJSON:   string(dnsJSON),
-		OSUser:           pool.Spec.Bootstrap.OSUser,
-		OSPasswordHash:   pool.Spec.Bootstrap.OSPasswordHash,
-		SSHAuthorizedKey: pool.Spec.Bootstrap.SSHAuthorizedKey,
-		K8sVersion:       pool.Spec.Bootstrap.K8sVersion,
-		K8sMinorRepo:     pool.Spec.Bootstrap.K8sMinorRepo,
-		JoinEndpoint:     pool.Spec.Join.Endpoint,
-		JoinCommand:      join,
-		Disks:            cloudInitDisks,
-		HostsLines:       r.hostsLines(ctx, pool),
+		NodeName:          name,
+		NodeIP:            ip,
+		CIDRPrefix:        cidrPrefix(pool.Spec.IPPlan.CIDR),
+		GatewayIP:         gatewayIP(pool.Spec.IPPlan.CIDR),
+		NICName:           pool.Spec.Bootstrap.NICName,
+		DNSServersJSON:    string(dnsJSON),
+		OSUser:            pool.Spec.Bootstrap.OSUser,
+		OSPasswordHash:    pool.Spec.Bootstrap.OSPasswordHash,
+		SSHAuthorizedKey:  pool.Spec.Bootstrap.SSHAuthorizedKey,
+		SSHAllowedSources: pool.Spec.Bootstrap.SSHAllowedSources,
+		K8sVersion:        pool.Spec.Bootstrap.K8sVersion,
+		K8sMinorRepo:      pool.Spec.Bootstrap.K8sMinorRepo,
+		JoinEndpoint:      pool.Spec.Join.Endpoint,
+		JoinCommand:       join,
+		Disks:             cloudInitDisks,
+		HostsLines:        r.hostsLines(ctx, pool),
 	})
 	if err != nil {
 		return release(fmt.Errorf("render bootstrap for %s: %w", name, err))
@@ -1250,6 +1258,27 @@ func ownedWorkerVMs(pool *infrav1.K8sWorkerPool, vms []cloud.VM) []cloud.VM {
 	for _, vm := range vms {
 		if strings.HasPrefix(vm.Name, prefix) {
 			out = append(out, vm)
+		}
+	}
+	return out
+}
+
+// foreignAddresses lists the addresses of VMs in the pool's scope that the pool
+// does not own. The pool must never hand them to a worker: the plan reserves
+// what it knows about, and this covers what it cannot know - a VM the
+// namePrefix did not recognise, an address a human added by hand.
+func foreignAddresses(owned, all []cloud.VM) []string {
+	isOwned := make(map[string]bool, len(owned))
+	for _, vm := range owned {
+		isOwned[vm.Name] = true
+	}
+	out := make([]string, 0, len(all))
+	for _, vm := range all {
+		if isOwned[vm.Name] {
+			continue
+		}
+		if ip := strings.TrimSpace(vm.IP); ip != "" {
+			out = append(out, ip)
 		}
 	}
 	return out

@@ -207,3 +207,16 @@ func TestCreateRefusesAPlacementWithoutTheGuestNetwork(t *testing.T) {
 		t.Fatalf("err = %v, want a gateway message", err)
 	}
 }
+
+// capacityInBytes is the field vSphere 8 reads for a new disk; with only the
+// deprecated capacityInKB the device is created with 0 bytes.
+func TestSetDiskCapacityWritesBothFields(t *testing.T) {
+	d := &types.VirtualDisk{}
+	setDiskCapacity(d, capacityKB(10))
+	if d.CapacityInKB != 10*1024*1024 {
+		t.Fatalf("capacityInKB = %d, want %d", d.CapacityInKB, 10*1024*1024)
+	}
+	if d.CapacityInBytes != 10*1024*1024*1024 {
+		t.Fatalf("capacityInBytes = %d, want %d", d.CapacityInBytes, int64(10)*1024*1024*1024)
+	}
+}

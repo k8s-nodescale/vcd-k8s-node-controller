@@ -8,51 +8,51 @@
 apiVersion: k8s-nodescale.github.io/v1alpha1
 kind: K8sWorkerPool
 metadata:
-  name: lab-cluster
+  name: example-cluster
 spec:
   replicas: 3
-  namePrefix: lab-cluster            # nodes are <prefix>-wrk-NN
+  namePrefix: example-cluster        # nodes are <prefix>-wrk-NN
   provider: vsphere                  # optional: empty means the installation's platform
   vsphere:
-    datacenter: MSK_Dev_DC           # required; no process-wide fallback
-    cluster: mskdev                  # the compute cluster; its hosts are the capacity
-    folder: /HUB Infrastructure/dev/k8s-test-lab
-    datastore: 99DOR13_DEV_NFS_L11
-    network: Avantage_VL_DEV_MGMT_CNO-330
+    datacenter: EXAMPLE-DC           # required; no process-wide fallback
+    cluster: example-cluster         # the compute cluster; the host below is the capacity
+    folder: /EXAMPLE-DC/vm/k8s
+    datastore: EXAMPLE-DATASTORE
+    network: EXAMPLE-PORTGROUP
     # resourcePool: ""               # empty means the cluster's root pool
   bootstrap:
     osUser: ubuntu
     nicName: ens192
     dns:
-      - 10.74.64.91
-      - 10.73.1.45
+      - 192.0.2.53
+      - 192.0.2.54
     k8sVersion: "1.28.15-1.1"
     k8sMinorRepo: "v1.28"
   flavor:
-    template: noble-template_1.1.0_k8s
+    template: ubuntu-24.04-k8s-template
     cpus: 8
     memoryMB: 4096
     osDiskGB: 40
-    disks:
+    disks:                           # bus/unit must match the image's controllers
       - sizeGB: 60
         mount: /var/lib
         busType: paravirtual
-        busNumber: 1
-        unitNumber: 0
+        busNumber: 0
+        unitNumber: 1
   ipPlan:
-    cidr: 10.99.96.64/26
-    vmIPOffset: 35                   # 10.99.96.64 + 35 = the VM range starts at .99
-    dvmOffset: 2                     # .101
-    kubeapiLB: 3                     # .102
-    lbNodeOffset: 5                  # .104
-    lbNodeCount: 2                   # .104-.105
-    mNodeOffset: 7                   # .106
-    masterCount: 3                   # .106-.108
-    wNodeOffset: 10                  # .109
-    nodeCount: 17                    # .109-.125 (the gateway .65 is never shifted)
-    # reserved: ["10.99.96.126"]
+    cidr: 192.168.100.0/24
+    vmIPOffset: 0                    # the range starts at the prefix; set a skip when one is needed
+    dvmOffset: 2                     # .2
+    kubeapiLB: 3                     # .3
+    lbNodeOffset: 5                  # .5
+    lbNodeCount: 2                   # .5-.6
+    mNodeOffset: 7                   # .7
+    masterCount: 3                   # .7-.9
+    wNodeOffset: 10                  # .10
+    nodeCount: 10                    # .10-.19
+    # reserved: ["192.168.100.200"]
   join:
-    endpoint: 10.99.96.102:6443
+    endpoint: 192.168.100.3:6443
     tokenTTL: 1h
     labels:
       node-role.kubernetes.io/worker: ""

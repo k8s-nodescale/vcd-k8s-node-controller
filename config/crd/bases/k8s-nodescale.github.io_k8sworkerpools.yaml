@@ -75,6 +75,16 @@ spec:
                     type: string
                   osUser:
                     type: string
+                  sshAllowedSources:
+                    description: |-
+                      SSHAllowedSources are extra sshd AllowUsers patterns the worker admits,
+                      e.g. "*@10.99.96.64/26". The images ship a restrictive AllowUsers line
+                      (the Terraform baseline appends the same values from allowed_ssh_ips); a
+                      worker that omits this list keeps the image's list, which may not include
+                      the operator's network.
+                    items:
+                      type: string
+                    type: array
                   sshAuthorizedKey:
                     type: string
                 type: object
