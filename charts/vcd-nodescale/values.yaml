@@ -5,38 +5,78 @@ image:
   tag: "" # defaults to .Chart.AppVersion
   pullPolicy: IfNotPresent
 
-namespace:
-  # Must match the namespace where the vCD credentials secret lives.
-  name: vcd-nodescale-system
-
-vcd:
-  # Name of an existing Secret in the release namespace. Required keys:
-  #   url, user, password, org, vdc, insecure (optional)
-  existingSecret: vcd-credentials
-
-# vSphere is optional: a deployment that serves only vCD pools leaves
-# existingSecret empty and gets no VSPHERE_* environment at all. Set it when a
-# pool carries spec.provider: vsphere.
+# platform is the one platform this installation serves: vcd or vsphere.
 #
-# The Secret lives in the release namespace and holds the connection the
-# controller process logs in with once, shared by every vSphere pool:
-#   url          https://97dev-vcp01.mtscloud.local (a bare host works too)
-#   user         terraform@mtsdevp97.local
-#   password     the account password
-#   datacenter   MSK_Dev_DC          (optional; a pool may name its own)
-#   folderRoot   /HUB Infrastructure/dev/k8s-test-lab
-#   insecure     true               (optional; self-signed vCenter)
+# It is mandatory and has no default on purpose. An installation never changes
+# its platform, and a pool may not pick the other one: the chart renders only
+# this platform's credentials, and the controller registers only its factory.
+# A vSphere installation therefore carries no vcd secret reference and cannot
+# depend on a vcd tenant - and the other way round.
+platform: ""
+
+namespace:
+  # One namespace per cluster, named after the product rather than the
+  # platform. It holds the controller, its ServiceAccount/RBAC and the
+  # platform credentials Secret.
+  name: nodescale-system
+
+# vCloud Director credentials. Used when platform is vcd; the whole block is
+# ignored otherwise, and nothing from it is rendered.
+#
+# The Secret lives in the release namespace and uses discrete keys, one per
+# setting:
+#   url       https://vcd.example.com/api   (a bare host is accepted too)
+#   user      a service account in the org below
+#   password  its password
+#   org       the organization the controller works in
+#   vdc       the virtual data center the pools live in
+#   insecure  true/false, whether to skip API certificate verification
 #
 # Example:
-#   kubectl -n vcd-nodescale-system create secret generic vsphere-credentials \
+#   kubectl -n nodescale-system create secret generic vcd-credentials \
+#     --from-literal=url=https://vcd.example.com/api \
+#     --from-literal=user=svc-node-controller \
+#     --from-literal=password='***' \
+#     --from-literal=org=myorg \
+#     --from-literal=vdc=My-VDC-Name \
+#     --from-literal=insecure=false
+vcd:
+  existingSecret: vcd-credentials
+
+# vSphere credentials. Used when platform is vsphere; the whole block is
+# ignored otherwise, and nothing from it is rendered.
+#
+# The Secret holds only the connection, shared by every vSphere pool of the
+# installation:
+#   url       https://vcenter.example.com    (a bare host works too)
+#   user      e.g. terraform@mtsdevp97.local
+#   password  its password
+#   insecure  true for a self-signed vCenter certificate
+#
+# Placement is per pool, in spec.vsphere: datacenter, cluster, resourcePool,
+# folder, datastore, network. Those describe where one pool's workers live,
+# not how the controller logs in, so they are read from the CR and never from
+# this Secret.
+#
+# The format is deliberately not the CSI INI: discrete keys are easier to
+# create, rotate and review. Where the cluster already has a
+# vmware-system-csi/vsphere-config-secret, copy its three connection values
+# out once (option A: the Secret is duplicated into our namespace; the
+# controller is not granted read access to another namespace):
+#
+#   kubectl -n nodescale-system create secret generic vsphere-credentials \
 #     --from-literal=url=https://97dev-vcp01.mtscloud.local \
 #     --from-literal=user=terraform@mtsdevp97.local \
-#     --from-literal=password=... \
-#     --from-literal=datacenter=MSK_Dev_DC \
-#     --from-literal=folderRoot="/HUB Infrastructure/dev/k8s-test-lab" \
+#     --from-literal=password='***' \
 #     --from-literal=insecure=true
 vsphere:
-  existingSecret: ""
+  existingSecret: vsphere-credentials
+  # folderRoot is the folder no pool may leave (VSPHERE_FOLDER_ROOT), for
+  # example "/HUB Infrastructure/dev/k8s-test-lab". It is the tenant boundary
+  # and therefore a property of the installation, not of a pool: a pool that
+  # names its own root would be naming its own limit. Empty enforces no
+  # boundary, which is only appropriate for a dedicated vCenter account.
+  folderRoot: ""
 
 leaderElection: true
 

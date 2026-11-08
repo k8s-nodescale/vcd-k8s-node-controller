@@ -55,17 +55,25 @@ type WorkerPoolReconciler struct {
 	// Org and VDC are the vCD org/VDC the vCD factory is authenticated
 	// against (VCD_ORG/VCD_VDC). They are used to reject a CR whose
 	// spec.vcd.org/vdc points somewhere else instead of silently ignoring it.
-	// They are empty for another platform.
+	// They are empty on a vsphere installation.
 	Org string
 	VDC string
 
-	// VSphereDatacenter and VSphereFolderRoot are the vCenter boundary the
-	// vSphere factory is configured with (VSPHERE_DATACENTER and
-	// VSPHERE_FOLDER_ROOT). The folder root is checked here as well so a CR
-	// that points outside the granted folder is rejected with a message that
-	// names it, instead of failing on the first platform call. The provider
-	// checks the resolved inventory path, which is the authority.
-	VSphereDatacenter string
+	// Platform is the one platform this installation serves (NODESCALE_PLATFORM):
+	// vcd or vsphere. Empty is read as vcd so a binary started by hand, without
+	// the chart, keeps its old behaviour.
+	//
+	// A pool may omit spec.provider, in which case it means this platform; a
+	// pool that names the other one is rejected with InvalidSpec instead of
+	// failing later with "no cloud provider named ...", because the other
+	// factory is not even registered.
+	Platform string
+
+	// VSphereFolderRoot is the vCenter folder boundary the installation was
+	// configured with (VSPHERE_FOLDER_ROOT). It is checked here so a CR that
+	// points outside the granted folder is rejected with a message that names
+	// it, instead of failing on the first platform call. The provider checks
+	// the resolved inventory path, which is the authority.
 	VSphereFolderRoot string
 
 	// PodName and PodNamespace identify this controller's Pod (downward API).
@@ -681,7 +689,17 @@ func (r *WorkerPoolReconciler) setCondition(pool *infrav1.K8sWorkerPool, status 
 // factory is the only thing the reconciler knows about the platform, so a pool
 // that names another implementation is served by that implementation.
 func (r *WorkerPoolReconciler) platform(pool *infrav1.K8sWorkerPool) (cloud.Provider, error) {
-	return r.Cloud.For(placementFor(pool))
+	return r.Cloud.For(placementFor(pool, r.installationPlatform()))
+}
+
+// installationPlatform is the platform this installation serves. An empty
+// value is read as vcd so a binary started by hand behaves as it did before
+// the platform became an installation property.
+func (r *WorkerPoolReconciler) installationPlatform() string {
+	if p := strings.ToLower(strings.TrimSpace(r.Platform)); p != "" {
+		return p
+	}
+	return cloud.ProviderVCD
 }
 
 // membership returns the load-balancer half of the pool's provider. It is nil
@@ -697,11 +715,12 @@ func (r *WorkerPoolReconciler) membership(pool *infrav1.K8sWorkerPool) (cloud.Po
 }
 
 // placementFor maps a pool's CR onto the provider-neutral placement the factory
-// takes. An empty spec.provider means vcd, which is what the CRD defaults it to.
-func placementFor(pool *infrav1.K8sWorkerPool) cloud.Placement {
+// takes. An empty spec.provider means the platform this installation serves,
+// which is also what validateSpec enforces.
+func placementFor(pool *infrav1.K8sWorkerPool, platform string) cloud.Placement {
 	pl := cloud.Placement{Provider: strings.ToLower(strings.TrimSpace(pool.Spec.Provider))}
 	if pl.Provider == "" {
-		pl.Provider = cloud.ProviderVCD
+		pl.Provider = platform
 	}
 	if v := pool.Spec.VCD; v != nil {
 		pl.VCD = &cloud.VCDPlacement{
@@ -752,11 +771,15 @@ func (r *WorkerPoolReconciler) validateSpec(pool *infrav1.K8sWorkerPool) string 
 	case strings.TrimSpace(pool.Spec.Join.Endpoint) == "":
 		return "spec.join.endpoint is required"
 	}
-	switch strings.ToLower(strings.TrimSpace(pool.Spec.Provider)) {
-	case "", cloud.ProviderVCD:
+	platform := r.installationPlatform()
+	if p := strings.ToLower(strings.TrimSpace(pool.Spec.Provider)); p != "" && p != platform {
+		return fmt.Sprintf("spec.provider %q does not match the platform of this installation (%s): the platform is chosen when the controller is installed and never per pool, so a second platform needs a second installation", pool.Spec.Provider, platform)
+	}
+	switch platform {
+	case cloud.ProviderVCD:
 		switch {
 		case pool.Spec.VCD == nil:
-			return "spec.vcd is required when spec.provider is vcd"
+			return "spec.vcd is required on a vcd installation"
 		case strings.TrimSpace(pool.Spec.VCD.VApp) == "":
 			return "spec.vcd.vapp is required"
 		case strings.TrimSpace(pool.Spec.VCD.OrgNetwork) == "":
@@ -772,7 +795,9 @@ func (r *WorkerPoolReconciler) validateSpec(pool *infrav1.K8sWorkerPool) string 
 		v := pool.Spec.VSphere
 		switch {
 		case v == nil:
-			return "spec.vsphere is required when spec.provider is vsphere"
+			return "spec.vsphere is required on a vsphere installation"
+		case strings.TrimSpace(v.Datacenter) == "":
+			return "spec.vsphere.datacenter is required: the datacenter is part of the pool's placement"
 		case strings.TrimSpace(v.Cluster) == "":
 			return "spec.vsphere.cluster is required"
 		case strings.TrimSpace(v.Folder) == "":
@@ -783,14 +808,14 @@ func (r *WorkerPoolReconciler) validateSpec(pool *infrav1.K8sWorkerPool) string 
 			return "spec.vsphere.network is required"
 		}
 		if root := strings.TrimSpace(r.VSphereFolderRoot); root != "" {
-			folder := normalizeVSphereFolder(r.VSphereDatacenter, v.Folder)
-			rootPath := normalizeVSphereFolder(r.VSphereDatacenter, root)
+			folder := normalizeVSphereFolder(v.Datacenter, v.Folder)
+			rootPath := normalizeVSphereFolder(v.Datacenter, root)
 			if folder != rootPath && !strings.HasPrefix(folder, rootPath+"/") {
 				return fmt.Sprintf("spec.vsphere.folder %q is outside the allowed root %q (VSPHERE_FOLDER_ROOT)", v.Folder, root)
 			}
 		}
 	default:
-		return fmt.Sprintf("spec.provider %q is not supported (vcd)", pool.Spec.Provider)
+		return fmt.Sprintf("this installation runs platform %q, which is not supported (vcd, vsphere)", platform)
 	}
 	if msg := validateIPWindow(pool.Spec.IPPlan); msg != "" {
 		return msg

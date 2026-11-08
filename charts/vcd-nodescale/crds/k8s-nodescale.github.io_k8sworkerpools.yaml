@@ -285,11 +285,12 @@ spec:
                   names (e.g. myorg-cluster-prod).
                 type: string
               provider:
-                default: vcd
                 description: |-
-                  Provider selects the platform that runs this pool's workers: vcd (the
-                  default) or vsphere. The platform block that matches it is required;
-                  the others are ignored.
+                  Provider names the platform that runs this pool's workers: vcd or
+                  vsphere. It is optional, and empty means the platform this controller
+                  installation serves - the normal case, because one installation serves
+                  one platform. A non-empty value must match it: naming the other platform
+                  is refused with InvalidSpec rather than silently ignored.
                 enum:
                 - vcd
                 - vsphere
@@ -451,8 +452,8 @@ spec:
                 type: object
               vcd:
                 description: |-
-                  VCD points at the target vCloud Director objects. Required when
-                  spec.provider is vcd (the default), ignored otherwise.
+                  VCD points at the target vCloud Director objects. Required on a vcd
+                  installation, ignored otherwise.
                 properties:
                   catalog:
                     type: string
@@ -485,8 +486,11 @@ spec:
                     type: string
                   datacenter:
                     description: |-
-                      Datacenter is the vCenter datacenter, e.g. MSK_Dev_DC. Empty means the
-                      one the controller was configured with (VSPHERE_DATACENTER).
+                      Datacenter is the vCenter datacenter, e.g. MSK_Dev_DC. It is required:
+                      the datacenter is part of where this pool lives, like the cluster and the
+                      datastore, so it is read from the pool and never from the controller
+                      configuration. There is deliberately no process-wide fallback, because
+                      two places to name it is two places to disagree.
                     type: string
                   datastore:
                     description: |-
@@ -513,6 +517,7 @@ spec:
                     type: string
                 required:
                 - cluster
+                - datacenter
                 - datastore
                 - folder
                 - network

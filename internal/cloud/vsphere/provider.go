@@ -45,11 +45,15 @@ import (
 
 // Config holds the vCenter connection settings. It is the process-wide half of
 // a placement: everything that differs per pool comes from spec.vsphere.
+//
+// Placement is deliberately absent: the datacenter, cluster, resource pool,
+// folder, datastore and network are properties of one pool and live in its CR,
+// so there is exactly one place to read them and no silent fallback to a
+// process-wide value that might name a different datacenter.
 type Config struct {
-	URL        string
-	User       string
-	Password   string
-	Datacenter string
+	URL      string
+	User     string
+	Password string
 
 	// FolderRoot is the boundary a pool folder must stay inside. Empty means
 	// the account is trusted with the whole datacenter.
@@ -100,7 +104,7 @@ func (c *Client) For(placement cloud.Placement) (cloud.Provider, error) {
 	}
 	pl := *placement.VSphere
 	if strings.TrimSpace(pl.Datacenter) == "" {
-		pl.Datacenter = c.cfg.Datacenter
+		return nil, errors.New("vsphere: spec.vsphere.datacenter is required: the datacenter is part of the pool's placement, not of the controller configuration")
 	}
 	if strings.TrimSpace(pl.NICName) == "" {
 		pl.NICName = "ens192"
@@ -181,7 +185,7 @@ func (p *Provider) base(ctx context.Context) (*govmomi.Client, *find.Finder, err
 	}
 	dc := strings.TrimSpace(p.placement.Datacenter)
 	if dc == "" {
-		return nil, nil, errors.New("vsphere: no datacenter: set spec.vsphere.datacenter or VSPHERE_DATACENTER")
+		return nil, nil, errors.New("vsphere: no datacenter: spec.vsphere.datacenter is required")
 	}
 	f := find.NewFinder(cl.Client, true)
 	dco, err := f.Datacenter(ctx, dc)

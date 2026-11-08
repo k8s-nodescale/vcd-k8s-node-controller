@@ -28,7 +28,7 @@ func testPlacement() cloud.Placement {
 }
 
 func TestForBindsThePlacement(t *testing.T) {
-	c := New(Config{Datacenter: "MSK_Dev_DC"})
+	c := New(Config{})
 	prov, err := c.For(testPlacement())
 	if err != nil {
 		t.Fatalf("For: %v", err)
@@ -38,21 +38,24 @@ func TestForBindsThePlacement(t *testing.T) {
 		t.Fatalf("placement = %#v, want the pool block", p.placement)
 	}
 
-	// The datacenter and the interface name are process defaults a pool may
-	// leave out.
+	// The interface name is the one default a pool may leave out; the
+	// datacenter is not, because it names an inventory object and there is no
+	// process-wide copy to fall back to.
 	pl := testPlacement()
-	pl.VSphere.Datacenter = ""
 	pl.VSphere.NICName = ""
 	prov, err = c.For(pl)
 	if err != nil {
 		t.Fatalf("For: %v", err)
 	}
 	p = prov.(*Provider)
-	if p.placement.Datacenter != "MSK_Dev_DC" {
-		t.Fatalf("datacenter = %q, want the process default", p.placement.Datacenter)
-	}
 	if p.placement.NICName != "ens192" {
 		t.Fatalf("nic = %q, want ens192", p.placement.NICName)
+	}
+
+	pl = testPlacement()
+	pl.VSphere.Datacenter = ""
+	if _, err := c.For(pl); err == nil || !strings.Contains(err.Error(), "datacenter") {
+		t.Fatalf("For accepted a placement without a datacenter: %v", err)
 	}
 }
 
@@ -82,7 +85,7 @@ func TestAnUnconfiguredFactoryFailsOnUse(t *testing.T) {
 // The folder root is the tenant boundary. The declared path is normalised, so
 // the datacenter prefix and the vm/ prefix do not change the answer.
 func TestFolderPathStaysInsideTheRoot(t *testing.T) {
-	c := New(Config{Datacenter: "MSK_Dev_DC", FolderRoot: "/HUB Infrastructure/dev/k8s-test-lab"})
+	c := New(Config{FolderRoot: "/HUB Infrastructure/dev/k8s-test-lab"})
 	prov, err := c.For(testPlacement())
 	if err != nil {
 		t.Fatalf("For: %v", err)
@@ -193,7 +196,7 @@ func TestDiskStateMapsBusAndUnit(t *testing.T) {
 }
 
 func TestCreateRefusesAPlacementWithoutTheGuestNetwork(t *testing.T) {
-	prov, err := New(Config{URL: "https://vcenter.example", Datacenter: "dc"}).For(testPlacement())
+	prov, err := New(Config{URL: "https://vcenter.example"}).For(testPlacement())
 	if err != nil {
 		t.Fatalf("For: %v", err)
 	}

@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: vcd-nodescale-manager
-  namespace: vcd-nodescale-system
+  namespace: nodescale-system
   labels:
     app.kubernetes.io/name: vcd-nodescale
     app.kubernetes.io/component: controller

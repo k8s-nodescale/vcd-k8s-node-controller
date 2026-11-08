@@ -123,7 +123,7 @@ Ansible.
   ```hcl
   node_controller = {
     enabled       = true
-    namespace     = "vcd-nodescale-system"
+    namespace     = "nodescale-system"
     chart_repo    = "https://charts.example.com"
     chart_version = "0.1.0"
     image_tag     = "v0.1.0"
@@ -138,7 +138,7 @@ Ansible.
 ### 3.6 Controller runtime location — **DECIDED: in-cluster Deployment in a dedicated namespace**
 - Run as a `Deployment` (leader-elected) inside its **own namespace**, not `kube-system`, to isolate
   RBAC and blast radius.
-- **Recommended namespace name:** `vcd-nodescale-system`
+- **Recommended namespace name:** `nodescale-system`
   - Clear, vCD-specific, follows the `*-system` convention used by infra components.
   - Alternatives: `nodescale-system` (your proposal — fine), `vcd-node-autoscaler`,
     `vcd-cluster-nodescale`. Avoid `kube-system`.
@@ -187,7 +187,7 @@ Ansible.
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│  Kubernetes cluster — namespace: vcd-nodescale-system             │
+│  Kubernetes cluster — namespace: nodescale-system             │
 │                                                                   │
 │  CRD: K8sWorkerPool (singleton "default")                         │
 │    spec:   replicas, node flavor (cpu/mem/disk), vCD refs,        │

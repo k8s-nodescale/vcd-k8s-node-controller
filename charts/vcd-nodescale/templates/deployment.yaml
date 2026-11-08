@@ -1,3 +1,4 @@
+{{- $platform := include "vcd-nodescale.platform" . -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -50,68 +51,74 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            # The installation serves exactly one platform: this value selects
+            # the only factory the process registers. A pool that asks for the
+            # other platform is rejected as InvalidSpec.
+            - name: NODESCALE_PLATFORM
+              value: {{ $platform | quote }}
+            {{- if eq $platform "vcd" }}
+            # vCloud Director connection. Every key is optional at the kubelet
+            # level so a missing Secret starts the Pod with a clear,
+            # non-restarting condition instead of a CreateContainerConfigError:
+            # the manager reports it on /readyz and on every affected pool.
             - name: VCD_URL
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.vcd.existingSecret }}
+                  name: {{ required "vcd.existingSecret is required when platform is vcd" .Values.vcd.existingSecret }}
                   key: url
+                  optional: true
             - name: VCD_USER
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.vcd.existingSecret }}
                   key: user
+                  optional: true
             - name: VCD_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.vcd.existingSecret }}
                   key: password
+                  optional: true
             - name: VCD_ORG
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.vcd.existingSecret }}
                   key: org
+                  optional: true
             - name: VCD_VDC
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.vcd.existingSecret }}
                   key: vdc
+                  optional: true
             - name: VCD_INSECURE
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.vcd.existingSecret }}
                   key: insecure
                   optional: true
-            # The vSphere connection is optional and shared by every pool that
-            # sets spec.provider: vsphere. The manager logs in on the first
-            # such pool, so a release without one has no vSphere env and needs
-            # no vCenter at all.
-            {{- if .Values.vsphere.existingSecret }}
+            {{- else }}
+            # vSphere connection, shared by every pool that sets
+            # spec.provider: vsphere. The manager logs in on the first such
+            # pool, so installing the controller before the account exists is
+            # a condition on the pool, not a restart loop.
             - name: VSPHERE_URL
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.vsphere.existingSecret }}
+                  name: {{ required "vsphere.existingSecret is required when platform is vsphere" .Values.vsphere.existingSecret }}
                   key: url
+                  optional: true
             - name: VSPHERE_USER
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.vsphere.existingSecret }}
                   key: user
+                  optional: true
             - name: VSPHERE_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.vsphere.existingSecret }}
                   key: password
-            - name: VSPHERE_DATACENTER
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.vsphere.existingSecret }}
-                  key: datacenter
-                  optional: true
-            - name: VSPHERE_FOLDER_ROOT
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.vsphere.existingSecret }}
-                  key: folderRoot
                   optional: true
             - name: VSPHERE_INSECURE
               valueFrom:
@@ -119,6 +126,13 @@ spec:
                   name: {{ .Values.vsphere.existingSecret }}
                   key: insecure
                   optional: true
+            # The folder boundary is not a credential: it is a policy of the
+            # installation, so it stays a chart value and never enters the
+            # Secret. The datacenter is per pool (spec.vsphere.datacenter).
+            {{- with .Values.vsphere.folderRoot }}
+            - name: VSPHERE_FOLDER_ROOT
+              value: {{ . | quote }}
+            {{- end }}
             {{- end }}
           ports:
             - name: metrics

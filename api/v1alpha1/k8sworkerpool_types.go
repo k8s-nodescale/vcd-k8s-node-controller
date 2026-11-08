@@ -94,16 +94,17 @@ type K8sWorkerPoolSpec struct {
 	// resize candidate (see spec.rollout).
 	Flavor NodeFlavor `json:"flavor"`
 
-	// Provider selects the platform that runs this pool's workers: vcd (the
-	// default) or vsphere. The platform block that matches it is required;
-	// the others are ignored.
+	// Provider names the platform that runs this pool's workers: vcd or
+	// vsphere. It is optional, and empty means the platform this controller
+	// installation serves - the normal case, because one installation serves
+	// one platform. A non-empty value must match it: naming the other platform
+	// is refused with InvalidSpec rather than silently ignored.
 	// +kubebuilder:validation:Enum=vcd;vsphere
-	// +kubebuilder:default=vcd
 	// +optional
 	Provider string `json:"provider,omitempty"`
 
-	// VCD points at the target vCloud Director objects. Required when
-	// spec.provider is vcd (the default), ignored otherwise.
+	// VCD points at the target vCloud Director objects. Required on a vcd
+	// installation, ignored otherwise.
 	// +optional
 	VCD *VCDRef `json:"vcd,omitempty"`
 
@@ -305,10 +306,12 @@ type VCDRef struct {
 // (its free space), so "the platform has room" means "the cluster this pool
 // runs in has room", not "some host in the datacenter has room".
 type VSphereRef struct {
-	// Datacenter is the vCenter datacenter, e.g. MSK_Dev_DC. Empty means the
-	// one the controller was configured with (VSPHERE_DATACENTER).
-	// +optional
-	Datacenter string `json:"datacenter,omitempty"`
+	// Datacenter is the vCenter datacenter, e.g. MSK_Dev_DC. It is required:
+	// the datacenter is part of where this pool lives, like the cluster and the
+	// datastore, so it is read from the pool and never from the controller
+	// configuration. There is deliberately no process-wide fallback, because
+	// two places to name it is two places to disagree.
+	Datacenter string `json:"datacenter"`
 
 	// Cluster is the compute cluster the pool runs in. Its hosts are the
 	// capacity of the pool: a worker is never placed on a host of another

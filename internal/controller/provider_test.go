@@ -19,6 +19,7 @@ func TestReconcileRejectsAVSpherePoolWithoutTheBlock(t *testing.T) {
 	pool.Spec.VCD = nil
 	fc := &fakeCloud{}
 	r := newTestReconciler(t, fc, &fakeKube{}, pool)
+	r.Platform = cloud.ProviderVSphere
 
 	if _, err := r.Reconcile(ctx, requestFor(pool)); err != nil {
 		t.Fatalf("reconcile: %v", err)
@@ -32,6 +33,40 @@ func TestReconcileRejectsAVSpherePoolWithoutTheBlock(t *testing.T) {
 	}
 	if !strings.Contains(cond.Message, "spec.vsphere is required") {
 		t.Fatalf("message does not name the missing block: %q", cond.Message)
+	}
+}
+
+// A pool that names the other platform is refused by name: the factory for it
+// is not even registered, and "no cloud provider named ..." would be a worse
+// explanation than "this installation runs the other platform".
+func TestReconcileRejectsAPoolOfTheOtherPlatform(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(1)
+	pool.Spec.Provider = "vsphere"
+	fc := &fakeCloud{}
+	r := newTestReconciler(t, fc, &fakeKube{}, pool)
+	// The installation is vcd, which is also the default when Platform is
+	// empty; the pool asks for vsphere and carries a vsphere block.
+	pool.Spec.VSphere = &infrav1.VSphereRef{
+		Datacenter: "MSK_Dev_DC",
+		Cluster:    "mskdev",
+		Folder:     "/lab",
+		Datastore:  "ds",
+		Network:    "pg",
+	}
+
+	if _, err := r.Reconcile(ctx, requestFor(pool)); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if len(fc.created) != 0 {
+		t.Fatalf("created %d VMs for a pool of the other platform", len(fc.created))
+	}
+	cond := metaReady(getPool(t, r, pool))
+	if cond == nil || cond.Reason != "InvalidSpec" {
+		t.Fatalf("Ready condition = %#v, want InvalidSpec", cond)
+	}
+	if !strings.Contains(cond.Message, "does not match the platform of this installation (vcd)") {
+		t.Fatalf("message does not explain the mismatch: %q", cond.Message)
 	}
 }
 
@@ -51,12 +86,13 @@ func TestReconcileRejectsAnUnknownProvider(t *testing.T) {
 }
 
 // placementFor is the whole mapping from the CR to the platform contract: an
-// empty provider means vcd, the matching block is carried over, and the guest
-// network of a vsphere pool is derived from the same spec the renderer uses.
+// empty provider means the installation's platform, the matching block is
+// carried over, and the guest network of a vsphere pool is derived from the
+// same spec the renderer uses.
 func TestPlacementForMapsThePool(t *testing.T) {
 	pool := testPool(1)
 	pool.Spec.Provider = ""
-	pl := placementFor(pool)
+	pl := placementFor(pool, cloud.ProviderVCD)
 	if pl.Provider != cloud.ProviderVCD {
 		t.Fatalf("provider = %q, want vcd", pl.Provider)
 	}
@@ -67,17 +103,18 @@ func TestPlacementForMapsThePool(t *testing.T) {
 	pool.Spec.Provider = cloud.ProviderVSphere
 	pool.Spec.VCD = nil
 	pool.Spec.VSphere = &infrav1.VSphereRef{
-		Cluster:   "mskdev",
-		Folder:    "/HUB Infrastructure/dev/k8s-test-lab",
-		Datastore: "99DOR13_DEV_NFS_L11",
-		Network:   "Avantage_VL_DEV_MGMT_CNO-330",
+		Datacenter: "MSK_Dev_DC",
+		Cluster:    "mskdev",
+		Folder:     "/HUB Infrastructure/dev/k8s-test-lab",
+		Datastore:  "99DOR13_DEV_NFS_L11",
+		Network:    "Avantage_VL_DEV_MGMT_CNO-330",
 	}
-	pl = placementFor(pool)
+	pl = placementFor(pool, cloud.ProviderVSphere)
 	if pl.Provider != cloud.ProviderVSphere || pl.VCD != nil || pl.VSphere == nil {
 		t.Fatalf("placement = %#v, want vsphere with no vCD block", pl)
 	}
 	v := pl.VSphere
-	if v.Cluster != "mskdev" || v.Datastore != "99DOR13_DEV_NFS_L11" || v.Network != "Avantage_VL_DEV_MGMT_CNO-330" {
+	if v.Datacenter != "MSK_Dev_DC" || v.Cluster != "mskdev" || v.Datastore != "99DOR13_DEV_NFS_L11" || v.Network != "Avantage_VL_DEV_MGMT_CNO-330" {
 		t.Fatalf("placement = %#v, want the pool block", v)
 	}
 	// testPool uses 192.168.100.0/24 with ens192 and one resolver.
@@ -97,13 +134,14 @@ func TestValidateSpecChecksTheVSphereFolderRoot(t *testing.T) {
 	pool.Spec.Provider = cloud.ProviderVSphere
 	pool.Spec.VCD = nil
 	pool.Spec.VSphere = &infrav1.VSphereRef{
-		Cluster:   "mskdev",
-		Folder:    "/OTHER/dev/lab",
-		Datastore: "ds",
-		Network:   "pg",
+		Datacenter: "MSK_Dev_DC",
+		Cluster:    "mskdev",
+		Folder:     "/OTHER/dev/lab",
+		Datastore:  "ds",
+		Network:    "pg",
 	}
 	r := &WorkerPoolReconciler{
-		VSphereDatacenter: "MSK_Dev_DC",
+		Platform:          cloud.ProviderVSphere,
 		VSphereFolderRoot: "/HUB Infrastructure/dev/k8s-test-lab",
 	}
 	if msg := r.validateSpec(pool); !strings.Contains(msg, "outside the allowed root") {

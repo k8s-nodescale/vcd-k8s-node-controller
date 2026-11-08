@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -153,5 +154,39 @@ func TestNewBoundsEveryRequest(t *testing.T) {
 	client.Client.Http.Timeout = httpTimeout(Config{Timeout: 7 * time.Second})
 	if got := client.Client.Http.Timeout; got != 7*time.Second {
 		t.Fatalf("client timeout = %v, want 7s", got)
+	}
+}
+
+// New must not log in. The platform is an installation property, so a
+// vSphere-only release never needs a vCD account: reaching this fake host would
+// fail, and the factory has to be usable until the first vcd pool asks for it.
+func TestNewDoesNotConnect(t *testing.T) {
+	c, err := New(Config{
+		URL: "https://vcd.invalid", User: "svc", Password: "pw", Org: "org",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if c.client != nil {
+		t.Fatal("New logged in: a release without vcd pools must not touch vCD")
+	}
+}
+
+// A pool on an installation whose credentials are missing gets one error that
+// names the missing key, and the next pass retries instead of a dead factory.
+func TestForNamesMissingCredentials(t *testing.T) {
+	c, err := New(Config{URL: "https://vcd.invalid"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	_, err = c.For(cloud.Placement{
+		Provider: cloud.ProviderVCD,
+		VCD:      &cloud.VCDPlacement{VApp: "vapp"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "VCD_USER") || !strings.Contains(err.Error(), "VCD_PASSWORD") {
+		t.Fatalf("For = %v, want an error naming VCD_USER and VCD_PASSWORD", err)
+	}
+	if c.client != nil {
+		t.Fatal("a failed connect was remembered")
 	}
 }

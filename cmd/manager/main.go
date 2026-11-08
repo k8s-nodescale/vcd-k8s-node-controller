@@ -2,7 +2,10 @@ package main
 
 import (
 	"flag"
+	"fmt"
+	"net/http"
 	"os"
+	"strings"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
@@ -61,37 +64,63 @@ func main() {
 
 	vcdOrg := os.Getenv("VCD_ORG")
 	vcdVDC := os.Getenv("VCD_VDC")
-	vcdFactory, err := vcd.New(vcd.Config{
-		URL:      os.Getenv("VCD_URL"),
-		User:     os.Getenv("VCD_USER"),
-		Password: os.Getenv("VCD_PASSWORD"),
-		Org:      vcdOrg,
-		VDC:      vcdVDC,
-		Insecure: os.Getenv("VCD_INSECURE") == "true",
-	})
-	if err != nil {
-		setupLog.Error(err, "unable to create vCD provider")
+
+	// The platform is a property of the installation, not of the process that
+	// can switch at will: the chart sets NODESCALE_PLATFORM, and exactly that
+	// one factory is registered. A pool that names another platform is refused
+	// by the reconciler, and the other platform needs a second installation.
+	platform := strings.ToLower(strings.TrimSpace(os.Getenv("NODESCALE_PLATFORM")))
+	if platform == "" {
+		// A binary started by hand, outside the chart, keeps the historical
+		// behaviour; the chart never leaves it empty.
+		platform = cloud.ProviderVCD
+	}
+
+	registry := cloud.Registry{}
+	var missingCredentials error
+	switch platform {
+	case cloud.ProviderVCD:
+		factory, err := vcd.New(vcd.Config{
+			URL:      os.Getenv("VCD_URL"),
+			User:     os.Getenv("VCD_USER"),
+			Password: os.Getenv("VCD_PASSWORD"),
+			Org:      vcdOrg,
+			VDC:      vcdVDC,
+			Insecure: os.Getenv("VCD_INSECURE") == "true",
+		})
+		if err != nil {
+			setupLog.Error(err, "unable to configure the vCD provider")
+			os.Exit(1)
+		}
+		registry[cloud.ProviderVCD] = factory
+		missingCredentials = requireEnv("VCD_URL", "VCD_USER", "VCD_PASSWORD", "VCD_ORG", "VCD_VDC")
+	case cloud.ProviderVSphere:
+		registry[cloud.ProviderVSphere] = vsphere.New(vsphere.Config{
+			URL:        os.Getenv("VSPHERE_URL"),
+			User:       os.Getenv("VSPHERE_USER"),
+			Password:   os.Getenv("VSPHERE_PASSWORD"),
+			FolderRoot: os.Getenv("VSPHERE_FOLDER_ROOT"),
+			Insecure:   os.Getenv("VSPHERE_INSECURE") == "true",
+		})
+		missingCredentials = requireEnv("VSPHERE_URL", "VSPHERE_USER", "VSPHERE_PASSWORD")
+	default:
+		setupLog.Error(fmt.Errorf("NODESCALE_PLATFORM=%q", platform),
+			"NODESCALE_PLATFORM must be vcd or vsphere: an installation serves exactly one platform")
 		os.Exit(1)
 	}
 
-	// The vSphere factory connects on first use: a deployment that serves only
-	// vCD pools does not need VSPHERE_* at all, and the first vsphere pool
-	// gets the error that names what is missing.
-	vsphereFactory := vsphere.New(vsphere.Config{
-		URL:        os.Getenv("VSPHERE_URL"),
-		User:       os.Getenv("VSPHERE_USER"),
-		Password:   os.Getenv("VSPHERE_PASSWORD"),
-		Datacenter: os.Getenv("VSPHERE_DATACENTER"),
-		FolderRoot: os.Getenv("VSPHERE_FOLDER_ROOT"),
-		Insecure:   os.Getenv("VSPHERE_INSECURE") == "true",
-	})
+	// Credentials being absent is not a reason to restart: the Pod starts, the
+	// readiness probe reports why, and each affected pool carries a CloudError
+	// naming the missing key. A wrong account is therefore a condition on the
+	// pool, not a CrashLoopBackOff of the whole controller.
+	if missingCredentials != nil {
+		setupLog.Error(missingCredentials,
+			"the platform credentials are not configured; pools will report CloudError until the Secret is created")
+	}
 
 	// The platform is a property of the pool (spec.provider), not of the
 	// process: the registry hands out the provider each pool asks for.
-	cloudProvider := cloud.Registry{
-		cloud.ProviderVCD:     vcdFactory,
-		cloud.ProviderVSphere: vsphereFactory,
-	}
+	cloudProvider := registry
 
 	cs, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
@@ -112,9 +141,9 @@ func main() {
 		Kube:              kube.NewClient(cs),
 		Renderer:          renderer,
 		Recorder:          mgr.GetEventRecorderFor("k8sworkerpool-controller"),
+		Platform:          platform,
 		Org:               vcdOrg,
 		VDC:               vcdVDC,
-		VSphereDatacenter: os.Getenv("VSPHERE_DATACENTER"),
 		VSphereFolderRoot: os.Getenv("VSPHERE_FOLDER_ROOT"),
 		PodName:           os.Getenv("POD_NAME"),
 		PodNamespace:      os.Getenv("POD_NAMESPACE"),
@@ -131,10 +160,37 @@ func main() {
 		setupLog.Error(err, "unable to set up ready check")
 		os.Exit(1)
 	}
+	// Readiness also answers "can this installation serve its platform at
+	// all": missing credentials keep the Pod NotReady without restarting it,
+	// so Helm --wait and kubectl get pods both show the install is not done.
+	if err := mgr.AddReadyzCheck("platform-credentials", func(_ *http.Request) error {
+		return missingCredentials
+	}); err != nil {
+		setupLog.Error(err, "unable to set up the platform credentials check")
+		os.Exit(1)
+	}
 
 	setupLog.Info("starting manager")
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+// requireEnv names the variables the installation's credentials Secret did not
+// provide. The values are read once at startup and the Secret is not
+// hot-reloaded, so the answer stays accurate for the life of the process - a
+// restart after fixing the Secret is the documented way to pick it up.
+func requireEnv(keys ...string) error {
+	var missing []string
+	for _, k := range keys {
+		if strings.TrimSpace(os.Getenv(k)) == "" {
+			missing = append(missing, k)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	return fmt.Errorf("platform credentials are incomplete: %s is empty (check the credentials Secret named in the chart, in the release namespace)",
+		strings.Join(missing, ", "))
 }

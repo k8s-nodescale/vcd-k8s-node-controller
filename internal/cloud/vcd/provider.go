@@ -50,11 +50,24 @@ func httpTimeout(cfg Config) time.Duration {
 	return defaultHTTPTimeout
 }
 
-// Client is an authenticated vCloud Director connection. It is the cloud
-// Factory: it hands out one Pool per placement, so one process serves every
-// pool regardless of where it lives.
+// Client is a vCloud Director connection. It is the cloud Factory: it hands
+// out one Pool per placement, so one process serves every pool regardless of
+// where it lives.
+//
+// The connection is lazy: New validates the endpoint and keeps the
+// configuration, and the first pool that asks for a provider logs in. A
+// deployment whose platform is not vcd therefore needs no vCD credentials at
+// all, and a wrong account surfaces as a condition on the pool instead of
+// exit(1) before the first reconcile.
 type Client struct {
-	cfg    Config
+	cfg      Config
+	endpoint *url.URL
+
+	// mu guards client. A failed login is not remembered: the pool that could
+	// not connect reports it, and the next pass retries, so installing the
+	// controller before the service account exists is a condition rather than
+	// a restart loop.
+	mu     sync.Mutex
 	client *govcd.VCDClient
 
 	// cpuOnce guards the single admin read of the vDC's CPU speed. The speed is
@@ -78,7 +91,9 @@ var (
 	_ cloud.PoolMembership = (*Pool)(nil)
 )
 
-// New connects to vCD and authenticates.
+// New prepares the vCD factory without connecting. The endpoint is validated
+// here because a malformed URL is a configuration mistake the operator should
+// see at startup; the login happens on the first pool (For).
 func New(cfg Config) (*Client, error) {
 	endpoint, err := normalizeURL(cfg.URL)
 	if err != nil {
@@ -88,13 +103,38 @@ func New(cfg Config) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	client := govcd.NewVCDClient(*u, cfg.Insecure)
-	// Bound every call, including the ones the SDK issues on its own behalf.
-	client.Client.Http.Timeout = httpTimeout(cfg)
-	if err := client.Authenticate(cfg.User, cfg.Password, cfg.Org); err != nil {
-		return nil, err
+	return &Client{cfg: cfg, endpoint: u}, nil
+}
+
+// connect authenticates once and returns the shared client. A failure is not
+// cached, so the next reconcile retries.
+func (c *Client) connect() (*govcd.VCDClient, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.client != nil {
+		return c.client, nil
 	}
-	return &Client{cfg: cfg, client: client}, nil
+	missing := make([]string, 0, 3)
+	if strings.TrimSpace(c.cfg.User) == "" {
+		missing = append(missing, "VCD_USER")
+	}
+	if c.cfg.Password == "" {
+		missing = append(missing, "VCD_PASSWORD")
+	}
+	if strings.TrimSpace(c.cfg.Org) == "" {
+		missing = append(missing, "VCD_ORG")
+	}
+	if len(missing) > 0 {
+		return nil, fmt.Errorf("vcd: credentials are not configured: %s is empty (the credentials Secret is missing or incomplete)", strings.Join(missing, ", "))
+	}
+	client := govcd.NewVCDClient(*c.endpoint, c.cfg.Insecure)
+	// Bound every call, including the ones the SDK issues on its own behalf.
+	client.Client.Http.Timeout = httpTimeout(c.cfg)
+	if err := client.Authenticate(c.cfg.User, c.cfg.Password, c.cfg.Org); err != nil {
+		return nil, fmt.Errorf("vcd: authenticate as %q in org %q: %w", c.cfg.User, c.cfg.Org, err)
+	}
+	c.client = client
+	return client, nil
 }
 
 // For returns the provider for one pool. The placement carries the vApp, org
@@ -108,6 +148,9 @@ func (c *Client) For(placement cloud.Placement) (cloud.Provider, error) {
 	}
 	if strings.TrimSpace(placement.VCD.VApp) == "" {
 		return nil, errors.New("vcd: spec.vcd.vapp is empty")
+	}
+	if _, err := c.connect(); err != nil {
+		return nil, err
 	}
 	return &Pool{Client: c, placement: *placement.VCD}, nil
 }

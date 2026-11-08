@@ -9,4 +9,4 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: vcd-nodescale-manager
-    namespace: vcd-nodescale-system
+    namespace: nodescale-system

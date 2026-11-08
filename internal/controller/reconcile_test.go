@@ -357,7 +357,7 @@ func testPool(replicas int32) *infrav1.K8sWorkerPool {
 	return &infrav1.K8sWorkerPool{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       "default",
-			Namespace:  "vcd-nodescale-system",
+			Namespace:  "nodescale-system",
 			Generation: 1,
 		},
 		Spec: infrav1.K8sWorkerPoolSpec{
