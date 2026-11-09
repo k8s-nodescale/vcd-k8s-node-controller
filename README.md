@@ -16,6 +16,12 @@ verified on a dev cluster (vCD, NSX-V): adding a replica to a `K8sWorkerPool`
 creates a VM, lays out and grows its disks, boots the guest, joins it to the
 cluster and reports it Ready - about five minutes per worker.
 
+**1.1.0** adds the vSphere provider, the one-platform-per-installation rule and
+the installation-wide guest policy (NTP, CA bundle, security sysctls, kernel
+modules and containerd), so a controller-made worker can boot the same way as a
+Terraform + cloud-init + Ansible one. See
+[Guest policy](#guest-policy-containerd-and-the-ca-bundle).
+
 ### How work lands from here
 
 One branch per feature, cut from `main`, named for what it delivers
@@ -1923,7 +1929,7 @@ Service, no Ingress, no Secret.
 ## Terraform integration contract
 
 - The Terraform module installs this chart behind a `node_controller.enabled`
-  toggle and pins `chart_version` / `image_tag` (currently `1.0.0`).
+  toggle and pins `chart_version` / `image_tag` (currently `1.1.0`).
 - The module also passes `platform` explicitly (`vcd` or `vsphere`), the
   platform Secret name, the vSphere folder root, and the namespace
   `nodescale-system`. The chart refuses to render without `platform`: the value
@@ -1983,7 +1989,7 @@ Build locally (the Dockerfile uses `golang:1.27.1-alpine` and
 `gcr.io/distroless/static:nonroot`):
 
 ```
-docker build -t docker.io/werton13/vcd-k8s-node-controller:1.0.0 .
+docker build -t docker.io/werton13/vcd-k8s-node-controller:1.1.0 .
 ```
 
 Public module defaults are used inside the build. On a restricted network,
@@ -1993,14 +1999,14 @@ override them:
 docker build \
   --build-arg GOPROXY=https://nexus.example.com/repository/golang/ \
   --build-arg GOSUMDB=off \
-  -t docker.io/werton13/vcd-k8s-node-controller:1.0.0 .
+  -t docker.io/werton13/vcd-k8s-node-controller:1.1.0 .
 ```
 
 Push (or use `make image-push`):
 
 ```
 docker login docker.io
-docker push docker.io/werton13/vcd-k8s-node-controller:1.0.0
+docker push docker.io/werton13/vcd-k8s-node-controller:1.1.0
 docker push docker.io/werton13/vcd-k8s-node-controller:latest
 ```
 
