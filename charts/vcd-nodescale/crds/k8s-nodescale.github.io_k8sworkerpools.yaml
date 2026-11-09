@@ -137,7 +137,9 @@ spec:
                       insecureSkipVerify:
                         description: |-
                           InsecureSkipVerify disables TLS verification for the mirror endpoints,
-                          matching what the Ansible baseline sets for an http:// mirror.
+                          matching what the Ansible baseline sets for an http:// mirror. On
+                          containerd 2.x this becomes a per-registry certs.d hosts.toml, where that
+                          version keeps its TLS settings.
                         type: boolean
                       mirrors:
                         additionalProperties:
@@ -633,6 +635,21 @@ spec:
                       Folder is where the VMs of the pool are created. It must be at or
                       below the controller root (VSPHERE_FOLDER_ROOT) when that is set,
                       which keeps a pool inside the boundary vCenter grants it.
+                    type: string
+                  host:
+                    description: |-
+                      Host pins every worker of the pool to one ESXi host of Cluster, by
+                      name or inventory path. Empty lets vCenter place each clone within the
+                      cluster, which is the normal case.
+
+                      A lab can require it: where each host has its own switch and the
+                      worker port group exists on only one of them, vCenter's own placement
+                      can put the clone on a host that cannot power it on ("No host is
+                      compatible with the virtual machine"). The host is then part of
+                      placement, exactly like the datastore and the network, so it is named
+                      in the pool - the same host the Terraform tfvars names in
+                      vsphere.esxi_host_name - and never in the controller's environment.
+                      A host that does not belong to Cluster is refused.
                     type: string
                   network:
                     description: |-

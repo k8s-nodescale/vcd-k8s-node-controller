@@ -156,6 +156,7 @@ One `K8sWorkerPool` describes the worker set of a single cluster. You own
 | `vsphere.datastore` | yes* | Datastore holding the worker disks; also the storage the capacity pre-flight reads. |
 | `vsphere.folder` | yes* | VM folder the workers are cloned into. It must be at or below the installation's `vsphere.folderRoot` when one is configured. |
 | `vsphere.network` | yes* | Port group the worker NIC is attached to. |
+| `vsphere.host` | no | Pins every worker of the pool to one ESXi host of `vsphere.cluster`. Empty (the normal case) lets vCenter place each clone. Set it where the port group exists on one host only - a lab whose hosts each have their own switch; the same host the Terraform `vsphere.esxi_host_name` names. A host outside the cluster is refused. |
 | `vsphere.datacenter` | yes* | vCenter datacenter, e.g. `MSK_Dev_DC`. Required: it is part of where the pool lives, like the cluster and the datastore, and there is no process-wide default to disagree with. |
 | `vsphere.resourcePool` | no | Resource pool inside the cluster. Empty means the root pool of the cluster. |
 | `ipPlan` | yes | Mirrors Terraform's `ip_plan`: `cidr`, `vmIPOffset`, `dvmOffset`, `kubeapiLB`, `ingressLB`, `lbNodeOffset`/`lbNodeCount`, `mNodeOffset`/`masterCount`, `wNodeOffset`, `nodeCount`, `reserved[]`. Every offset is relative to `vmIPOffset`: `address = prefix + vmIPOffset + offset`. Workers are allocated from `vmIPOffset+wNodeOffset` upwards. |
@@ -621,6 +622,7 @@ answers. `$DC` is the datacenter, for example `MSK_Dev_DC`.
 | `vsphere.folder` | the folder holding the existing workers: `govc find /$DC/vm -type m -name '<worker-prefix>-*'` prints the VM path, the folder is its parent |
 | `vsphere.datastore` | `govc device.info -vm <worker>`: the hard-disk backing is `[datastore] ...` |
 | `vsphere.network` | `govc device.info -vm <worker>`: the network adapter summary names the port group |
+| `vsphere.host` | only when the pool must stay on one host: the `vsphere.esxi_host_name` of the tfvars that built the cluster, or `govc host.info` for the cluster's hosts |
 | `flavor.template` | `govc vm.info -r <worker>`, or the image the cluster owner names; a VM built by hand has no template and any image that carries the same k8s packages will do |
 | `flavor.cpus` / `memoryMB` / `osDiskGB` | `govc vm.info <worker>` |
 | `flavor.disks[]` | `govc device.info -vm <worker>`: the SCSI controller's `BusNumber` and each data disk's `UnitNumber`/size |
@@ -698,6 +700,8 @@ spec:
     folder: /HUB Infrastructure/dev/k8s-test-lab   # must stay below vsphere.folderRoot
     datastore: 99DOR13_DEV_NFS_L11   # where the worker disks live
     network: Avantage_VL_DEV_MGMT_CNO-330          # the port group of the NIC
+    # host: esxi-01.example.local    # only when the port group exists on one
+    #                                # host: it pins every worker of the pool
     # resourcePool: ""               # empty means the cluster's root pool
   bootstrap:
     osUser: ubuntu                   # an account the image already has

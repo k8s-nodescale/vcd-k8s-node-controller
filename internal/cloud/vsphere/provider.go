@@ -256,6 +256,51 @@ func (p *Provider) cluster(ctx context.Context, f *find.Finder) (*object.Cluster
 	return c, nil
 }
 
+// host returns the host a pinned pool was given, after checking that it is one
+// of the cluster's hosts. A host of another cluster is refused instead of
+// cloned onto: the cluster is the pool's capacity and the host is a
+// refinement of it, not a way out of it.
+//
+// A name matches the host's inventory path or its own name, case-insensitively,
+// so both the FQDN a tfvars carries and a full path work.
+func (p *Provider) host(ctx context.Context, f *find.Finder, cluster *object.ClusterComputeResource) (*object.HostSystem, error) {
+	want := strings.TrimSpace(p.placement.Host)
+	if want == "" {
+		return nil, nil
+	}
+	hosts, err := cluster.Hosts(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("vsphere: hosts of cluster %q: %w", p.placement.Cluster, err)
+	}
+	for _, h := range hosts {
+		if hostMatches(h, want) {
+			return h, nil
+		}
+	}
+	return nil, fmt.Errorf("vsphere: spec.vsphere.host %q is not a host of cluster %q: "+
+		"the host is a refinement of the cluster, so it cannot name a machine outside it",
+		want, p.placement.Cluster)
+}
+
+// hostMatches compares a configured host against one inventory entry: the full
+// path, or the leaf name (the FQDN in the terraform tfvars).
+func hostMatches(h *object.HostSystem, want string) bool {
+	if h == nil {
+		return false
+	}
+	want = strings.TrimSpace(want)
+	return strings.EqualFold(strings.TrimSpace(h.InventoryPath), want) ||
+		strings.EqualFold(hostLeaf(h.InventoryPath), want)
+}
+
+// hostLeaf drops the inventory path, leaving the host name a tfvars carries.
+func hostLeaf(path string) string {
+	if i := strings.LastIndex(path, "/"); i >= 0 {
+		return path[i+1:]
+	}
+	return path
+}
+
 func (p *Provider) resourcePool(ctx context.Context, f *find.Finder, cluster *object.ClusterComputeResource) (*object.ResourcePool, error) {
 	name := strings.TrimSpace(p.placement.ResourcePool)
 	if name == "" {
@@ -526,8 +571,21 @@ func (p *Provider) CreateVM(ctx context.Context, spec cloud.CreateVMSpec) (cloud
 
 	dsRef := ds.Reference()
 	poolRef := pool.Reference()
+	loc := types.VirtualMachineRelocateSpec{Datastore: &dsRef, Pool: &poolRef}
+	// Placement is the pool's: when it names a host, the clone is created
+	// there. vCenter's own placement cannot know that the port group exists
+	// on only one host (each host may have its own switch), and its mistake
+	// surfaces at power-on, after the clone.
+	if p.placement.Host != "" {
+		host, herr := p.host(ctx, f, cluster)
+		if herr != nil {
+			return cloud.VM{}, herr
+		}
+		href := host.Reference()
+		loc.Host = &href
+	}
 	task, err := tpl.Clone(ctx, folder, spec.Name, types.VirtualMachineCloneSpec{
-		Location: types.VirtualMachineRelocateSpec{Datastore: &dsRef, Pool: &poolRef},
+		Location: loc,
 		Config:   cfg,
 	})
 	if err != nil {

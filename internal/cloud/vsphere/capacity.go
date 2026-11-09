@@ -50,6 +50,26 @@ func (p *Provider) Capacity(ctx context.Context) (cloud.PlatformCapacity, error)
 	if err != nil {
 		return cloud.PlatformCapacity{}, fmt.Errorf("vsphere: hosts of cluster %q: %w", p.placement.Cluster, err)
 	}
+	model := "vSphere " + p.placement.Cluster
+	if p.placement.Host != "" {
+		// A pinned host is the only host a worker can use, so it is the only
+		// host whose room is real for this pool. Counting the whole cluster
+		// would tell the caller there is space where the create can never go.
+		pinned := hosts[:0:0]
+		for _, h := range hosts {
+			if hostMatches(h, p.placement.Host) {
+				pinned = append(pinned, h)
+			}
+		}
+		if len(pinned) == 0 {
+			return cloud.PlatformCapacity{}, fmt.Errorf(
+				"vsphere: spec.vsphere.host %q is not a host of cluster %q: "+
+					"the host is a refinement of the cluster, so it cannot name a machine outside it",
+				p.placement.Host, p.placement.Cluster)
+		}
+		hosts = pinned
+		model = model + "/" + hostLeaf(p.placement.Host)
+	}
 	refs := make([]types.ManagedObjectReference, 0, len(hosts))
 	for _, h := range hosts {
 		refs = append(refs, h.Reference())
@@ -63,11 +83,6 @@ func (p *Provider) Capacity(ctx context.Context) (cloud.PlatformCapacity, error)
 	// Sorted so CPUMHzPerCore is the same number on every pass when the hosts
 	// of a cluster do not report the same speed.
 	sort.Slice(mhs, func(i, j int) bool { return mhs[i].Name < mhs[j].Name })
-
-	// A pinned host is the only host a worker can use, so it is the only host
-	// whose room is real for this pool. Counting the whole cluster would tell
-	// the caller there is space where the create can never go.
-	model := "vSphere " + p.placement.Cluster
 
 	out := cloud.PlatformCapacity{Model: model}
 	usable := 0

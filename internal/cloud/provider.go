@@ -73,6 +73,13 @@ type VSpherePlacement struct {
 	Network      string
 	Folder       string
 
+	// Host pins every worker of the pool to one ESXi host of Cluster. Empty
+	// means vCenter places each clone within the cluster. Some environments
+	// publish the worker port group on a single host's switch, so there the
+	// host is part of placement exactly like the cluster and the datastore:
+	// it is named by the pool, never by the process environment.
+	Host string
+
 	// Guest network: the subnet prefix comes from the pool ipPlan.cidr, so
 	// only the gateway, the interface name and the resolvers live here.
 	NICName    string

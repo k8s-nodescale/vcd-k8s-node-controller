@@ -436,6 +436,21 @@ type VSphereRef struct {
 	// resolvers come from spec.bootstrap.nicName and spec.bootstrap.dns, so
 	// there is one place to change them.
 	Network string `json:"network"`
+
+	// Host pins every worker of the pool to one ESXi host of Cluster, by
+	// name or inventory path. Empty lets vCenter place each clone within the
+	// cluster, which is the normal case.
+	//
+	// A lab can require it: where each host has its own switch and the
+	// worker port group exists on only one of them, vCenter's own placement
+	// can put the clone on a host that cannot power it on ("No host is
+	// compatible with the virtual machine"). The host is then part of
+	// placement, exactly like the datastore and the network, so it is named
+	// in the pool - the same host the Terraform tfvars names in
+	// vsphere.esxi_host_name - and never in the controller's environment.
+	// A host that does not belong to Cluster is refused.
+	// +optional
+	Host string `json:"host,omitempty"`
 }
 
 // IPPlan mirrors Terraform's ip_plan variable. It carries only the

@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/vmware/govmomi/object"
 	"github.com/vmware/govmomi/vim25/types"
 
 	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/cloud"
@@ -218,5 +219,55 @@ func TestSetDiskCapacityWritesBothFields(t *testing.T) {
 	}
 	if d.CapacityInBytes != 10*1024*1024*1024 {
 		t.Fatalf("capacityInBytes = %d, want %d", d.CapacityInBytes, int64(10)*1024*1024*1024)
+	}
+}
+
+// TestHostMatchesTheTfvarsName: the pool names the host the way the Terraform
+// tfvars does (vsphere.esxi_host_name, an FQDN), while vSphere reports an
+// inventory path. Both must resolve to the same host, and a host outside the
+// cluster must not.
+func TestHostMatchesTheTfvarsName(t *testing.T) {
+	fqdn := "99r2488-01-dev.mtscloud.local"
+	h := &object.HostSystem{Common: object.Common{
+		InventoryPath: "/MSK_Dev_DC/host/mskdev/" + fqdn,
+	}}
+	for _, want := range []string{
+		fqdn,
+		"99R2488-01-DEV.MTSCLOUD.LOCAL",
+		" /MSK_Dev_DC/host/mskdev/" + fqdn + " ",
+	} {
+		if !hostMatches(h, want) {
+			t.Errorf("hostMatches(%q) = false, want true", want)
+		}
+	}
+	for _, want := range []string{
+		"",
+		"77r2488-01-dev.mtscloud.local",
+		"99r2488-01",
+		"/MSK_Dev_DC/host/other/99r2488-01-dev.mtscloud.local",
+	} {
+		if hostMatches(h, want) {
+			t.Errorf("hostMatches(%q) = true, want false", want)
+		}
+	}
+	if got := hostLeaf("/MSK_Dev_DC/host/mskdev/" + fqdn); got != fqdn {
+		t.Errorf("hostLeaf = %q, want %q", got, fqdn)
+	}
+	if got := hostLeaf(fqdn); got != fqdn {
+		t.Errorf("hostLeaf on a bare name = %q, want %q", got, fqdn)
+	}
+}
+
+// TestPlacementCarriesTheHost: the host is part of placement, so it reaches the
+// clone the same way the cluster and the datastore do.
+func TestPlacementCarriesTheHost(t *testing.T) {
+	pl := testPlacement()
+	pl.VSphere.Host = "99r2488-01-dev.mtscloud.local"
+	prov, err := New(Config{URL: "https://vcenter.example"}).For(pl)
+	if err != nil {
+		t.Fatalf("For: %v", err)
+	}
+	if got := prov.(*Provider).placement.Host; got != pl.VSphere.Host {
+		t.Fatalf("placement host = %q, want %q", got, pl.VSphere.Host)
 	}
 }

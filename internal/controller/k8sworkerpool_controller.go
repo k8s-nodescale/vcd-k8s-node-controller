@@ -760,6 +760,7 @@ func placementFor(pool *infrav1.K8sWorkerPool, platform string) cloud.Placement 
 			Datastore:    v.Datastore,
 			Network:      v.Network,
 			Folder:       v.Folder,
+			Host:         v.Host,
 			NICName:      pool.Spec.Bootstrap.NICName,
 			Gateway:      gatewayIP(pool.Spec.IPPlan.CIDR),
 			DNSServers:   pool.Spec.Bootstrap.DNS,
