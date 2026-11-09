@@ -56,6 +56,14 @@ spec:
             # other platform is rejected as InvalidSpec.
             - name: NODESCALE_PLATFORM
               value: {{ $platform | quote }}
+            {{- with .Values.bootstrap.configMapName }}
+            # Installation-wide guest policy (NTP, CA bundle, sysctls,
+            # containerd mirrors): a ConfigMap in this namespace with a
+            # bootstrap.yaml key. A pool that leaves a field empty gets this
+            # value; a pool that names one keeps its own.
+            - name: NODESCALE_BOOTSTRAP_CONFIGMAP
+              value: {{ . | quote }}
+            {{- end }}
             {{- if eq $platform "vcd" }}
             # vCloud Director connection. Every key is optional at the kubelet
             # level so a missing Secret starts the Pod with a clear,

@@ -20,6 +20,42 @@ namespace:
   # platform credentials Secret.
   name: nodescale-system
 
+# Installation-wide guest policy: the defaults every K8sWorkerPool inherits
+# when its own spec.bootstrap leaves a field empty.
+#
+# The chart renders one ConfigMap (bootstrap.configMapName) whose bootstrap.yaml
+# key has the same shape as spec.bootstrap. The controller reads it and embeds
+# the values into each new worker's user-data, so a pool does not repeat a 6 KB
+# CA bundle or a mirror list.
+#
+# bootstrap.defaults accepts:
+#   ntpServers: [ntp1.example.com, ntp2.example.com]
+#   sysctls: {net.core.rmem_max: "67108864"}
+#   kernelModules: [nf_conntrack]
+#   caBundleRef: {name: ..., key: ...}   (set automatically when caBundle is)
+#   containerd:
+#     sandboxImage: registry.example.com/pause:3.9
+#     insecureSkipVerify: false
+#     mirrors:
+#       docker.io: ["http://mirror.example.com"]
+#       registry.k8s.io: ["http://mirror.example.com"]
+#
+# A pool keeps its own value when it names one: these are defaults, not
+# overrides. The values apply to workers created after the chart is upgraded;
+# running workers keep the bootstrap they were created with.
+bootstrap:
+  configMapName: nodescale-bootstrap
+  # create=false is for an installation that manages the same ConfigMap
+  # elsewhere (Ansible, a GitOps repository): the controller still reads it,
+  # the chart just does not own it.
+  create: true
+  defaults: {}
+  # caBundle is a PEM bundle (one or more certificates). Install it with
+  #   --set-file bootstrap.caBundle=/path/to/ca-bundle.pem
+  # The chart stores it under the ca-bundle.pem key and points caBundleRef at
+  # it, so no pool has to carry the text.
+  caBundle: ""
+
 # vCloud Director credentials. Used when platform is vcd; the whole block is
 # ignored otherwise, and nothing from it is rendered.
 #
@@ -49,7 +85,7 @@ vcd:
 # The Secret holds only the connection, shared by every vSphere pool of the
 # installation:
 #   url       https://vcenter.example.com    (a bare host works too)
-#   user      e.g. terraform@mtsdevp97.local
+#   user      e.g. terraform@example.local
 #   password  its password
 #   insecure  true for a self-signed vCenter certificate
 #
@@ -65,8 +101,8 @@ vcd:
 # controller is not granted read access to another namespace):
 #
 #   kubectl -n nodescale-system create secret generic vsphere-credentials \
-#     --from-literal=url=https://97dev-vcp01.mtscloud.local \
-#     --from-literal=user=terraform@mtsdevp97.local \
+#     --from-literal=url=https://vcenter.example.com \
+#     --from-literal=user=terraform@example.local \
 #     --from-literal=password='***' \
 #     --from-literal=insecure=true
 vsphere:

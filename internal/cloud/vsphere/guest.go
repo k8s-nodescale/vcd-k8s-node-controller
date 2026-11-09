@@ -10,6 +10,8 @@
 package vsphere
 
 import (
+	"bytes"
+	"compress/gzip"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -77,23 +79,52 @@ func decodeAnnotation(raw string) vmAnnotation {
 // the metadata document and disk.EnableUUID. An empty document is skipped,
 // which keeps a template with its own bootstrap from being overwritten by an
 // empty one.
-func guestExtraConfig(userData, metadata string, enableUUID bool) []types.BaseOptionValue {
+//
+// The documents are gzip-compressed before base64: a rendered user-data is
+// ~35 KB and grows with the CA bundle a pool may add, while a guestinfo value
+// is limited (64 KB) and the base64 layer alone would spend a third of it.
+// cloud-init's VMware datasource understands "gzip+base64" (DataSourceVMware,
+// enc_type), so the guest decodes it without help.
+func guestExtraConfig(userData, metadata string, enableUUID bool) ([]types.BaseOptionValue, error) {
 	var out []types.BaseOptionValue
-	add := func(key, value string) {
+	add := func(key, value string) error {
 		if value == "" {
-			return
+			return nil
+		}
+		enc, err := gzipBase64(value)
+		if err != nil {
+			return err
 		}
 		out = append(out,
-			&types.OptionValue{Key: key, Value: base64.StdEncoding.EncodeToString([]byte(value))},
-			&types.OptionValue{Key: key + ".encoding", Value: "base64"},
+			&types.OptionValue{Key: key, Value: enc},
+			&types.OptionValue{Key: key + ".encoding", Value: "gzip+base64"},
 		)
+		return nil
 	}
-	add("guestinfo.userdata", userData)
-	add("guestinfo.metadata", metadata)
+	if err := add("guestinfo.userdata", userData); err != nil {
+		return nil, err
+	}
+	if err := add("guestinfo.metadata", metadata); err != nil {
+		return nil, err
+	}
 	if enableUUID {
 		out = append(out, &types.OptionValue{Key: "disk.EnableUUID", Value: "TRUE"})
 	}
-	return out
+	return out, nil
+}
+
+// gzipBase64 compresses a guestinfo document and encodes it for the .encoding
+// property cloud-init reads.
+func gzipBase64(in string) (string, error) {
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write([]byte(in)); err != nil {
+		return "", err
+	}
+	if err := zw.Close(); err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(buf.Bytes()), nil
 }
 
 // metadataDocument is the cloud-init network document for one worker. It has to

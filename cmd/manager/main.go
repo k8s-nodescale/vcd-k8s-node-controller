@@ -135,18 +135,19 @@ func main() {
 	}
 
 	if err := (&controller.WorkerPoolReconciler{
-		Client:            mgr.GetClient(),
-		Scheme:            mgr.GetScheme(),
-		Cloud:             cloudProvider,
-		Kube:              kube.NewClient(cs),
-		Renderer:          renderer,
-		Recorder:          mgr.GetEventRecorderFor("k8sworkerpool-controller"),
-		Platform:          platform,
-		Org:               vcdOrg,
-		VDC:               vcdVDC,
-		VSphereFolderRoot: os.Getenv("VSPHERE_FOLDER_ROOT"),
-		PodName:           os.Getenv("POD_NAME"),
-		PodNamespace:      os.Getenv("POD_NAMESPACE"),
+		Client:             mgr.GetClient(),
+		Scheme:             mgr.GetScheme(),
+		Cloud:              cloudProvider,
+		Kube:               kube.NewClient(cs),
+		Renderer:           renderer,
+		Recorder:           mgr.GetEventRecorderFor("k8sworkerpool-controller"),
+		Platform:           platform,
+		Org:                vcdOrg,
+		VDC:                vcdVDC,
+		VSphereFolderRoot:  os.Getenv("VSPHERE_FOLDER_ROOT"),
+		PodName:            os.Getenv("POD_NAME"),
+		PodNamespace:       os.Getenv("POD_NAMESPACE"),
+		BootstrapConfigMap: strings.TrimSpace(os.Getenv("NODESCALE_BOOTSTRAP_CONFIGMAP")),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller")
 		os.Exit(1)

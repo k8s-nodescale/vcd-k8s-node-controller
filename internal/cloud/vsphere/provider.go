@@ -510,11 +510,15 @@ func (p *Provider) CreateVM(ctx context.Context, spec cloud.CreateVMSpec) (cloud
 	if metadata == "" {
 		return cloud.VM{}, errors.New("vsphere: cannot render the guest network document: gateway, prefix or nic name is missing")
 	}
+	extraConfig, err := guestExtraConfig(spec.UserData, metadata, spec.EnableUUID)
+	if err != nil {
+		return cloud.VM{}, fmt.Errorf("vsphere: encode the guest bootstrap: %w", err)
+	}
 	cfg := &types.VirtualMachineConfigSpec{
 		NumCPUs:     spec.CPUs,
 		MemoryMB:    int64(spec.MemoryMB),
 		Annotation:  encodeAnnotation(spec.Metadata, spec.IP, spec.Template),
-		ExtraConfig: guestExtraConfig(spec.UserData, metadata, spec.EnableUUID),
+		ExtraConfig: extraConfig,
 		DeviceChange: []types.BaseVirtualDeviceConfigSpec{
 			&types.VirtualDeviceConfigSpec{Operation: types.VirtualDeviceConfigSpecOperationEdit, Device: nics[0]},
 		},

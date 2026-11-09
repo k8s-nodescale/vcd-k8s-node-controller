@@ -134,6 +134,11 @@ One `K8sWorkerPool` describes the worker set of a single cluster. You own
 | `bootstrap.dns` | no | Resolvers written into the guest. |
 | `bootstrap.k8sVersion` | no | Full apt version pinned in the guest, e.g. `1.35.9-1.1`. |
 | `bootstrap.k8sMinorRepo` | no | `pkgs.k8s.io` minor repo, e.g. `v1.35`. |
+| `bootstrap.ntpServers[]` | no | chrony sources, each written as `server <host> iburst` in a marked block of `/etc/chrony/chrony.conf`. Empty keeps the image's sources; the installation default applies when the chart sets one. |
+| `bootstrap.caBundleRef` | no | `{kind, name, namespace, key}` of a ConfigMap (default) or Secret holding the PEM bundle to trust in the guest. Usually inherited from the installation, see [Guest policy](#guest-policy-containerd-and-the-ca-bundle). |
+| `bootstrap.sysctls` | no | Extra kernel parameters, written to `/etc/sysctl.d/99-zzz-nodescale.conf` (last in name order, so they win) and applied with `sysctl --system`. The Kubernetes-required ones are always written. |
+| `bootstrap.kernelModules[]` | no | Modules loaded and persisted in `/etc/modules-load.d/nodescale.conf` before the sysctls apply, so a `nf_conntrack` parameter is not silently dropped. A failed `modprobe` is logged, never fatal. |
+| `bootstrap.containerd` | no | Site part of the runtime config: `sandboxImage`, `mirrors` (`{host: [endpoint,...]}`), `insecureSkipVerify`, and `configRef` as a full-file escape hatch. See [Guest policy](#guest-policy-containerd-and-the-ca-bundle). |
 | `flavor.cpus` / `flavor.memoryMB` | yes | VM shape. |
 | `flavor.osDiskGB` | no | Grows the cloned template's system disk (bus 0/unit 0) before the first power-on. Terraform nodes use `disks_config.osdisk.sizegb`; a clone without this keeps the template size (10 GB on the current Ubuntu template). A smaller value replaces the worker (see [Rolling compute-spec changes](#rolling-compute-spec-changes)). |
 | `flavor.template` | no | Image to clone: a vCD catalog item, or on vSphere a VM name or inventory path (e.g. `noble-template_1.1.0_k8s`). Must expose `disk.EnableUUID`. Another value replaces the worker: a different image is a different VM. |
@@ -361,6 +366,12 @@ helm install vcd-nodescale charts/vcd-nodescale \
 below it. It is a policy of the installation rather than a credential, so it is
 a plain chart value and not a Secret key.
 
+The release also renders `nodescale-bootstrap`, the installation-wide guest
+policy (NTP, CA bundle, sysctls, containerd mirrors) that every new worker
+inherits; add `--set-file bootstrap.caBundle=...` and
+`bootstrap.defaults` when they apply. See
+[Guest policy](#guest-policy-containerd-and-the-ca-bundle).
+
 The Pod starts even while the credentials Secret is missing or incomplete:
 `/readyz` stays NotReady (so `helm --wait` fails) and every affected pool
 reports `CloudError` naming the missing key. The controller never enters a
@@ -445,6 +456,131 @@ helm -n vcd-nodescale-system uninstall vcd-nodescale
 
 Then write the pools as described in the next section (a release installed by an
 older chart needs its CRD applied first, as above).
+
+### Guest policy: containerd and the CA bundle
+
+A worker is created from a **plain image**: nothing about the site is baked into
+the template, and the controller assumes no prepared `/etc/containerd/config.toml`
+either. The two files that used to be copied into an image - the runtime
+configuration and the trust bundle - are produced at boot from two inputs:
+
+- the **installation** policy, one ConfigMap the chart renders, and
+- the **pool** `spec.bootstrap`, which overrides it field by field.
+
+```
+nodescale-system/nodescale-bootstrap        (chart: values.bootstrap)
+  bootstrap.yaml    same shape as spec.bootstrap: ntpServers, sysctls,
+                    kernelModules, containerd, caBundleRef
+  ca-bundle.pem     the PEM bundle, when --set-file bootstrap.caBundle was used
+```
+
+The controller reads that ConfigMap once per reconcile and embeds the result
+into the new worker's user-data; the guest never talks to the Kubernetes API,
+and a pool that names nothing inherits everything. A pool reference
+(`bootstrap.caBundleRef`, `bootstrap.containerd.configRef`) resolves in the
+pool's namespace; a reference that comes from the installation resolves in the
+controller's namespace, which is where the chart put the ConfigMap.
+
+**containerd `config.toml`.** It is generated in the guest, not shipped whole:
+the prerequisites script runs `containerd config default > /etc/containerd/config.toml`
+only when the image has no file (the `containerd` package does not own that
+path), writes `imports = ["/etc/containerd/conf.d/*.toml"]` once, and the
+script generates `/etc/containerd/conf.d/10-nodescale.toml` with only the site
+values:
+
+```toml
+# containerd 1.x layout
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+  SystemdCgroup = true
+[plugins."io.containerd.grpc.v1.cri"]
+  sandbox_image = "registry.example.com/pause:3.9"
+[plugins."io.containerd.grpc.v1.cri".registry.mirrors."docker.io"]
+  endpoint = ["http://mirror.example.com"]
+```
+
+The base therefore matches the binary that is actually installed, and the
+fragment stays readable and version-free: containerd takes `version` from the
+base file. The plugin layout does **not** come from a constant: containerd 2.x
+renamed the CRI plugin (`io.containerd.cri.v1.runtime` for the runtime,
+`io.containerd.cri.v1.images` for the sandbox image and the registry), and a
+key written in the wrong layout is ignored with a warning while `SystemdCgroup`
+silently stays `false`. The script therefore reads the layout from the
+generated base and writes the matching keys - on 2.x the pause image becomes
+`pinned_images.sandbox` and `insecureSkipVerify` becomes a per-registry
+`/etc/containerd/certs.d/<host>/hosts.toml`, which is where 2.x keeps TLS
+settings. The script then checks the effective result with
+`containerd config dump` and logs a warning when `SystemdCgroup` did not take
+effect (a 1.x-style drop-in against a 2.x binary, or the reverse).
+
+A site whose runtime cannot be expressed this way sets
+`bootstrap.containerd.configRef` to a full `config.toml` in a ConfigMap or
+Secret; the controller then writes that file verbatim and generates no drop-in,
+at the cost of coupling the pool to a containerd major version.
+
+**CA bundle.** Never a literal in the CR and never in the chart source: install it
+from a file, per installation, and every pool trusts it.
+
+```
+helm upgrade vcd-nodescale vcd-nodescale/vcd-nodescale \
+  --namespace nodescale-system --reuse-values \
+  --set-file bootstrap.caBundle=./environment-roots.pem
+```
+
+The chart stores it as `ca-bundle.pem` and points `bootstrap.caBundleRef` at its
+own ConfigMap. The controller splits the bundle into one file per certificate
+under `/usr/local/share/ca-certificates/nodescale-NN.crt` and runs
+`update-ca-certificates` before anything reaches the network - apt, the
+Kubernetes repository and the registry all use it. A pool overrides the bundle
+with its own `caBundleRef` (for example a cluster that trusts one extra root),
+or the installation sets `bootstrap.create=false` and something else owns the
+ConfigMap.
+
+**The two install scenarios** differ only in who fills that ConfigMap:
+
+- **Terraform + Ansible** (a cluster being promoted, the baseline these fields
+  mirror). The same values already exist in that path: `ntp_srv1`/`ntp_srv2`,
+  `containerd_mirror`, the CA files `templates/userdata_w.yaml` writes into
+  `ca_certs.trusted`, and the sysctls of `add_custom_kernel_params`. They have
+  to reach the ConfigMap once, at install time:
+
+  ```
+  kubectl -n nodescale-system create configmap nodescale-bootstrap \
+    --from-file=bootstrap.yaml=bootstrap.yaml \
+    --from-file=ca-bundle.pem=environment-roots.pem
+  ```
+
+  `bootstrap.yaml` has the shape shown under `bootstrap.defaults` in the chart
+  values (`ntpServers`, `sysctls`, `kernelModules`, `containerd`, and the
+  `caBundleRef` the chart adds when it renders a bundle). Set
+  `bootstrap.create=false` in the release values when Ansible owns the object, so
+  the chart does not overwrite it on upgrade. Wiring the
+  `k8s_addons_node_controller` role to build the file from the variables it
+  already carries is the remaining step on that side; the controller side is
+  identical in both scenarios, and until the wiring lands the ConfigMap is
+  applied once by hand (or by the playbook's own template task). A worker the
+  controller creates afterwards then boots with the same NTP, trust bundle,
+  mirror and runtime settings as the Terraform/Ansible ones next to it.
+- **Helm + `kubectl apply -f pool.yaml`** (an existing cluster). There is no
+  playbook, so the ConfigMap is chart values: `bootstrap.defaults` for NTP,
+  sysctls, modules and containerd; `--set-file bootstrap.caBundle` for trust. A
+  single pool can still carry its own values in `spec.bootstrap`.
+
+Both boxes must produce the same thing, and the fields are the same names, so
+the two scenarios can be compared line by line:
+
+| Guest change | Terraform + Ansible source | Chart / pool source |
+| --- | --- | --- |
+| chrony sources | `ntp_srv1`/`ntp_srv2` in `cluster_vars_content` | `bootstrap.defaults.ntpServers` |
+| trusted roots | PEM files in `templates/userdata_w.yaml` (`ca_certs.trusted`) | `--set-file bootstrap.caBundle` |
+| sysctls | site sysctl file on the DVM | `bootstrap.defaults.sysctls` |
+| containerd mirrors | `containerd_mirror` (the private `config.toml` template) | `bootstrap.defaults.containerd.mirrors` |
+| pause image | `sandbox_image` in that template | `bootstrap.defaults.containerd.sandboxImage` |
+| cgroup driver | `SystemdCgroup = true` in that template | generated drop-in, always |
+
+Values apply to workers created after the change: an existing worker keeps the
+bootstrap it was born with, exactly like a Terraform node keeps the user-data it
+was cloned with. Replacing a worker is a rollout (see
+[Rolling compute-spec changes](#rolling-compute-spec-changes)).
 
 ## Writing a K8sWorkerPool for an existing cluster
 
@@ -563,6 +699,16 @@ spec:
     dns: ["10.74.64.91", "10.73.1.45"]
     k8sVersion: 1.28.15-1.1          # a version the apt repository carries
     k8sMinorRepo: v1.28
+    # Guest policy is normally installation-wide (the nodescale-bootstrap
+    # ConfigMap, see "Guest policy"); a pool names a field only to differ:
+    # ntpServers: [ntp1.example.com, ntp2.example.com]
+    # caBundleRef: {name: environment-roots, key: ca.pem}
+    # sysctls: {net.netfilter.nf_conntrack_max: "2621440"}
+    # kernelModules: [nf_conntrack]
+    # containerd:
+    #   sandboxImage: registry.example.com/pause:3.9
+    #   mirrors:
+    #     docker.io: ["http://mirror.example.com"]
   flavor:
     template: noble-template_1.1.0_k8s
     cpus: 8

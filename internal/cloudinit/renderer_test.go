@@ -41,6 +41,14 @@ func testParams() Params {
 				TempMount: "/data2", Mount: "/var/lib", FSType: "ext4", SizeGB: 30,
 			},
 		},
+		NTPServers:             []string{"ntp1.example.com", "ntp2.example.com"},
+		CACerts:                []string{"-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIUTESTCERT\n-----END CERTIFICATE-----"},
+		Sysctls:                []string{"net.core.rmem_max = 67108864", "net.netfilter.nf_conntrack_max = 2621440"},
+		KernelModules:          []string{"nf_conntrack"},
+		ContainerdSandboxImage: "registry.example.com/pause:3.9",
+		ContainerdMirrors: []MirrorParam{
+			{Host: "docker.io", Endpoints: []string{"http://mirror.example.com"}},
+		},
 	}
 }
 
@@ -443,7 +451,9 @@ func TestUserDataIsValidCloudConfig(t *testing.T) {
 		"/etc/kubernetes/join-command.sh",
 		"/etc/sysctl.d/k8s.conf",
 		"/etc/modules-load.d/k8s.conf",
-		"/etc/containerd/config.toml",
+		"/etc/sysctl.d/99-zzz-nodescale.conf",
+		"/etc/modules-load.d/nodescale.conf",
+		"/usr/local/share/ca-certificates/nodescale-00.crt",
 	} {
 		if _, ok := files[want]; !ok {
 			t.Errorf("%s is missing", want)

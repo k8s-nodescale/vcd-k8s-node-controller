@@ -24,7 +24,7 @@ import (
 
 // RenderVersion is bumped whenever the rendered output changes in a way that
 // matters to a running guest. It is stamped into every generated file.
-const RenderVersion = "0.4.1"
+const RenderVersion = "0.5.0"
 
 //go:embed templates/*.tmpl
 var templatesFS embed.FS
@@ -67,6 +67,54 @@ type Params struct {
 	// cluster's nodes by name and address, the way the Terraform baseline
 	// writes them.
 	HostsLines []string
+	// NTPServers are written into chrony.conf in a marked block. Empty keeps
+	// the image's configuration.
+	NTPServers []string
+	// CACerts are PEM blocks the guest trusts: each becomes a file under
+	// /usr/local/share/ca-certificates and one update-ca-certificates run.
+	CACerts []string
+	// Sysctls are "key = value" lines written after the kernel modules load,
+	// so a conntrack parameter is not silently dropped by a missing module.
+	Sysctls []string
+	// KernelModules are modprobe'd and persisted before the sysctls apply.
+	KernelModules []string
+	// ContainerdSandboxImage is the pause image containerd hands to the
+	// runtime. Empty keeps the installed binary's default.
+	ContainerdSandboxImage string
+	// ContainerdMirrors are the registry hosts, sorted, with their endpoints.
+	// Empty means every registry is reached directly.
+	ContainerdMirrors []MirrorParam
+	// ContainerdInsecure disables TLS verification for those endpoints.
+	ContainerdInsecure bool
+	// ContainerdFullConfig, when set, is written to /etc/containerd/config.toml
+	// verbatim and no drop-in is generated.
+	ContainerdFullConfig string
+}
+
+// MirrorParam is one registry host and the endpoints containerd may pull it
+// from. The controller sorts the host list so two renders are identical.
+type MirrorParam struct {
+	Host      string
+	Endpoints []string
+}
+
+// Mirrors converts a pool's map into the sorted slice the template ranges over.
+// A map has no order, and the guest file would otherwise differ between two
+// renders of the same pool.
+func Mirrors(in map[string][]string) []MirrorParam {
+	hosts := make([]string, 0, len(in))
+	for host, endpoints := range in {
+		if len(endpoints) == 0 {
+			continue
+		}
+		hosts = append(hosts, host)
+	}
+	sort.Strings(hosts)
+	out := make([]MirrorParam, 0, len(hosts))
+	for _, host := range hosts {
+		out = append(out, MirrorParam{Host: host, Endpoints: append([]string(nil), in[host]...)})
+	}
+	return out
 }
 
 // Renderer renders the templates.
@@ -157,6 +205,23 @@ func (r *Renderer) Render(p Params) (userData string, initscript string, err err
 		return "", "", fmt.Errorf("render disk setup: %w", err)
 	}
 
+	type caFile struct{ Path, Content string }
+	var caFiles []caFile
+	for i, pem := range p.CACerts {
+		caFiles = append(caFiles, caFile{
+			Path:    fmt.Sprintf("/usr/local/share/ca-certificates/nodescale-%02d.crt", i),
+			Content: indentLines(strings.TrimSpace(pem), 6),
+		})
+	}
+	sysctlFile := ""
+	if len(p.Sysctls) > 0 {
+		sysctlFile = indentLines(strings.Join(p.Sysctls, "\n"), 6)
+	}
+	fullConfigFile := ""
+	if p.ContainerdFullConfig != "" {
+		fullConfigFile = indentLines(strings.TrimSpace(p.ContainerdFullConfig), 6)
+	}
+
 	var ud bytes.Buffer
 	if err := r.userDataTpl.Execute(&ud, struct {
 		Params
@@ -166,9 +231,12 @@ func (r *Renderer) Render(p Params) (userData string, initscript string, err err
 		GrowScript      string
 		GrowDataScript  string
 		DiskSetupScript string
+		CACertFiles     []caFile
+		SysctlFile      string
+		FullConfigFile  string
 	}{p, r.stamp, indentLines(layout.String(), 6), indentLines(ensure.String(), 6),
 		indentLines(grow.String(), 6), indentLines(growData.String(), 6),
-		indentLines(ds.String(), 6)}); err != nil {
+		indentLines(ds.String(), 6), caFiles, sysctlFile, fullConfigFile}); err != nil {
 		return "", "", fmt.Errorf("render user-data: %w", err)
 	}
 	gz, err := base64Gzip(ud.Bytes())
@@ -207,8 +275,66 @@ func specHash8(p Params) string {
 			d.Device, d.VG, d.LV, d.TempMount, d.Mount, d.FSType, d.SizeGB,
 			strings.Join(d.RsyncExcludes, ","))
 	}
+	// The guest policy is part of the identity too: a recreated VM whose NTP,
+	// CA bundle or containerd config changed is not "the same instance".
+	b.WriteString(strings.Join(p.NTPServers, ","))
+	b.WriteByte('|')
+	b.WriteString(strings.Join(p.CACerts, ","))
+	b.WriteByte('|')
+	b.WriteString(strings.Join(p.Sysctls, ","))
+	b.WriteByte('|')
+	b.WriteString(strings.Join(p.KernelModules, ","))
+	b.WriteByte('|')
+	b.WriteString(p.ContainerdSandboxImage)
+	b.WriteByte('|')
+	for _, m := range p.ContainerdMirrors {
+		fmt.Fprintf(&b, "%s=%s,", m.Host, strings.Join(m.Endpoints, "+"))
+	}
+	b.WriteByte('|')
+	fmt.Fprintf(&b, "%t", p.ContainerdInsecure)
+	b.WriteByte('|')
+	b.WriteString(p.ContainerdFullConfig)
 	sum := sha256.Sum256([]byte(b.String()))
 	return hex.EncodeToString(sum[:])[:8]
+}
+
+// CACertBlocks splits a PEM bundle into individual certificates. A guest needs
+// one file per certificate: update-ca-certificates reads the directory and
+// skips a file that holds several blocks it cannot order.
+func CACertBlocks(bundle string) []string {
+	var out []string
+	const begin = "-----BEGIN CERTIFICATE-----"
+	const end = "-----END CERTIFICATE-----"
+	rest := bundle
+	for {
+		i := strings.Index(rest, begin)
+		if i < 0 {
+			return out
+		}
+		rest = rest[i:]
+		j := strings.Index(rest, end)
+		if j < 0 {
+			return out
+		}
+		j += len(end)
+		out = append(out, rest[:j])
+		rest = rest[j:]
+	}
+}
+
+// SysctlLines renders a sysctl map as sorted "key = value" lines, so a pool
+// always produces the same file.
+func SysctlLines(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, fmt.Sprintf("%s = %s", k, m[k]))
+	}
+	return out
 }
 
 // templateHash fingerprints the embedded templates so a rendered guest can be

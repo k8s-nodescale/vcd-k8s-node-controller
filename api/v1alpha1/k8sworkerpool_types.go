@@ -255,10 +255,101 @@ type BootstrapConfig struct {
 	// the operator's network.
 	// +optional
 	SSHAllowedSources []string `json:"sshAllowedSources,omitempty"`
-	NICName           string   `json:"nicName,omitempty"`
-	DNS               []string `json:"dns,omitempty"`
-	K8sVersion        string   `json:"k8sVersion,omitempty"`
-	K8sMinorRepo      string   `json:"k8sMinorRepo,omitempty"`
+
+	// NTPServers are the chrony sources written into the guest, each as
+	// "server <host> iburst". Empty keeps the image's own configuration: the
+	// Terraform baseline sets the same list per cluster (ntp.servers), so a
+	// worker built by the controller should not silently use another source.
+	// +optional
+	NTPServers []string `json:"ntpServers,omitempty"`
+
+	// CABundleRef names a ConfigMap or Secret key holding the PEM bundle to
+	// trust in the guest. The bundle is usually environment policy shared by
+	// every pool, so it is not a literal in the CR: an installation-wide
+	// default lives in the bootstrap ConfigMap the chart renders, and this
+	// field only overrides it for one pool.
+	// +optional
+	CABundleRef *ConfigKeyRef `json:"caBundleRef,omitempty"`
+
+	// Sysctls are additional kernel parameters written to
+	// /etc/sysctl.d/99-zzz-nodescale.conf (later files win, so a pool value
+	// overrides the image's). The Kubernetes-required ones (bridge-nf-call,
+	// ip_forward) are always written and do not belong here.
+	// +optional
+	Sysctls map[string]string `json:"sysctls,omitempty"`
+
+	// KernelModules are loaded and persisted in
+	// /etc/modules-load.d/nodescale.conf before the sysctls are applied: a
+	// conntrack parameter silently does nothing without its module.
+	// +optional
+	KernelModules []string `json:"kernelModules,omitempty"`
+
+	// Containerd carries the site-specific part of the container runtime
+	// configuration. The controller generates the rest from the containerd
+	// binary installed in the guest, so a worker does not depend on the image
+	// shipping a prepared /etc/containerd/config.toml.
+	// +optional
+	Containerd *ContainerdConfig `json:"containerd,omitempty"`
+
+	NICName      string   `json:"nicName,omitempty"`
+	DNS          []string `json:"dns,omitempty"`
+	K8sVersion   string   `json:"k8sVersion,omitempty"`
+	K8sMinorRepo string   `json:"k8sMinorRepo,omitempty"`
+}
+
+// ConfigKeyRef names one key of a ConfigMap or a Secret.
+type ConfigKeyRef struct {
+	// Kind is ConfigMap (the default) or Secret. A CA bundle is public and
+	// belongs in a ConfigMap; Secret is accepted for installs that keep all
+	// their configuration in one store.
+	// +kubebuilder:validation:Enum=ConfigMap;Secret
+	// +optional
+	Kind string `json:"kind,omitempty"`
+
+	// Name is the object name.
+	Name string `json:"name"`
+
+	// Namespace defaults to the namespace of the K8sWorkerPool. A reference
+	// from the installation-wide bootstrap ConfigMap resolves in the
+	// controller's namespace instead.
+	// +optional
+	Namespace string `json:"namespace,omitempty"`
+
+	// Key is the data key holding the value.
+	Key string `json:"key"`
+}
+
+// ContainerdConfig is the environment-specific part of containerd's
+// configuration. Everything else (the full 290-line document) is generated in
+// the guest by `containerd config default`, so it matches the installed
+// version instead of a copy taken from another cluster.
+type ContainerdConfig struct {
+	// SandboxImage is the pause image kubelet asks containerd for. Empty keeps
+	// the binary default.
+	// +optional
+	SandboxImage string `json:"sandboxImage,omitempty"`
+
+	// Mirrors maps a registry host to its endpoint list, e.g.
+	// {"docker.io": ["http://mirror.example.com"]}. Empty means the worker
+	// pulls from the registries directly, which only works where they are
+	// reachable.
+	// +optional
+	Mirrors map[string][]string `json:"mirrors,omitempty"`
+
+	// InsecureSkipVerify disables TLS verification for the mirror endpoints,
+	// matching what the Ansible baseline sets for an http:// mirror. On
+	// containerd 2.x this becomes a per-registry certs.d hosts.toml, where that
+	// version keeps its TLS settings.
+	// +optional
+	InsecureSkipVerify bool `json:"insecureSkipVerify,omitempty"`
+
+	// ConfigRef, when set, is the complete config.toml for this pool: the
+	// controller writes it verbatim and generates nothing. This is the escape
+	// hatch for a site whose runtime configuration cannot be expressed as a
+	// drop-in; it couples the pool to the containerd major version, which is
+	// why it is not the default.
+	// +optional
+	ConfigRef *ConfigKeyRef `json:"configRef,omitempty"`
 }
 
 // NodeFlavor describes a worker VM shape.

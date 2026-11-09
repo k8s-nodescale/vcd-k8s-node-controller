@@ -82,6 +82,13 @@ type WorkerPoolReconciler struct {
 	PodName      string
 	PodNamespace string
 
+	// BootstrapConfigMap is the installation-wide bootstrap policy
+	// (NODESCALE_BOOTSTRAP_CONFIGMAP): one ConfigMap in PodNamespace whose
+	// bootstrap.yaml key holds the defaults for NTP, the CA bundle, sysctls and
+	// containerd. Empty means an installation without defaults, in which case
+	// every pool must carry what it needs.
+	BootstrapConfigMap string
+
 	// ownNode caches the Node resolved from PodName, including an empty
 	// result, so the guard costs one API call per process.
 	ownNode *string
@@ -778,6 +785,9 @@ func (r *WorkerPoolReconciler) validateSpec(pool *infrav1.K8sWorkerPool) string 
 	case strings.TrimSpace(pool.Spec.Join.Endpoint) == "":
 		return "spec.join.endpoint is required"
 	}
+	if msg := validateGuestPolicy(pool.Spec.Bootstrap); msg != "" {
+		return msg
+	}
 	platform := r.installationPlatform()
 	if p := strings.ToLower(strings.TrimSpace(pool.Spec.Provider)); p != "" && p != platform {
 		return fmt.Sprintf("spec.provider %q does not match the platform of this installation (%s): the platform is chosen when the controller is installed and never per pool, so a second platform needs a second installation", pool.Spec.Provider, platform)
@@ -1127,6 +1137,10 @@ func (r *WorkerPoolReconciler) createWorker(ctx context.Context, pool *infrav1.K
 	if err != nil {
 		return cloud.VM{}, "", err
 	}
+	guest, err := r.effectiveBootstrap(ctx, pool)
+	if err != nil {
+		return cloud.VM{}, "", err
+	}
 
 	var token string
 	release := func(cause error) (cloud.VM, string, error) {
@@ -1154,22 +1168,30 @@ func (r *WorkerPoolReconciler) createWorker(ctx context.Context, pool *infrav1.K
 	}
 
 	userData, initscript, err := r.Renderer.Render(cloudinit.Params{
-		NodeName:          name,
-		NodeIP:            ip,
-		CIDRPrefix:        cidrPrefix(pool.Spec.IPPlan.CIDR),
-		GatewayIP:         gatewayIP(pool.Spec.IPPlan.CIDR),
-		NICName:           pool.Spec.Bootstrap.NICName,
-		DNSServersJSON:    string(dnsJSON),
-		OSUser:            pool.Spec.Bootstrap.OSUser,
-		OSPasswordHash:    pool.Spec.Bootstrap.OSPasswordHash,
-		SSHAuthorizedKey:  pool.Spec.Bootstrap.SSHAuthorizedKey,
-		SSHAllowedSources: pool.Spec.Bootstrap.SSHAllowedSources,
-		K8sVersion:        pool.Spec.Bootstrap.K8sVersion,
-		K8sMinorRepo:      pool.Spec.Bootstrap.K8sMinorRepo,
-		JoinEndpoint:      pool.Spec.Join.Endpoint,
-		JoinCommand:       join,
-		Disks:             cloudInitDisks,
-		HostsLines:        r.hostsLines(ctx, pool),
+		NodeName:               name,
+		NodeIP:                 ip,
+		CIDRPrefix:             cidrPrefix(pool.Spec.IPPlan.CIDR),
+		GatewayIP:              gatewayIP(pool.Spec.IPPlan.CIDR),
+		NICName:                pool.Spec.Bootstrap.NICName,
+		DNSServersJSON:         string(dnsJSON),
+		OSUser:                 pool.Spec.Bootstrap.OSUser,
+		OSPasswordHash:         pool.Spec.Bootstrap.OSPasswordHash,
+		SSHAuthorizedKey:       pool.Spec.Bootstrap.SSHAuthorizedKey,
+		SSHAllowedSources:      pool.Spec.Bootstrap.SSHAllowedSources,
+		K8sVersion:             pool.Spec.Bootstrap.K8sVersion,
+		K8sMinorRepo:           pool.Spec.Bootstrap.K8sMinorRepo,
+		JoinEndpoint:           pool.Spec.Join.Endpoint,
+		JoinCommand:            join,
+		Disks:                  cloudInitDisks,
+		HostsLines:             r.hostsLines(ctx, pool),
+		NTPServers:             guest.NTPServers,
+		CACerts:                guest.CACerts,
+		Sysctls:                guest.Sysctls,
+		KernelModules:          guest.KernelModules,
+		ContainerdSandboxImage: guest.ContainerdSandboxImage,
+		ContainerdMirrors:      guest.ContainerdMirrors,
+		ContainerdInsecure:     guest.ContainerdInsecure,
+		ContainerdFullConfig:   guest.ContainerdFull,
 	})
 	if err != nil {
 		return release(fmt.Errorf("render bootstrap for %s: %w", name, err))

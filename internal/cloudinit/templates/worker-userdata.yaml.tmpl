@@ -121,6 +121,16 @@ write_files:
       PermitRootLogin no
     permissions: '0600'
 
+  {{- range .CACertFiles }}
+  # bootstrap.caBundleRef: one file per certificate, then one
+  # update-ca-certificates run in runcmd. The Terraform baseline does the same
+  # through cloud-init's ca_certs.trusted.
+  - path: {{ .Path }}
+    permissions: '0644'
+    content: |
+{{ .Content }}
+  {{- end }}
+
   # The Terraform baseline writes every node of the cluster into /etc/hosts, so
   # a worker can resolve its peers before DNS knows them. The controller knows
   # the pool's own workers (and reads the cluster's Nodes), and appends rather
@@ -139,19 +149,38 @@ write_files:
       overlay
       br_netfilter
 
+  {{- if .KernelModules }}
+  # bootstrap.kernelModules: loaded before the sysctls below, because a
+  # conntrack parameter is silently dropped when its module is not there.
+  - path: /etc/modules-load.d/nodescale.conf
+    content: |
+  {{- range .KernelModules }}
+      {{ . }}
+  {{- end }}
+  {{- end }}
+
   - path: /etc/sysctl.d/k8s.conf
     content: |
       net.bridge.bridge-nf-call-iptables  = 1
       net.bridge.bridge-nf-call-ip6tables = 1
       net.ipv4.ip_forward                 = 1
 
+  {{- if .SysctlFile }}
+  # bootstrap.sysctls, last in lexical order on purpose: sysctl applies the
+  # directory in name order, so 99-zzz-nodescale.conf overrides the image's
+  # 99-unixteam-sysctl.conf instead of being overridden by it.
+  - path: /etc/sysctl.d/99-zzz-nodescale.conf
+    content: |
+{{ .SysctlFile }}
+  {{- end }}
+
+  {{- if .FullConfigFile }}
+  # bootstrap.containerd.configRef: the site owns the whole file. Nothing is
+  # generated and imports are left alone.
   - path: /etc/containerd/config.toml
     content: |
-      version = 2
-      root = "/var/lib/containerd"
-      state = "/run/containerd"
-      [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
-        SystemdCgroup = true
+{{ .FullConfigFile }}
+  {{- end }}
 
   - path: /etc/kubernetes/join-command.sh
     permissions: '0700'
@@ -254,6 +283,11 @@ write_files:
       # 2. Kernel modules and sysctls (config files are written above).
       modprobe overlay
       modprobe br_netfilter
+{{- if .KernelModules }}
+  {{- range .KernelModules }}
+      modprobe {{ . }} || log "modprobe {{ . }} failed; continuing"
+  {{- end }}
+{{- end }}
       sysctl --system
 
       # 3. containerd.
@@ -262,8 +296,101 @@ write_files:
         DEBIAN_FRONTEND=noninteractive apt-get install -y containerd conntrack socat cloud-guest-utils
       fi
       mkdir -p /etc/containerd
+{{- if .FullConfigFile }}
+      # bootstrap.containerd.configRef owns the file; only check that the guest
+      # really received it.
+      if [[ ! -f /etc/containerd/config.toml ]]; then
+        log "containerd.configRef is set but /etc/containerd/config.toml is missing"
+        exit 1
+      fi
+{{- else }}
+      # A generic image ships no containerd config at all (the package does not
+      # own the path) and the built-in defaults use SystemdCgroup=false, which
+      # the systemd cgroup driver kubelet runs cannot work with. Generate the
+      # base from the installed binary so it matches the version, then write
+      # this installation's values into a drop-in.
+      if [[ ! -f /etc/containerd/config.toml ]]; then
+        containerd config default > /etc/containerd/config.toml
+        log "generated /etc/containerd/config.toml from containerd config default"
+      fi
+      mkdir -p /etc/containerd/conf.d
+      if ! grep -q '/etc/containerd/conf.d/\*.toml' /etc/containerd/config.toml; then
+        if grep -q '^imports' /etc/containerd/config.toml; then
+          sed -i 's|^imports = .*|imports = ["/etc/containerd/conf.d/*.toml"]|' /etc/containerd/config.toml
+        else
+          sed -i '1i imports = ["/etc/containerd/conf.d/*.toml"]' /etc/containerd/config.toml
+        fi
+        log "enabled /etc/containerd/conf.d imports"
+      fi
+      # containerd 2.x renamed the CRI plugin: the runtime section is
+      # io.containerd.cri.v1.runtime and images (sandbox, registry) are
+      # io.containerd.cri.v1.images, while 1.x keeps both under
+      # io.containerd.grpc.v1.cri (a base file declaring version = 2, which
+      # containerd 2.x still accepts through its legacy mapping). A key in the
+      # wrong layout is ignored with a warning and SystemdCgroup silently stays
+      # false, so the layout is read from the base file, not assumed from the
+      # binary version.
+      runtime_plugin=io.containerd.grpc.v1.cri
+      images_plugin=io.containerd.grpc.v1.cri
+      sandbox_section="[plugins.\"io.containerd.grpc.v1.cri\"]"
+      sandbox_key=sandbox_image
+      if grep -qE '^[[:space:]]*version[[:space:]]*=[[:space:]]*3' /etc/containerd/config.toml ||
+        grep -q 'io.containerd.cri.v1.images' /etc/containerd/config.toml; then
+        runtime_plugin=io.containerd.cri.v1.runtime
+        images_plugin=io.containerd.cri.v1.images
+        sandbox_section="[plugins.\"io.containerd.cri.v1.images\".pinned_images]"
+        sandbox_key=sandbox
+      fi
+      {
+        echo "[plugins.\"${runtime_plugin}\".containerd.runtimes.runc.options]"
+        echo '  SystemdCgroup = true'
+{{- if .ContainerdSandboxImage }}
+        echo "${sandbox_section}"
+        echo "  ${sandbox_key} = \"{{ .ContainerdSandboxImage }}\""
+{{- end }}
+{{- range .ContainerdMirrors }}
+        if [[ "$images_plugin" != "io.containerd.cri.v1.images" ]]; then
+          echo "[plugins.\"${images_plugin}\".registry.mirrors.\"{{ .Host }}\"]"
+          echo '  endpoint = [{{ range $i, $e := .Endpoints }}{{ if $i }}, {{ end }}"{{ $e }}"{{ end }}]'
+        fi
+{{- end }}
+{{- if .ContainerdInsecure }}
+        if [[ "$images_plugin" != "io.containerd.cri.v1.images" ]]; then
+{{- range .ContainerdMirrors }}
+          echo "[plugins.\"${images_plugin}\".registry.configs.\"{{ .Host }}\".tls]"
+          echo '  insecure_skip_verify = true'
+{{- end }}
+        fi
+{{- end }}
+      } > /etc/containerd/conf.d/10-nodescale.toml
+      log "wrote the containerd drop-in for ${runtime_plugin}"
+{{- if .ContainerdInsecure }}
+{{- range .ContainerdMirrors }}
+      # containerd 2.x takes per-registry TLS from a certs.d hosts.toml, not
+      # from registry.configs. The file also lists the endpoints, so the
+      # drop-in above leaves this registry out on 2.x.
+      if [[ "$images_plugin" == "io.containerd.cri.v1.images" ]]; then
+        mkdir -p "/etc/containerd/certs.d/{{ .Host }}"
+        cat > "/etc/containerd/certs.d/{{ .Host }}/hosts.toml" <<'NODESCALE_HOSTS'
+      server = "https://{{ .Host }}"
+{{- range .Endpoints }}
+      [host."{{ . }}"]
+        capabilities = ["pull", "resolve"]
+        skip_verify = true
+{{- end }}
+      NODESCALE_HOSTS
+      fi
+{{- end }}
+{{- end }}
+{{- end }}
       systemctl enable containerd
       systemctl restart containerd
+      if command -v containerd >/dev/null 2>&1; then
+        if ! containerd config dump 2>/dev/null | grep -q 'SystemdCgroup = true'; then
+          log "WARNING: SystemdCgroup is not true in the effective containerd config"
+          log "WARNING: if this containerd is 2.x, its CRI keys are io.containerd.cri.v1.*; set bootstrap.containerd.configRef"
+        fi
+      fi
 
       # 4. Kubernetes binaries, pinned when a version is configured.
       if ! command -v kubeadm >/dev/null 2>&1; then
@@ -443,6 +570,27 @@ write_files:
       WantedBy=multi-user.target
 
 runcmd:
+{{- if .CACertFiles }}
+  # Trust the pool's CA bundle before anything reaches the network: apt, the
+  # Kubernetes repository and the container registry all use it.
+  - update-ca-certificates
+{{- end }}
+{{- if .NTPServers }}
+  # bootstrap.ntpServers: the Terraform baseline sets the same sources per
+  # cluster. The block is marked so a re-run replaces it instead of appending.
+  - |
+    if [ -f /etc/chrony/chrony.conf ]; then
+      sed -i '/^# BEGIN nodescale ntp$/,/^# END nodescale ntp$/d' /etc/chrony/chrony.conf
+      {
+        echo '# BEGIN nodescale ntp'
+      {{- range .NTPServers }}
+        echo 'server {{ . }} iburst'
+      {{- end }}
+        echo '# END nodescale ntp'
+      } >> /etc/chrony/chrony.conf
+      systemctl restart chrony 2>/dev/null || true
+    fi
+{{- end }}
   - systemctl daemon-reload
   - systemctl enable vcd-grow-disks.service vcd-ensure-layout.service
   - systemctl enable k8s-node-prereqs.service k8s-node-join.service

@@ -1,0 +1,33 @@
+{{- /*
+  The installation-wide guest policy, in one object.
+
+  Why a ConfigMap rather than fields in every K8sWorkerPool: the CA bundle is a
+  multi-kilobyte PEM and the mirror list describes the site, not a pool. The
+  controller reads this object and embeds the values into the user-data of each
+  new worker; the guest never talks to the Kubernetes API.
+
+  bootstrap.yaml has the same shape as spec.bootstrap, so the same keys work in
+  both places and a pool only carries what differs.
+*/ -}}
+{{- if .Values.bootstrap.create }}
+{{- $name := default "nodescale-bootstrap" .Values.bootstrap.configMapName }}
+{{- $defaults := deepCopy (.Values.bootstrap.defaults | default dict) }}
+{{- if .Values.bootstrap.caBundle }}
+{{- $_ := set $defaults "caBundleRef" (dict "kind" "ConfigMap" "name" $name "key" "ca-bundle.pem") }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}
+  namespace: {{ include "vcd-nodescale.namespace" . }}
+  labels:
+    app.kubernetes.io/name: {{ include "vcd-nodescale.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+data:
+  bootstrap.yaml: |
+{{ $defaults | toYaml | indent 4 }}
+  {{- if .Values.bootstrap.caBundle }}
+  ca-bundle.pem: |
+{{ .Values.bootstrap.caBundle | trim | indent 4 }}
+  {{- end }}
+{{- end }}

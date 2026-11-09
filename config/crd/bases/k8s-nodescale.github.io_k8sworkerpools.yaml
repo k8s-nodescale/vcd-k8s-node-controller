@@ -61,6 +61,101 @@ spec:
                 description: Bootstrap carries OS/cloud-init inputs used to render
                   new worker user-data.
                 properties:
+                  caBundleRef:
+                    description: |-
+                      CABundleRef names a ConfigMap or Secret key holding the PEM bundle to
+                      trust in the guest. The bundle is usually environment policy shared by
+                      every pool, so it is not a literal in the CR: an installation-wide
+                      default lives in the bootstrap ConfigMap the chart renders, and this
+                      field only overrides it for one pool.
+                    properties:
+                      key:
+                        description: Key is the data key holding the value.
+                        type: string
+                      kind:
+                        description: |-
+                          Kind is ConfigMap (the default) or Secret. A CA bundle is public and
+                          belongs in a ConfigMap; Secret is accepted for installs that keep all
+                          their configuration in one store.
+                        enum:
+                        - ConfigMap
+                        - Secret
+                        type: string
+                      name:
+                        description: Name is the object name.
+                        type: string
+                      namespace:
+                        description: |-
+                          Namespace defaults to the namespace of the K8sWorkerPool. A reference
+                          from the installation-wide bootstrap ConfigMap resolves in the
+                          controller's namespace instead.
+                        type: string
+                    required:
+                    - key
+                    - name
+                    type: object
+                  containerd:
+                    description: |-
+                      Containerd carries the site-specific part of the container runtime
+                      configuration. The controller generates the rest from the containerd
+                      binary installed in the guest, so a worker does not depend on the image
+                      shipping a prepared /etc/containerd/config.toml.
+                    properties:
+                      configRef:
+                        description: |-
+                          ConfigRef, when set, is the complete config.toml for this pool: the
+                          controller writes it verbatim and generates nothing. This is the escape
+                          hatch for a site whose runtime configuration cannot be expressed as a
+                          drop-in; it couples the pool to the containerd major version, which is
+                          why it is not the default.
+                        properties:
+                          key:
+                            description: Key is the data key holding the value.
+                            type: string
+                          kind:
+                            description: |-
+                              Kind is ConfigMap (the default) or Secret. A CA bundle is public and
+                              belongs in a ConfigMap; Secret is accepted for installs that keep all
+                              their configuration in one store.
+                            enum:
+                            - ConfigMap
+                            - Secret
+                            type: string
+                          name:
+                            description: Name is the object name.
+                            type: string
+                          namespace:
+                            description: |-
+                              Namespace defaults to the namespace of the K8sWorkerPool. A reference
+                              from the installation-wide bootstrap ConfigMap resolves in the
+                              controller's namespace instead.
+                            type: string
+                        required:
+                        - key
+                        - name
+                        type: object
+                      insecureSkipVerify:
+                        description: |-
+                          InsecureSkipVerify disables TLS verification for the mirror endpoints,
+                          matching what the Ansible baseline sets for an http:// mirror.
+                        type: boolean
+                      mirrors:
+                        additionalProperties:
+                          items:
+                            type: string
+                          type: array
+                        description: |-
+                          Mirrors maps a registry host to its endpoint list, e.g.
+                          {"docker.io": ["http://mirror.example.com"]}. Empty means the worker
+                          pulls from the registries directly, which only works where they are
+                          reachable.
+                        type: object
+                      sandboxImage:
+                        description: |-
+                          SandboxImage is the pause image kubelet asks containerd for. Empty keeps
+                          the binary default.
+                        type: string
+                    type: object
                   dns:
                     items:
                       type: string
@@ -69,8 +164,25 @@ spec:
                     type: string
                   k8sVersion:
                     type: string
+                  kernelModules:
+                    description: |-
+                      KernelModules are loaded and persisted in
+                      /etc/modules-load.d/nodescale.conf before the sysctls are applied: a
+                      conntrack parameter silently does nothing without its module.
+                    items:
+                      type: string
+                    type: array
                   nicName:
                     type: string
+                  ntpServers:
+                    description: |-
+                      NTPServers are the chrony sources written into the guest, each as
+                      "server <host> iburst". Empty keeps the image's own configuration: the
+                      Terraform baseline sets the same list per cluster (ntp.servers), so a
+                      worker built by the controller should not silently use another source.
+                    items:
+                      type: string
+                    type: array
                   osPasswordHash:
                     type: string
                   osUser:
@@ -87,6 +199,15 @@ spec:
                     type: array
                   sshAuthorizedKey:
                     type: string
+                  sysctls:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      Sysctls are additional kernel parameters written to
+                      /etc/sysctl.d/99-zzz-nodescale.conf (later files win, so a pool value
+                      overrides the image's). The Kubernetes-required ones (bridge-nf-call,
+                      ip_forward) are always written and do not belong here.
+                    type: object
                 type: object
               capacity:
                 description: |-

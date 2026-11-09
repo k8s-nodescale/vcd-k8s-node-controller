@@ -84,7 +84,30 @@ for f in "$tmp/vcd.yaml" "$tmp/vsphere.yaml"; do
 	fi
 done
 
-# 6. the packaged CRD is the generated one: a chart that ships a stale CRD
+# 6. the installation bootstrap ConfigMap: rendered by default, referenced by
+# the Deployment, and carrying a CA bundle only when one was supplied.
+grep -q 'kind: ConfigMap' "$tmp/vcd.yaml" ||
+	fail "the vcd release renders no bootstrap ConfigMap"
+grep -q 'name: nodescale-bootstrap' "$tmp/vcd.yaml" ||
+	fail "the bootstrap ConfigMap is not named nodescale-bootstrap"
+grep -q 'name: NODESCALE_BOOTSTRAP_CONFIGMAP' "$tmp/vcd.yaml" ||
+	fail "the Deployment does not tell the controller which ConfigMap to read"
+grep -q 'ca-bundle.pem' "$tmp/vcd.yaml" &&
+	fail "an empty bootstrap.caBundle still rendered a ca-bundle.pem key"
+render --set platform=vsphere \
+	--set vsphere.folderRoot="/HUB Infrastructure/dev/k8s-test-lab" \
+	--set-file bootstrap.caBundle=/dev/stdin <<<'-----BEGIN CERTIFICATE-----' >"$tmp/ca.yaml"
+grep -q 'ca-bundle.pem' "$tmp/ca.yaml" ||
+	fail "bootstrap.caBundle was not stored under ca-bundle.pem"
+grep -q 'name: nodescale-bootstrap' "$tmp/ca.yaml" ||
+	fail "the CA bundle did not point caBundleRef at the bootstrap ConfigMap"
+render --set platform=vsphere \
+	--set vsphere.folderRoot="/HUB Infrastructure/dev/k8s-test-lab" \
+	--set bootstrap.create=false >"$tmp/nocm.yaml"
+grep -q 'kind: ConfigMap' "$tmp/nocm.yaml" &&
+	fail "bootstrap.create=false still rendered the ConfigMap"
+
+# 7. the packaged CRD is the generated one: a chart that ships a stale CRD
 # prunes fields the controller writes.
 if ! diff -q "config/crd/bases/k8s-nodescale.github.io_k8sworkerpools.yaml" \
 	"$chart/crds/k8s-nodescale.github.io_k8sworkerpools.yaml" >/dev/null; then
