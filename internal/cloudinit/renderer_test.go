@@ -20,6 +20,8 @@ func testParams() Params {
 		GatewayIP:      "192.0.2.1",
 		NICName:        "ens192",
 		DNSServersJSON: `["192.0.2.53"]`,
+		DNSServersLine: "192.0.2.53",
+		AptMirror:      "https://mirror.example.com/ubuntu-noble",
 		OSUser:         "ubuntu",
 		K8sVersion:     "1.35.9-1.1",
 		K8sMinorRepo:   "v1.35",
@@ -471,6 +473,79 @@ func TestUserDataIsValidCloudConfig(t *testing.T) {
 
 // TestGolden pins the rendered output. Run with UPDATE_GOLDEN=1 after an
 // intentional template change; the diff is the review artefact.
+// The mirror has to be in place before the first apt call: on a network with
+// no internet access the very first install is the one that fails.
+func TestAptMirrorPrecedesEveryAptCall(t *testing.T) {
+	ud, _ := mustRender(t, testParams())
+	source := strings.Index(ud, "/etc/apt/sources.list.d/nodescale.sources")
+	if source < 0 {
+		t.Fatal("the mirror is not written to a sources file")
+	}
+	first := strings.Index(ud, "apt-get")
+	if first < 0 {
+		t.Fatal("no apt call in the render")
+	}
+	if source > first {
+		t.Errorf("the sources file is written after the first apt call (source=%d, apt=%d)", source, first)
+	}
+	if !strings.Contains(ud, "https://mirror.example.com/ubuntu-noble") {
+		t.Error("the configured mirror is missing from the render")
+	}
+	// The image's own file must be taken out of the way, or apt reads two
+	// URIs and one of them is unreachable.
+	if !strings.Contains(ud, "disabled-by-nodescale") {
+		t.Error("the image's sources are left active next to the mirror")
+	}
+	if !strings.Contains(ud, "$codename-updates") {
+		t.Error("the suites are not derived from the release when none are given")
+	}
+}
+
+// Without a mirror the guest keeps the image's sources: a pool that does not
+// name a mirror must not have its apt configuration rewritten.
+func TestNoAptMirrorKeepsTheImageSources(t *testing.T) {
+	p := testParams()
+	p.AptMirror = ""
+	ud, _ := mustRender(t, p)
+	if strings.Contains(ud, "nodescale.sources") {
+		t.Error("a sources file was written without bootstrap.apt.mirror")
+	}
+	if !strings.Contains(ud, "Acquire {") {
+		t.Error("the apt retry policy disappeared with the mirror")
+	}
+}
+
+// The Terraform baseline writes the resolvers to netplan and to a resolved
+// drop-in; the drop-in is what stops a second resolver source winning.
+func TestResolvedDropInFollowsDNS(t *testing.T) {
+	ud, _ := mustRender(t, testParams())
+	if !strings.Contains(ud, "/etc/systemd/resolved.conf.d/nodescale.conf") {
+		t.Fatal("no resolved drop-in")
+	}
+	if !strings.Contains(ud, "DNS=192.0.2.53") {
+		t.Error("the drop-in does not carry the resolvers")
+	}
+
+	p := testParams()
+	p.DNSServersLine = ""
+	ud, _ = mustRender(t, p)
+	if strings.Contains(ud, "resolved.conf.d/nodescale.conf") {
+		t.Error("a resolved drop-in was written without DNS servers")
+	}
+}
+
+// The runc apparmor profile is unloaded defensively like the baseline does, but
+// only where apparmor exists: a generic image without it is not an error.
+func TestRuncAppArmorIsDisabledWhenPresent(t *testing.T) {
+	ud, _ := mustRender(t, testParams())
+	if !strings.Contains(ud, "apparmor.d/disable/runc") {
+		t.Error("the runc apparmor profile is not disabled")
+	}
+	if !strings.Contains(ud, "command -v apparmor_parser") {
+		t.Error("the apparmor step is not guarded by the binary being present")
+	}
+}
+
 func TestGolden(t *testing.T) {
 	ud, is := mustRender(t, testParams())
 	golden := filepath.Join("testdata", "golden")

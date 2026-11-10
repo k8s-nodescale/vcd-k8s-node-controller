@@ -24,7 +24,7 @@ import (
 
 // RenderVersion is bumped whenever the rendered output changes in a way that
 // matters to a running guest. It is stamped into every generated file.
-const RenderVersion = "0.5.0"
+const RenderVersion = "0.6.0"
 
 //go:embed templates/*.tmpl
 var templatesFS embed.FS
@@ -48,12 +48,15 @@ type DiskParam struct {
 
 // Params is the full input for rendering a worker bootstrap.
 type Params struct {
-	NodeName          string
-	NodeIP            string
-	CIDRPrefix        string // e.g. "24"
-	GatewayIP         string
-	NICName           string
-	DNSServersJSON    string // JSON array, e.g. ["8.8.8.8","1.1.1.1"]
+	NodeName       string
+	NodeIP         string
+	CIDRPrefix     string // e.g. "24"
+	GatewayIP      string
+	NICName        string
+	DNSServersJSON string // JSON array, e.g. ["8.8.8.8","1.1.1.1"]
+	// DNSServersLine is the same list space-separated, for the resolved
+	// drop-in (systemd reads DNS= that way, not JSON).
+	DNSServersLine    string
 	OSUser            string
 	OSPasswordHash    string
 	SSHAuthorizedKey  string
@@ -89,6 +92,12 @@ type Params struct {
 	// ContainerdFullConfig, when set, is written to /etc/containerd/config.toml
 	// verbatim and no drop-in is generated.
 	ContainerdFullConfig string
+	// AptMirror replaces the image's package sources. Empty keeps them.
+	AptMirror string
+	// AptSuites and AptComponents override the derived suites and the default
+	// component set; empty keeps them.
+	AptSuites     []string
+	AptComponents []string
 }
 
 // MirrorParam is one registry host and the endpoints containerd may pull it

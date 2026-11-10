@@ -61,6 +61,36 @@ spec:
                 description: Bootstrap carries OS/cloud-init inputs used to render
                   new worker user-data.
                 properties:
+                  apt:
+                    description: |-
+                      Apt replaces the image's package sources with the environment's mirror.
+                      The Terraform baseline does the same (apt.sources_list): an image whose
+                      sources point at the public archive cannot install anything on a network
+                      without internet access, and the first apt call fails the boot.
+                    properties:
+                      components:
+                        description: |-
+                          Components overrides the components. Empty uses
+                          main universe restricted multiverse.
+                        items:
+                          type: string
+                        type: array
+                      mirror:
+                        description: |-
+                          Mirror is the URI written as the only active apt source, e.g.
+                          https://nexus.example.com/repository/ubuntu-noble. It is used as given:
+                          the path that carries the release name is not guessed. Empty keeps the
+                          image's sources.
+                        type: string
+                      suites:
+                        description: |-
+                          Suites overrides the suites. Empty derives them from the guest's release
+                          codename: <code>, <code>-updates, <code>-backports, <code>-security, the
+                          set the Terraform baseline enables.
+                        items:
+                          type: string
+                        type: array
+                    type: object
                   caBundleRef:
                     description: |-
                       CABundleRef names a ConfigMap or Secret key holding the PEM bundle to

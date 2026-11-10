@@ -468,12 +468,13 @@ helm -n vcd-nodescale-system uninstall vcd-nodescale
 Then write the pools as described in the next section (a release installed by an
 older chart needs its CRD applied first, as above).
 
-### Guest policy: containerd and the CA bundle
+### Guest policy: containerd, the CA bundle, apt and the base OS
 
 A worker is created from a **plain image**: nothing about the site is baked into
 the template, and the controller assumes no prepared `/etc/containerd/config.toml`
-either. The two files that used to be copied into an image - the runtime
-configuration and the trust bundle - are produced at boot from two inputs:
+either. The files that used to be copied into an image - the runtime
+configuration, the trust bundle, the package source and the resolver - are
+produced at boot from two inputs:
 
 - the **installation** policy, one ConfigMap the chart renders, and
 - the **pool** `spec.bootstrap`, which overrides it field by field.
@@ -481,7 +482,7 @@ configuration and the trust bundle - are produced at boot from two inputs:
 ```
 nodescale-system/nodescale-bootstrap        (chart: values.bootstrap)
   bootstrap.yaml    same shape as spec.bootstrap: ntpServers, sysctls,
-                    kernelModules, containerd, caBundleRef
+                    kernelModules, containerd, apt, caBundleRef
   ca-bundle.pem     the PEM bundle, when --set-file bootstrap.caBundle was used
 ```
 
@@ -546,13 +547,57 @@ with its own `caBundleRef` (for example a cluster that trusts one extra root),
 or the installation sets `bootstrap.create=false` and something else owns the
 ConfigMap.
 
-**The two install scenarios** differ only in who fills that ConfigMap:
+**apt: the mirror comes before the first apt call.** An image built for the
+public archive cannot install anything on a network without internet access,
+and the first `apt-get` in the prerequisites script is the one that fails - on a
+guest that has no way to report it. `bootstrap.apt.mirror` replaces the image's
+sources with one deb822 file, exactly as `apt.sources_list` does in the
+Terraform baseline:
+
+```yaml
+spec:
+  bootstrap:
+    apt:
+      mirror: https://nexus.example.com/repository/ubuntu-noble   # required
+      suites: [noble, noble-updates, noble-backports, noble-security]  # optional
+      components: [main, universe, restricted, multiverse]             # optional
+```
+
+The suites default to the guest's own `VERSION_CODENAME` plus updates,
+backports and security; the components default to
+`main universe restricted multiverse`. The file is written as
+`/etc/apt/sources.list.d/nodescale.sources`, every other `*.sources` and
+`*.list` is renamed to `*.disabled-by-nodescale` (the Kubernetes repository
+added later is exempt), and `deb` lines in `/etc/apt/sources.list` are commented
+out - two active sources mean apt fetches every index twice and, worse, keeps a
+URI this network cannot reach. The mirror is used as given: the path that
+carries the release name is not guessed, because a Nexus repository path is a
+site convention, not a distribution one. Without `mirror` the image's sources
+are left untouched.
+
+**Resolver: one global DNS set.** netplan is enough until a second source (a
+DHCP lease on another NIC, a package that ships its own drop-in) takes the
+default route. The controller writes the pool's `bootstrap.dns` into a second
+place as well, the way the Ansible baseline does:
+`/etc/systemd/resolved.conf.d/nodescale.conf` with `DNS=<servers>` and
+`Domains=~.`, then restarts `systemd-resolved`. `Domains=~.` is what pins the
+global resolver set instead of letting a per-link domain win.
+
+**The `runc` apparmor profile is unloaded, defensively.** On kernels where
+Ubuntu's `runc` profile denies a mount, a pod fails at start with no useful
+message. Like the Ansible baseline, the prerequisites script links the profile
+into `/etc/apparmor.d/disable` and runs `apparmor_parser -R`; both are guarded
+by `command -v apparmor_parser` and by the profile existing, so an image that
+ships no apparmor is not an error.
+
+The two install scenarios differ only in who fills that ConfigMap:
 
 - **Terraform + Ansible** (a cluster being promoted, the baseline these fields
   mirror). The same values already exist in that path: `ntp_srv1`/`ntp_srv2`,
   `containerd_mirror`, the CA files `templates/userdata_w.yaml` writes into
-  `ca_certs.trusted`, and the sysctls of `add_custom_kernel_params`. They have
-  to reach the ConfigMap once, at install time:
+  `ca_certs.trusted`, the sysctls of `add_custom_kernel_params` and the
+  `ubuntu_mirror_baseurl` of `apt.sources_list`. They have to reach the
+  ConfigMap once, at install time:
 
   ```
   kubectl -n nodescale-system create configmap nodescale-bootstrap \
@@ -561,7 +606,7 @@ ConfigMap.
   ```
 
   `bootstrap.yaml` has the shape shown under `bootstrap.defaults` in the chart
-  values (`ntpServers`, `sysctls`, `kernelModules`, `containerd`, and the
+  values (`ntpServers`, `sysctls`, `kernelModules`, `containerd`, `apt`, and the
   `caBundleRef` the chart adds when it renders a bundle). Set
   `bootstrap.create=false` in the release values when Ansible owns the object, so
   the chart does not overwrite it on upgrade. Wiring the
@@ -573,8 +618,9 @@ ConfigMap.
   mirror and runtime settings as the Terraform/Ansible ones next to it.
 - **Helm + `kubectl apply -f pool.yaml`** (an existing cluster). There is no
   playbook, so the ConfigMap is chart values: `bootstrap.defaults` for NTP,
-  sysctls, modules and containerd; `--set-file bootstrap.caBundle` for trust. A
-  single pool can still carry its own values in `spec.bootstrap`.
+  sysctls, modules, the apt mirror and containerd; `--set-file
+  bootstrap.caBundle` for trust. A single pool can still carry its own values in
+  `spec.bootstrap`.
 
 Both boxes must produce the same thing, and the fields are the same names, so
 the two scenarios can be compared line by line:
@@ -587,6 +633,9 @@ the two scenarios can be compared line by line:
 | containerd mirrors | `containerd_mirror` (the private `config.toml` template) | `bootstrap.defaults.containerd.mirrors` |
 | pause image | `sandbox_image` in that template | `bootstrap.defaults.containerd.sandboxImage` |
 | cgroup driver | `SystemdCgroup = true` in that template | generated drop-in, always |
+| apt mirror | `ubuntu_mirror_baseurl` (`apt.sources_list`) | `bootstrap.defaults.apt.mirror` (suites/components optional) |
+| resolvers | Ansible `resolved.conf.d` drop-in | `bootstrap.dns`, always written to netplan and the drop-in |
+| `runc` apparmor profile | Ansible `disable ubuntu's default apparmor runc profile` | unloaded in the prerequisites script, always |
 
 Values apply to workers created after the change: an existing worker keeps the
 bootstrap it was born with, exactly like a Terraform node keeps the user-data it

@@ -24,6 +24,7 @@ type installationBootstrap struct {
 	Sysctls       map[string]string         `json:"sysctls,omitempty"`
 	KernelModules []string                  `json:"kernelModules,omitempty"`
 	Containerd    *infrav1.ContainerdConfig `json:"containerd,omitempty"`
+	Apt           *infrav1.AptConfig        `json:"apt,omitempty"`
 }
 
 // guestBootstrap is the resolved guest policy: the pool's spec with the
@@ -38,6 +39,9 @@ type guestBootstrap struct {
 	ContainerdMirrors      []cloudinit.MirrorParam
 	ContainerdInsecure     bool
 	ContainerdFull         string
+	AptMirror              string
+	AptSuites              []string
+	AptComponents          []string
 }
 
 // effectiveBootstrap merges spec.bootstrap with the installation-wide defaults
@@ -55,6 +59,7 @@ func (r *WorkerPoolReconciler) effectiveBootstrap(ctx context.Context, pool *inf
 	sysctls := copyStringMap(spec.Sysctls)
 	modules := append([]string(nil), spec.KernelModules...)
 	containerd := copyContainerd(spec.Containerd)
+	apt := copyApt(spec.Apt)
 	caRef := copyRef(spec.CABundleRef)
 	caNamespace := pool.Namespace
 
@@ -77,6 +82,7 @@ func (r *WorkerPoolReconciler) effectiveBootstrap(ctx context.Context, pool *inf
 			caNamespace = r.PodNamespace
 		}
 		containerd = mergeContainerd(def.Containerd, containerd)
+		apt = mergeApt(def.Apt, apt)
 	}
 
 	var certs []string
@@ -97,6 +103,9 @@ func (r *WorkerPoolReconciler) effectiveBootstrap(ctx context.Context, pool *inf
 		CACerts:       certs,
 		Sysctls:       cloudinit.SysctlLines(sysctls),
 		KernelModules: modules,
+		AptMirror:     aptMirror(apt),
+		AptSuites:     aptSuites(apt),
+		AptComponents: aptComponents(apt),
 	}
 	if containerd != nil && containerd.ConfigRef != nil {
 		full, err := r.readRef(ctx, containerd.ConfigRef, pool.Namespace)
@@ -237,6 +246,61 @@ func copyContainerd(in *infrav1.ContainerdConfig) *infrav1.ContainerdConfig {
 	return &out
 }
 
+// copyApt deep-copies the package-source policy so a merge cannot write into
+// the pool's object.
+func copyApt(in *infrav1.AptConfig) *infrav1.AptConfig {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	out.Suites = append([]string(nil), in.Suites...)
+	out.Components = append([]string(nil), in.Components...)
+	return &out
+}
+
+// mergeApt fills what the pool left empty, per field, like the other policy
+// values: a pool that names its own mirror keeps its own suites too.
+func mergeApt(base, override *infrav1.AptConfig) *infrav1.AptConfig {
+	if base == nil {
+		return override
+	}
+	if override == nil {
+		return copyApt(base)
+	}
+	out := copyApt(base)
+	if strings.TrimSpace(override.Mirror) != "" {
+		out.Mirror = override.Mirror
+	}
+	if len(override.Suites) > 0 {
+		out.Suites = append([]string(nil), override.Suites...)
+	}
+	if len(override.Components) > 0 {
+		out.Components = append([]string(nil), override.Components...)
+	}
+	return out
+}
+
+func aptMirror(in *infrav1.AptConfig) string {
+	if in == nil {
+		return ""
+	}
+	return strings.TrimSpace(in.Mirror)
+}
+
+func aptSuites(in *infrav1.AptConfig) []string {
+	if in == nil {
+		return nil
+	}
+	return append([]string(nil), in.Suites...)
+}
+
+func aptComponents(in *infrav1.AptConfig) []string {
+	if in == nil {
+		return nil
+	}
+	return append([]string(nil), in.Components...)
+}
+
 func copyRef(in *infrav1.ConfigKeyRef) *infrav1.ConfigKeyRef {
 	if in == nil {
 		return nil
@@ -278,6 +342,27 @@ func validateGuestPolicy(b infrav1.BootstrapConfig) string {
 	for _, module := range b.KernelModules {
 		if strings.TrimSpace(module) == "" || strings.ContainsAny(module, " \t\n\r") {
 			return fmt.Sprintf("spec.bootstrap.kernelModules: %q is not a module name", module)
+		}
+	}
+	if a := b.Apt; a != nil {
+		mirror := strings.TrimSpace(a.Mirror)
+		if mirror != "" {
+			if strings.ContainsAny(mirror, " \t\n\r\"") {
+				return fmt.Sprintf("spec.bootstrap.apt.mirror: %q is not a URI", mirror)
+			}
+			if !strings.HasPrefix(mirror, "http://") && !strings.HasPrefix(mirror, "https://") {
+				return fmt.Sprintf("spec.bootstrap.apt.mirror: %q must start with http:// or https://", mirror)
+			}
+		}
+		for _, suite := range a.Suites {
+			if strings.TrimSpace(suite) == "" || strings.ContainsAny(suite, " \t\n\r") {
+				return fmt.Sprintf("spec.bootstrap.apt.suites: %q is not a suite name", suite)
+			}
+		}
+		for _, component := range a.Components {
+			if strings.TrimSpace(component) == "" || strings.ContainsAny(component, " \t\n\r") {
+				return fmt.Sprintf("spec.bootstrap.apt.components: %q is not a component name", component)
+			}
 		}
 	}
 	if c := b.Containerd; c != nil {

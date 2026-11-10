@@ -100,6 +100,18 @@ write_files:
                 via: {{ .GatewayIP }}
             nameservers:
               addresses: {{ .DNSServersJSON }}
+{{- if .DNSServersLine }}
+  # The Terraform baseline writes the resolvers twice: netplan for the
+  # interface and a resolved drop-in. Netplan alone is enough until a second
+  # source (a DHCP lease on another NIC, a package that ships its own drop-in)
+  # takes the default route; Domains=~. pins the global resolver set.
+  - path: /etc/systemd/resolved.conf.d/nodescale.conf
+    permissions: '0644'
+    content: |
+      [Resolve]
+      DNS={{ .DNSServersLine }}
+      Domains=~.
+{{- end }}
 
   # Parity with the Terraform baseline: a password login that works when a
   # worker has to be rescued by hand. 0600 because sshd refuses a group- or
@@ -249,6 +261,47 @@ write_files:
         exit 0
       fi
 
+{{- if .AptMirror }}
+      # 0a. Package sources first: every later step installs something, and on
+      #     a network without internet access an image that still points at the
+      #     public archive fails at the first apt call. The Terraform baseline
+      #     replaces the sources list with the environment's mirror for the
+      #     same reason. The file is deb822, which both 22.04 and 24.04 read.
+      codename="$(. /etc/os-release && echo "${VERSION_CODENAME:-}")"
+      if [[ -z "$codename" ]]; then
+        log "cannot derive the release codename; bootstrap.apt.mirror cannot be applied"
+        exit 1
+      fi
+      mirror="{{ .AptMirror }}"
+      suites="{{ range $i, $s := .AptSuites }}{{ if $i }} {{ end }}{{ $s }}{{ end }}"
+      if [[ -z "$suites" ]]; then
+        suites="$codename $codename-updates $codename-backports $codename-security"
+      fi
+      components="{{ range $i, $c := .AptComponents }}{{ if $i }} {{ end }}{{ $c }}{{ end }}"
+      if [[ -z "$components" ]]; then
+        components="main universe restricted multiverse"
+      fi
+      cat >/etc/apt/sources.list.d/nodescale.sources <<EOF
+      Types: deb
+      URIs: $mirror
+      Suites: $suites
+      Components: $components
+      EOF
+      # One active source only: a second copy makes apt fetch every index
+      # twice and, worse, keeps a URI that this network cannot reach. The
+      # Kubernetes repository added later is left alone.
+      for f in /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
+        [[ -e "$f" ]] || continue
+        case "$f" in
+          */nodescale.sources|*/kubernetes.list|*.disabled-by-nodescale) continue ;;
+        esac
+        mv -f "$f" "$f.disabled-by-nodescale"
+      done
+      if [[ -f /etc/apt/sources.list ]]; then
+        sed -ri 's@^([[:space:]]*deb[[:space:]])@# disabled by nodescale: \1@' /etc/apt/sources.list
+      fi
+      log "apt sources replaced with ${mirror} (${codename})"
+{{- end }}
       # 0b. Parity with the Terraform baseline: unattended-upgrades must not
       #     compete for the dpkg lock while the node is being prepared, and
       #     Pro/ESM hooks must not inject repositories the cluster image never
@@ -289,6 +342,17 @@ write_files:
   {{- end }}
 {{- end }}
       sysctl --system
+
+      # 2b. The Terraform baseline unloads Ubuntu's apparmor profile for runc:
+      #     on kernels where it denies a mount, a pod fails at start with no
+      #     useful message. Guarded, because a generic image may ship no
+      #     apparmor at all and that is not an error.
+      if command -v apparmor_parser >/dev/null 2>&1 && [[ -f /etc/apparmor.d/runc ]]; then
+        mkdir -p /etc/apparmor.d/disable
+        ln -sf /etc/apparmor.d/runc /etc/apparmor.d/disable/runc
+        apparmor_parser -R /etc/apparmor.d/runc 2>/dev/null || true
+        log "runc apparmor profile disabled"
+      fi
 
       # 3. containerd.
       if ! command -v containerd >/dev/null 2>&1; then
@@ -574,6 +638,9 @@ runcmd:
   # Trust the pool's CA bundle before anything reaches the network: apt, the
   # Kubernetes repository and the container registry all use it.
   - update-ca-certificates
+{{- if .DNSServersLine }}
+  - systemctl restart systemd-resolved || true
+{{- end }}
 {{- end }}
 {{- if .NTPServers }}
   # bootstrap.ntpServers: the Terraform baseline sets the same sources per

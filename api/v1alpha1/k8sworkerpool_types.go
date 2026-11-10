@@ -291,6 +291,13 @@ type BootstrapConfig struct {
 	// +optional
 	Containerd *ContainerdConfig `json:"containerd,omitempty"`
 
+	// Apt replaces the image's package sources with the environment's mirror.
+	// The Terraform baseline does the same (apt.sources_list): an image whose
+	// sources point at the public archive cannot install anything on a network
+	// without internet access, and the first apt call fails the boot.
+	// +optional
+	Apt *AptConfig `json:"apt,omitempty"`
+
 	NICName      string   `json:"nicName,omitempty"`
 	DNS          []string `json:"dns,omitempty"`
 	K8sVersion   string   `json:"k8sVersion,omitempty"`
@@ -317,6 +324,29 @@ type ConfigKeyRef struct {
 
 	// Key is the data key holding the value.
 	Key string `json:"key"`
+}
+
+// AptConfig is the package-source policy for a worker's guest. Only the mirror
+// is required: the suites and components follow the release and the baseline
+// unless a pool names its own.
+type AptConfig struct {
+	// Mirror is the URI written as the only active apt source, e.g.
+	// https://nexus.example.com/repository/ubuntu-noble. It is used as given:
+	// the path that carries the release name is not guessed. Empty keeps the
+	// image's sources.
+	// +optional
+	Mirror string `json:"mirror,omitempty"`
+
+	// Suites overrides the suites. Empty derives them from the guest's release
+	// codename: <code>, <code>-updates, <code>-backports, <code>-security, the
+	// set the Terraform baseline enables.
+	// +optional
+	Suites []string `json:"suites,omitempty"`
+
+	// Components overrides the components. Empty uses
+	// main universe restricted multiverse.
+	// +optional
+	Components []string `json:"components,omitempty"`
 }
 
 // ContainerdConfig is the environment-specific part of containerd's

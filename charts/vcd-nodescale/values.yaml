@@ -33,12 +33,21 @@ namespace:
 #   sysctls: {net.core.rmem_max: "67108864"}
 #   kernelModules: [nf_conntrack]
 #   caBundleRef: {name: ..., key: ...}   (set automatically when caBundle is)
+#   apt:
+#     # The mirror replaces the image's package sources. Required on a network
+#     # without internet access: the first apt call fails without it.
+#     mirror: https://nexus.example.com/repository/ubuntu-noble
+#     suites: [noble, noble-updates, noble-backports, noble-security]
+#     components: [main, universe, restricted, multiverse]
 #   containerd:
 #     sandboxImage: registry.example.com/pause:3.9
 #     insecureSkipVerify: false
 #     mirrors:
 #       docker.io: ["http://mirror.example.com"]
 #       registry.k8s.io: ["http://mirror.example.com"]
+#
+# apt.suites and apt.components are optional: empty derives the suites from the
+# guest's release codename and uses main universe restricted multiverse.
 #
 # A pool keeps its own value when it names one: these are defaults, not
 # overrides. The values apply to workers created after the chart is upgraded;

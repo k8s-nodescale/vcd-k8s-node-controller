@@ -226,6 +226,67 @@ containerd:
 
 // TestEffectiveBootstrapResolvesCARefs covers both scopes: a pool reference
 // resolves in the pool's namespace, an installation default in the controller's.
+// The apt policy merges field by field like the rest: a pool that names only a
+// mirror still gets the installation's suites and components.
+func TestEffectiveBootstrapMergesAptPerField(t *testing.T) {
+	r := bootstrapReconciler(t, installationConfigMap(t, `
+apt:
+  mirror: https://mirror.example.com/ubuntu-noble
+  components: [main, universe]
+`))
+	pool := bootstrapPool(infrav1.BootstrapConfig{
+		Apt: &infrav1.AptConfig{Mirror: "https://pool.example.com/ubuntu-noble"},
+	})
+
+	got, err := r.effectiveBootstrap(context.Background(), pool)
+	if err != nil {
+		t.Fatalf("effectiveBootstrap: %v", err)
+	}
+	if got.AptMirror != "https://pool.example.com/ubuntu-noble" {
+		t.Errorf("the pool's mirror did not win: %q", got.AptMirror)
+	}
+	if len(got.AptComponents) != 2 || got.AptComponents[0] != "main" {
+		t.Errorf("the installation components were dropped: %#v", got.AptComponents)
+	}
+
+	// A pool that names a suite keeps its own and still inherits the mirror.
+	pool2 := bootstrapPool(infrav1.BootstrapConfig{
+		Apt: &infrav1.AptConfig{Mirror: "https://pool.example.com/x", Suites: []string{"custom"}},
+	})
+	got2, err := r.effectiveBootstrap(context.Background(), pool2)
+	if err != nil {
+		t.Fatalf("effectiveBootstrap: %v", err)
+	}
+	if len(got2.AptSuites) != 1 || got2.AptSuites[0] != "custom" {
+		t.Errorf("the pool's suites were dropped: %#v", got2.AptSuites)
+	}
+}
+
+// A mirror that is not a URI would be written into the sources file verbatim,
+// and apt would refuse to read it on a guest nobody can log in to.
+func TestValidateGuestPolicyApt(t *testing.T) {
+	cases := []struct {
+		name string
+		apt  *infrav1.AptConfig
+		want bool
+	}{
+		{"empty", &infrav1.AptConfig{}, false},
+		{"https", &infrav1.AptConfig{Mirror: "https://mirror.example.com/ubuntu"}, false},
+		{"http", &infrav1.AptConfig{Mirror: "http://10.0.0.5/ubuntu"}, false},
+		{"no scheme", &infrav1.AptConfig{Mirror: "mirror.example.com/ubuntu"}, true},
+		{"ftp", &infrav1.AptConfig{Mirror: "ftp://mirror.example.com/ubuntu"}, true},
+		{"space", &infrav1.AptConfig{Mirror: "https://mirror.example.com/ubuntu noble"}, true},
+		{"bad suite", &infrav1.AptConfig{Mirror: "https://m.example.com", Suites: []string{"a b"}}, true},
+		{"bad component", &infrav1.AptConfig{Mirror: "https://m.example.com", Components: []string{""}}, true},
+	}
+	for _, tc := range cases {
+		msg := validateGuestPolicy(infrav1.BootstrapConfig{Apt: tc.apt})
+		if (msg != "") != tc.want {
+			t.Errorf("%s: got %q, want error=%v", tc.name, msg, tc.want)
+		}
+	}
+}
+
 func TestEffectiveBootstrapResolvesCARefs(t *testing.T) {
 	poolCM := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{Name: "cluster-roots", Namespace: "cluster-a"},

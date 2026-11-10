@@ -1175,6 +1175,7 @@ func (r *WorkerPoolReconciler) createWorker(ctx context.Context, pool *infrav1.K
 		GatewayIP:              gatewayIP(pool.Spec.IPPlan.CIDR),
 		NICName:                pool.Spec.Bootstrap.NICName,
 		DNSServersJSON:         string(dnsJSON),
+		DNSServersLine:         strings.Join(pool.Spec.Bootstrap.DNS, " "),
 		OSUser:                 pool.Spec.Bootstrap.OSUser,
 		OSPasswordHash:         pool.Spec.Bootstrap.OSPasswordHash,
 		SSHAuthorizedKey:       pool.Spec.Bootstrap.SSHAuthorizedKey,
@@ -1193,6 +1194,9 @@ func (r *WorkerPoolReconciler) createWorker(ctx context.Context, pool *infrav1.K
 		ContainerdMirrors:      guest.ContainerdMirrors,
 		ContainerdInsecure:     guest.ContainerdInsecure,
 		ContainerdFullConfig:   guest.ContainerdFull,
+		AptMirror:              guest.AptMirror,
+		AptSuites:              guest.AptSuites,
+		AptComponents:          guest.AptComponents,
 	})
 	if err != nil {
 		return release(fmt.Errorf("render bootstrap for %s: %w", name, err))
