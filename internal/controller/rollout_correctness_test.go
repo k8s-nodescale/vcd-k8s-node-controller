@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -300,5 +301,116 @@ func TestRolloutWaitForPDBPausesInsteadOfEvicting(t *testing.T) {
 	}
 	if len(fc.poweredOff) != 0 {
 		t.Fatalf("the VM was touched: %v", fc.poweredOff)
+	}
+}
+
+// A create takes minutes, and the slot is published before the VM exists. Until
+// the condition is written the published status still carried the previous
+// pass's message: on vSphere the pool said "Converged 1/1" while desired was 2
+// and the second clone was already running.
+func TestScaleUpPublishesProvisioningWithTheSlot(t *testing.T) {
+	pool := testPool(1)
+	fc := &fakeCloud{}
+	fk := &fakeKube{}
+	r := newTestReconciler(t, fc, fk, pool)
+
+	var seen *metav1.Condition
+	fc.createHook = func() {
+		got := getPool(t, r, pool)
+		for i := range got.Status.Conditions {
+			if got.Status.Conditions[i].Type == "Ready" {
+				c := got.Status.Conditions[i]
+				seen = &c
+			}
+		}
+	}
+	reconcileOnce(t, r, pool)
+
+	if seen == nil {
+		t.Fatal("the pool carries no Ready condition while the VM is being created")
+	}
+	if seen.Status != metav1.ConditionFalse || seen.Reason != "Provisioning" {
+		t.Fatalf("condition during the create = %s/%s, want False/Provisioning", seen.Status, seen.Reason)
+	}
+	if !strings.Contains(seen.Message, "0/1 workers Ready") || !strings.Contains(seen.Message, "pool-wrk-01") {
+		t.Errorf("message = %q, want the counts and the worker being created", seen.Message)
+	}
+}
+
+// Ready must not say "Converged" while status.rollout says Progressing: a
+// worker being replaced stays Ready for most of the roll, so counting Ready
+// alone reported a converged pool during a rollout (seen live on vSphere).
+func TestPoolConditionReportsARolloutInProgress(t *testing.T) {
+	pool := testPool(1)
+	pool.Status.ObservedReplicas = 1
+	pool.Status.Nodes = []infrav1.WorkerNodeStatus{{
+		Name: "pool-wrk-01", IP: "10.0.0.10", Phase: infrav1.NodePhaseResizing,
+		Resize: &infrav1.ResizeStatus{Phase: "Cordoned"},
+	}}
+	pool.Status.Rollout = infrav1.RolloutStatus{Phase: infrav1.RolloutPhaseProgressing, CurrentWorker: "pool-wrk-01"}
+
+	status, reason, msg := evaluatePoolCondition(pool)
+	if status != metav1.ConditionFalse || reason != "RollingOut" {
+		t.Fatalf("condition = %s/%s, want False/RollingOut", status, reason)
+	}
+	if !strings.Contains(msg, "rollout in progress") || !strings.Contains(msg, "pool-wrk-01") {
+		t.Errorf("message = %q, want the rollout and the worker", msg)
+	}
+
+	pool.Status.Rollout.Phase = infrav1.RolloutPhaseIdle
+	pool.Status.Nodes[0].Phase = infrav1.NodePhaseReady
+	pool.Status.Nodes[0].Resize = nil
+	if status, reason, _ := evaluatePoolCondition(pool); status != metav1.ConditionTrue || reason != "Converged" {
+		t.Fatalf("condition after the rollout = %s/%s, want True/Converged", status, reason)
+	}
+}
+
+// I-33: a passing roll returns before the readiness evaluation, so it has to
+// write the condition itself. Before this the pool published the message from
+// the pass before the roll - live on vSphere it read "Converged 3/3" through a
+// whole replacement while status.rollout said Progressing.
+func TestARolloutPassPublishesRollingOut(t *testing.T) {
+	pool := testPool(1)
+	fc := &fakeCloud{}
+	fk := &fakeKube{nodes: readyNodes("pool-wrk-01")}
+	r := newTestReconciler(t, fc, fk, pool)
+
+	reconcileOnce(t, r, pool)
+	if c := meta.FindStatusCondition(getPool(t, r, pool).Status.Conditions, "Ready"); c == nil || c.Reason != "Converged" {
+		t.Fatalf("condition before the roll = %#v, want Converged", c)
+	}
+
+	updateSpec(t, r, pool, func(p *infrav1.K8sWorkerPool) { p.Spec.Flavor.CPUs = 4 })
+	reconcileOnce(t, r, pool) // takes the worker out of service
+
+	got := getPool(t, r, pool)
+	c := meta.FindStatusCondition(got.Status.Conditions, "Ready")
+	if c == nil {
+		t.Fatal("the pool carries no Ready condition during the roll")
+	}
+	if c.Status != metav1.ConditionFalse || c.Reason != "RollingOut" {
+		t.Fatalf("condition during the roll = %s/%s (%q), want False/RollingOut", c.Status, c.Reason, c.Message)
+	}
+	if !strings.Contains(c.Message, "pool-wrk-01") || !strings.Contains(c.Message, "rollout in progress") {
+		t.Errorf("message = %q, want the worker and the roll", c.Message)
+	}
+	if got.Status.Rollout.Phase != infrav1.RolloutPhaseProgressing {
+		t.Fatalf("rollout phase = %q, want Progressing", got.Status.Rollout.Phase)
+	}
+
+	// The pass that closes the roll also has to say so: it returns before the
+	// readiness evaluation and would otherwise leave "RollingOut" behind
+	// for the whole requeue interval.
+	reconcileOnce(t, r, pool) // resize and boot
+	reconcileOnce(t, r, pool) // back in service
+	reconcileOnce(t, r, pool) // roll closes
+
+	got = getPool(t, r, pool)
+	c = meta.FindStatusCondition(got.Status.Conditions, "Ready")
+	if got.Status.Rollout.Phase != infrav1.RolloutPhaseIdle {
+		t.Fatalf("rollout phase = %q, want Idle", got.Status.Rollout.Phase)
+	}
+	if c == nil || c.Status != metav1.ConditionTrue || c.Reason != "Converged" {
+		t.Fatalf("condition after the roll = %#v, want True/Converged", c)
 	}
 }

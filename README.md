@@ -256,7 +256,7 @@ reports `ErrPoolNotConfigured` for a pool it cannot address (NSX-T today).
 | `ledger.nextIndex` / `used[]` / `free[]` | Address book. `used` holds every allocated worker IP; addresses of deleted VMs are never released automatically. |
 | `nodes[]` | Per worker: `name` (the VM name in the platform), `nodeName` (the Kubernetes Node object name, lower case - the only name the controller passes to the Kubernetes API), `ip`, `providerID` (the VM id in the platform: `urn:vcloud:vm:...` on vCD, the managed object id on vSphere), `phase`, `cpu`, `memoryMB`, `diskGB`, `k8sReady`, `kubeletVersion`, `message`, `deleteStartedAt`, `flavor` (what the VM actually runs with, template included, read back from the platform), `healAttempts` / `healLastAttempt` (the AutoHeal budget), `resize` (the per-worker rollout step: `phase`, `recreate`, `drainStartedAt`, `message`), `provisioningStartedAt` (when the watchdog clock started for a VM that has no Node yet), `bootstrapTokenID` (the token kept alive until the join, then revoked; never the secret half). `message` is where a blocked removal explains itself (the PDB, the attached volume, the local PV). |
 | `rollout` | `phase` (`Idle`, `Progressing`, `Paused`, `Queued`), `message` (why a roll is waiting, e.g. the capacity it needs), `targetFlavor`, `workersTotal`, `workersDone`, `currentWorker`, `lastError`, `startedAt`. |
-| `conditions[]` | `Ready`, with reason `Converged` (`3/3 workers Ready`), `Progressing` while a worker is not Ready yet, `WorkerMissing` when a slot lost its VM, `WorkerFailed` when a worker is parked (drain timeout, exhausted AutoHeal, or no Node within `provisioning.timeout`), `LastWorkerProtected` / `WorkerHostsController` on a refused emptying, `RolloutInProgress` while a roll holds the pool, `NoResourceAvailable` when workers are queued for vDC capacity, plus `ScaleUpFailed`, `ScaleDownFailed`, `RolloutFailed` and `InvalidSpec` on errors. |
+| `conditions[]` | `Ready`, with reason `Converged` (`3/3 workers Ready`), `Progressing` while a worker is not Ready yet, `WorkerMissing` when a slot lost its VM, `WorkerFailed` when a worker is parked (drain timeout, exhausted AutoHeal, or no Node within `provisioning.timeout`), `LastWorkerProtected` / `WorkerHostsController` on a refused emptying, `RolloutInProgress` while a roll holds the pool, `RollingOut` while a worker is being replaced or resized (`2/3 workers Ready, rollout in progress (pool-wrk-03)`), `NoResourceAvailable` when workers are queued for vDC capacity, plus `ScaleUpFailed`, `ScaleDownFailed`, `RolloutFailed` and `InvalidSpec` on errors. |
 
 Phases: `Provisioning` (VM created, Node not registered yet) -> `Joining` (Node
 registered, not Ready) -> `Ready`. Removal uses `Draining` (cordon, pool
@@ -1321,7 +1321,11 @@ middle of a roll resumes at the same worker instead of starting over - the same
 mechanism that makes a named removal resumable.
 
 While a roll runs, scale-in and `deleteWorkers` are refused with
-`RolloutInProgress`; scale-up is allowed and only adds capacity. A worker that
+`RolloutInProgress`; scale-up is allowed and only adds capacity. The pool itself
+reports `Ready=False` with reason `RollingOut` for the whole roll, so
+`status.conditions[]` and `status.rollout` never disagree - a worker keeps
+`Ready` in Kubernetes for most of its replacement (it is drained, then stopped),
+which used to make the pool look `Converged` in the middle of a roll. A worker that
 does not come back within `rollout.readyTimeout` (default `10m`) is parked as
 `Failed` with its VM intact, and with `rollout.pauseOnFailure: true` (the
 default) the whole roll pauses there: `status.rollout.phase: Paused` and

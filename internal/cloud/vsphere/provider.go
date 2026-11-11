@@ -609,10 +609,29 @@ func (p *Provider) CreateVM(ctx context.Context, spec cloud.CreateVMSpec) (cloud
 		}
 		return cloud.VM{}, err
 	}
-	if err := powerOn(ctx, vm); err != nil {
+	if err := startOrRemove(spec.Name,
+		func() error { return powerOn(ctx, vm) },
+		func() error { return destroyVM(ctx, vm) }); err != nil {
 		return cloud.VM{}, err
 	}
 	return p.vmInfo(ctx, vm)
+}
+
+// startOrRemove powers a fresh clone on and removes it when that fails: a VM
+// that never started is not a worker. Leaving it behind gives the folder a
+// powered-off VM that no status row owns and nothing ever revisits (I-29) -
+// the controller drops the slot after a failed create, so the orphan would
+// outlive every retry.
+func startOrRemove(name string, start, remove func() error) error {
+	if err := start(); err != nil {
+		if derr := remove(); derr != nil {
+			// The name is the only pointer left to the VM an operator has to
+			// delete by hand, because the slot is gone by the time this shows.
+			return fmt.Errorf("%w (the VM %q could not be removed either: %v)", err, name, derr)
+		}
+		return err
+	}
+	return nil
 }
 
 // finishCreate completes a create that an earlier pass did not: the VM exists,

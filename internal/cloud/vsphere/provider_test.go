@@ -2,6 +2,7 @@ package vsphere
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -269,5 +270,49 @@ func TestPlacementCarriesTheHost(t *testing.T) {
 	}
 	if got := prov.(*Provider).placement.Host; got != pl.VSphere.Host {
 		t.Fatalf("placement host = %q, want %q", got, pl.VSphere.Host)
+	}
+}
+
+// I-29: a clone that cannot be powered on must not survive the create. The
+// controller drops the slot when the create fails, so a VM left behind is
+// invisible to status and to the page, and no later pass will ever clean it.
+func TestAFailedPowerOnRemovesTheVM(t *testing.T) {
+	removed := 0
+	err := startOrRemove("nscl-test-wrk-09",
+		func() error { return errors.New("power on: no host is compatible") },
+		func() error { removed++; return nil })
+	if err == nil || !strings.Contains(err.Error(), "no host is compatible") {
+		t.Fatalf("err = %v, want the power-on failure", err)
+	}
+	if removed != 1 {
+		t.Fatalf("removed %d times, want the clone removed once", removed)
+	}
+}
+
+func TestASuccessfulPowerOnKeepsTheVM(t *testing.T) {
+	removed := 0
+	if err := startOrRemove("nscl-test-wrk-09",
+		func() error { return nil },
+		func() error { removed++; return nil }); err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if removed != 0 {
+		t.Fatalf("removed %d times, want the VM kept", removed)
+	}
+}
+
+// When the cleanup fails too, the error has to name the VM: the slot is already
+// gone, so this message is the only thing pointing at the leftover object.
+func TestAFailedPowerOnAndCleanupNamesTheVM(t *testing.T) {
+	err := startOrRemove("nscl-test-wrk-09",
+		func() error { return errors.New("power on: no host is compatible") },
+		func() error { return errors.New("destroy: permission denied") })
+	if err == nil {
+		t.Fatal("err = nil, want both failures")
+	}
+	for _, want := range []string{"no host is compatible", "permission denied", "nscl-test-wrk-09"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %q, want it to mention %q", err, want)
+		}
 	}
 }

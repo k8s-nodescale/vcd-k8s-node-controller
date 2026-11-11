@@ -611,6 +611,15 @@ func evaluatePoolCondition(pool *infrav1.K8sWorkerPool) (metav1.ConditionStatus,
 			msg += " (" + queuedMessage + ")"
 		}
 		return metav1.ConditionFalse, "NoResourceAvailable", msg
+	case pool.Status.Rollout.Phase == infrav1.RolloutPhaseProgressing:
+		// A worker being replaced or resized keeps Ready=1 for most of the roll
+		// (it is drained, then stopped), so counting Ready alone called the pool
+		// "Converged" while status.rollout said Progressing. The two must agree.
+		msg := fmt.Sprintf("%d/%d workers Ready, rollout in progress", ready, desired)
+		if w := pool.Status.Rollout.CurrentWorker; w != "" {
+			msg += " (" + w + ")"
+		}
+		return metav1.ConditionFalse, "RollingOut", msg
 	case pool.Status.ObservedReplicas != desired:
 		return metav1.ConditionFalse, "Scaling",
 			fmt.Sprintf("desired=%d observed=%d ready=%d", desired, pool.Status.ObservedReplicas, ready)
@@ -1036,6 +1045,13 @@ func (r *WorkerPoolReconciler) scaleUp(ctx context.Context, before, pool *infrav
 		})
 		pool.Status.ObservedReplicas = int32(len(pool.Status.Nodes))
 		pool.Status.Ledger = toStatusLedger(alloc.Ledger())
+		// The condition goes out with the slot, not at the end of the pass: a
+		// clone takes minutes, and until this line the published status still
+		// read "Converged N/N" from the pass before the scale-up (seen live on
+		// vSphere: desired=2, observed=2, message "1/1 workers Ready").
+		r.setCondition(pool, metav1.ConditionFalse, "Provisioning", fmt.Sprintf(
+			"%d/%d workers Ready, creating %s",
+			readyWorkers(pool.Status.Nodes), pool.Spec.Replicas, name))
 		if err := r.flush(ctx, before, pool); err != nil {
 			return err
 		}
