@@ -319,6 +319,11 @@ func (r *WorkerPoolReconciler) reconcile(ctx context.Context, before, pool *infr
 			r.setCondition(pool, metav1.ConditionFalse, "CreateResumeFailed", err.Error())
 			return ctrl.Result{}, err
 		}
+		// Same as above: a deletion message from an earlier pass must not
+		// outlive the deletion.
+		r.setCondition(pool, metav1.ConditionFalse, "Provisioning", fmt.Sprintf(
+			"%d/%d workers Ready, finishing a worker create interrupted by a restart",
+			readyWorkers(pool.Status.Nodes), pool.Spec.Replicas))
 		return ctrl.Result{RequeueAfter: requeueProgressing}, nil
 	}
 
@@ -330,6 +335,13 @@ func (r *WorkerPoolReconciler) reconcile(ctx context.Context, before, pool *infr
 			r.setCondition(pool, metav1.ConditionFalse, "ScaleUpFailed", err.Error())
 			return ctrl.Result{}, err
 		}
+		// This pass ends before the readiness evaluation, so it has to say
+		// what it did: otherwise the condition keeps the previous pass's
+		// message and reports a state the pool is no longer in.
+		r.setCondition(pool, metav1.ConditionFalse, "NoResourceAvailable", fmt.Sprintf(
+			"%d/%d workers Ready, %d worker(s) queued for vDC capacity",
+			readyWorkers(pool.Status.Nodes), pool.Spec.Replicas,
+			countPhase(pool.Status.Nodes, infrav1.NodePhaseQueued)))
 		return ctrl.Result{RequeueAfter: requeueProgressing}, nil
 	}
 
@@ -537,6 +549,24 @@ func (r *WorkerPoolReconciler) refreshReadiness(ctx context.Context, pool *infra
 		}
 	}
 	return nil
+}
+
+// readyWorkers counts the slots whose node is Ready, the same way
+// evaluatePoolCondition does.
+func readyWorkers(nodes []infrav1.WorkerNodeStatus) int32 {
+	return countPhase(nodes, infrav1.NodePhaseReady)
+}
+
+// countPhase is how many slots are in one phase, for the progress messages a
+// pass writes when it returns before the readiness evaluation.
+func countPhase(nodes []infrav1.WorkerNodeStatus, phase infrav1.NodePhase) int32 {
+	var n int32
+	for i := range nodes {
+		if nodes[i].Phase == phase {
+			n++
+		}
+	}
+	return n
 }
 
 // evaluatePoolCondition makes Ready mean "the requested workers are Ready",
@@ -1189,6 +1219,7 @@ func (r *WorkerPoolReconciler) createWorker(ctx context.Context, pool *infrav1.K
 		NTPServers:             guest.NTPServers,
 		CACerts:                guest.CACerts,
 		Sysctls:                guest.Sysctls,
+		SysctlNames:            guest.SysctlNames,
 		KernelModules:          guest.KernelModules,
 		ContainerdSandboxImage: guest.ContainerdSandboxImage,
 		ContainerdMirrors:      guest.ContainerdMirrors,

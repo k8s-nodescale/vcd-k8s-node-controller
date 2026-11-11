@@ -342,6 +342,17 @@ write_files:
   {{- end }}
 {{- end }}
       sysctl --system
+{{- if .SysctlNames }}
+      # sysctl skips a parameter whose module is not loaded: the guest looks
+      # configured and the value never took effect (nf_conntrack_max is the
+      # classic one - the module arrives with the first pod, long after this
+      # script ran). Say so instead of leaving it invisible.
+      for key in {{ range $i, $k := .SysctlNames }}{{ if $i }} {{ end }}{{ $k }}{{ end }}; do
+        if ! sysctl -n "$key" >/dev/null 2>&1; then
+          log "WARNING: sysctl ${key} is not a live parameter after sysctl --system; if it belongs to a module, list the module in bootstrap.kernelModules"
+        fi
+      done
+{{- end }}
 
       # 2b. The Terraform baseline unloads Ubuntu's apparmor profile for runc:
       #     on kernels where it denies a mount, a pod fails at start with no

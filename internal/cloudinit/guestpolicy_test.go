@@ -103,6 +103,29 @@ func TestCACertBlocksSplitsBundle(t *testing.T) {
 	}
 }
 
+// A bundle copied out of a YAML block scalar keeps the indentation of that
+// block on every line, and OpenSSL refuses a certificate whose base64 body
+// starts with a space ("Unable to load certificate file"). The split has to
+// produce clean PEM, whatever the caller's formatting.
+func TestCACertBlocksStripsIndentation(t *testing.T) {
+	bundle := "      -----BEGIN CERTIFICATE-----\n" +
+		"         MIIFoTCCA4mgAwIBAgIQHuLb9X4TvvGMet8FDF/3kDANBgkqhkiG9w0BAQsFADBN\n" +
+		"      MQswCQYDVQQGEwJSVTEgMB4GA1UEChMXTW9iaWxlIFRlbGVTeXN0ZW1zIFBKU0Mx\n" +
+		"      -----END CERTIFICATE-----\n"
+	got := CACertBlocks(bundle)
+	if len(got) != 1 {
+		t.Fatalf("got %d certificates, want 1: %#v", len(got), got)
+	}
+	for _, line := range strings.Split(got[0], "\n") {
+		if line != strings.TrimSpace(line) {
+			t.Errorf("line keeps indentation: %q", line)
+		}
+	}
+	if !strings.HasPrefix(got[0], "-----BEGIN CERTIFICATE-----\n") {
+		t.Errorf("block does not start at the marker: %q", got[0])
+	}
+}
+
 func TestSysctlLinesAreSorted(t *testing.T) {
 	got := SysctlLines(map[string]string{
 		"net.netfilter.nf_conntrack_max": "2621440",
@@ -147,5 +170,23 @@ func TestPrereqsGeneratesContainerdBase(t *testing.T) {
 	}
 	if !strings.Contains(prereqs, "grep -q '/etc/containerd/conf.d/\\*.toml' /etc/containerd/config.toml") {
 		t.Error("the imports line is patched without checking whether it is already there; a re-run would duplicate it")
+	}
+}
+
+// The guest checks every configured key after "sysctl --system"; the list it
+// loops over comes from here and must match the file it wrote.
+func TestSysctlNamesAreSorted(t *testing.T) {
+	got := SysctlNames(map[string]string{
+		"net.netfilter.nf_conntrack_max": "2621440",
+		"net.core.rmem_max":              "67108864",
+	})
+	want := []string{"net.core.rmem_max", "net.netfilter.nf_conntrack_max"}
+	if len(got) != len(want) {
+		t.Fatalf("got %#v, want %#v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got %#v, want %#v", got, want)
+		}
 	}
 }

@@ -24,7 +24,7 @@ import (
 
 // RenderVersion is bumped whenever the rendered output changes in a way that
 // matters to a running guest. It is stamped into every generated file.
-const RenderVersion = "0.6.0"
+const RenderVersion = "0.6.1"
 
 //go:embed templates/*.tmpl
 var templatesFS embed.FS
@@ -76,6 +76,9 @@ type Params struct {
 	// CACerts are PEM blocks the guest trusts: each becomes a file under
 	// /usr/local/share/ca-certificates and one update-ca-certificates run.
 	CACerts []string
+	// SysctlNames are those keys alone, in the same order, for the guest's
+	// post-apply check.
+	SysctlNames []string
 	// Sysctls are "key = value" lines written after the kernel modules load,
 	// so a conntrack parameter is not silently dropped by a missing module.
 	Sysctls []string
@@ -326,9 +329,40 @@ func CACertBlocks(bundle string) []string {
 			return out
 		}
 		j += len(end)
-		out = append(out, rest[:j])
+		out = append(out, normalizePEM(rest[:j]))
 		rest = rest[j:]
 	}
+}
+
+// normalizePEM removes the indentation a block picks up when it is copied out
+// of a YAML block scalar: Terraform's user-data holds the CA bundle under
+// "ca_certs: - |", so every body line keeps the two spaces of that block and
+// OpenSSL refuses a certificate whose base64 lines start with a space. Empty
+// lines are dropped for the same reason: the parser stops at the first one.
+func normalizePEM(block string) string {
+	lines := strings.Split(block, "\n")
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n")
+}
+
+// SysctlNames is the sorted key list of a sysctl map. The guest checks each
+// key after "sysctl --system": sysctl silently skips a parameter whose module
+// is not loaded, and the guest then looks configured while the value never
+// took effect.
+func SysctlNames(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // SysctlLines renders a sysctl map as sorted "key = value" lines, so a pool

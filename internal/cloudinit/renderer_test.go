@@ -46,6 +46,7 @@ func testParams() Params {
 		NTPServers:             []string{"ntp1.example.com", "ntp2.example.com"},
 		CACerts:                []string{"-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIUTESTCERT\n-----END CERTIFICATE-----"},
 		Sysctls:                []string{"net.core.rmem_max = 67108864", "net.netfilter.nf_conntrack_max = 2621440"},
+		SysctlNames:            []string{"net.core.rmem_max", "net.netfilter.nf_conntrack_max"},
 		KernelModules:          []string{"nf_conntrack"},
 		ContainerdSandboxImage: "registry.example.com/pause:3.9",
 		ContainerdMirrors: []MirrorParam{
@@ -543,6 +544,30 @@ func TestRuncAppArmorIsDisabledWhenPresent(t *testing.T) {
 	}
 	if !strings.Contains(ud, "command -v apparmor_parser") {
 		t.Error("the apparmor step is not guarded by the binary being present")
+	}
+}
+
+// sysctl --system skips a parameter whose module is not loaded, so the guest
+// looks configured while the value never took effect. The prerequisites script
+// checks every configured key afterwards and says so in its log.
+func TestSysctlCheckCoversEveryConfiguredKey(t *testing.T) {
+	ud, _ := mustRender(t, testParams())
+	if !strings.Contains(ud, "for key in net.core.rmem_max net.netfilter.nf_conntrack_max; do") {
+		t.Fatal("the guest does not check the configured sysctl keys after applying them")
+	}
+	if !strings.Contains(ud, `sysctl -n "$key"`) {
+		t.Error("the check does not read the live value")
+	}
+	if !strings.Contains(ud, "bootstrap.kernelModules") {
+		t.Error("the warning does not say how to fix it")
+	}
+
+	p := testParams()
+	p.Sysctls = nil
+	p.SysctlNames = nil
+	ud, _ = mustRender(t, p)
+	if strings.Contains(ud, "for key in") {
+		t.Error("a pool without sysctls still emits the check loop")
 	}
 }
 

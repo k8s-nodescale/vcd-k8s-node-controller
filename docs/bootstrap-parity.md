@@ -180,5 +180,58 @@ existing workers:
 The last row is what 1.2.0 closes: those two steps are written by the current
 template and are verified on a freshly cloned worker (see the next section).
 
-**2026-11-10 (fresh worker, 1.2.0).** Filled in by the scale matrix of this
-release - see the release notes.
+**2026-11-10/11 (1.2.0, the whole scale matrix on vSphere).** Every VM below was
+cloned on the host the lab pool pins; every new worker came up with containerd
+2.2.1 from the site mirror. Times are wall clock from the `replicas` patch to
+`Converged`.
+
+| Step | Result | Time |
+| --- | --- | --- |
+| 4 -> 6 | 6/6 `Converged`, new `.113` and `.114` | ~4 min |
+| 6 -> 3 | drain, power-off, delete, addresses back in the ledger | ~50 s |
+| 3 -> 1 | 1/1, after `wrk-01` was repaired (see below) | ~7 min |
+| 1 -> 0 | refused: `Ready=False / MinReplicasProtected`, the message names the floor | 8 s |
+| 1 -> 4 | 4/4, the same worker names and the same addresses as before | 6 min 37 s |
+
+Chaos, with the pool at 4. The second column is `reconciliation.policy`:
+
+| Disturbance | Policy | Result |
+| --- | --- | --- |
+| VM destroyed in vCenter, Node object left behind | `Notify` | slot `Missing` with its name and address, address stays reserved, no VM created |
+| same, after the policy was switched | `AutoHeal` | the same name `.112` and the same static address, recreated after the backoff, pool back to 4/4 |
+| VM powered off, Node object left behind | `AutoHeal` | `3/4 Progressing`, no recreation: a powered-off VM is an owner decision, not drift |
+| VM powered back on | `AutoHeal` | 4/4 `Converged` in 20 s, the node rejoined on its own |
+
+Guest, read on the fresh `wrk-04`:
+
+| Check | Result |
+| --- | --- |
+| apt | one `nodescale.sources` on the site Nexus mirror, the image's `ubuntu.sources` renamed to `ubuntu.sources.disabled-by-nodescale` |
+| resolved | drop-in `DNS=10.74.64.91 10.73.1.45` and `Domains=~.` |
+| chrony | both site servers in the marked block, `chronyc sources` lists both |
+| CA bundle | `nodescale-00.crt` and `nodescale-01.crt` in `/usr/local/share/ca-certificates` and in `/etc/ssl/certs`; the root CA in the bundle is expired and the Terraform baseline ships the same file |
+| apparmor | the image has neither the parser nor the profile, so the step is skipped rather than failed |
+| containerd | `SystemdCgroup = true`, `pinned_images.sandbox = k8s.gcr.io/pause:3.5` |
+| storage | LVM mounted on `/var` (10 G) and `/var/lib` (30 G) |
+| ssh | the debug ed25519 key is the only line in `kuberadm`'s `authorized_keys` |
+
+Three defects surfaced in this run; 1.2.1 fixes all three:
+
+- a sysctl whose module is not loaded is skipped by `sysctl --system` in
+  silence, so the guest looks configured while the value never took effect.
+  `nf_conntrack_max` was the case; pinning `kernelModules: [nf_conntrack]` works
+  around it, and the guest now also reads every configured key back and logs a
+  warning that names `bootstrap.kernelModules`.
+- a CA bundle pasted into a YAML block scalar carries that block's indentation
+  into every line, and OpenSSL refuses such a file. The bundle is normalised
+  line by line when it is split.
+- `Ready` kept the message of a finished step (`worker ... deleted`) while the
+  replacements were already booting: the passes that return before the readiness
+  evaluation did not update the condition. They now write `Provisioning` or
+  `NoResourceAvailable` with the counts.
+
+The adopted `wrk-01` keeps containerd 1.7.12 from the image. On 1.7.12 a drop-in
+that redefines the `[plugins.'io.containerd.grpc.v1.cri'.containers.runc.options]`
+table emptied `runtime_type` and pods could not start
+(`container.Runtime.Name must be set`). The current template sets only the
+options it owns, and the repaired node passes.

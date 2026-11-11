@@ -167,6 +167,17 @@ func TestResumeInterruptedCreateFinishesTheVM(t *testing.T) {
 	if !found {
 		t.Fatalf("revoked token ids = %v, want the stale one revoked", fk.revokedTokenIDs)
 	}
+	// The pass returned before the readiness evaluation, so it has to state
+	// what it is doing. Otherwise the pool keeps the previous pass's message -
+	// in the lab, "worker wrk-02 (10.99.96.110) deleted" was still on screen
+	// four minutes after that worker was gone and replacements were booting.
+	cond := metaReady(getPool(t, r, pool))
+	if cond == nil || cond.Reason != "Provisioning" {
+		t.Fatalf("Ready condition = %#v, want Provisioning", cond)
+	}
+	if strings.Contains(cond.Message, "deleted") {
+		t.Errorf("the condition still reports the previous step: %q", cond.Message)
+	}
 }
 
 // I-19: status.nodes[] must show the slot while CreateVM runs, not only after

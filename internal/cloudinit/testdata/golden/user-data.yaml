@@ -1,5 +1,5 @@
 #cloud-config
-# render=0.6.0 hash=fa62d1fbd33d
+# render=0.6.1 hash=28cfcc56b1fa
 preserve_hostname: false
 hostname: pool-wrk-01
 fqdn: pool-wrk-01
@@ -636,7 +636,7 @@ write_files:
       LOG=/var/log/k8s-node-prereqs.log
       exec >>"$LOG" 2>&1
       log() { echo "[$(date -Is)] $*"; }
-      log "starting prerequisites render=0.6.0 hash=fa62d1fbd33d"
+      log "starting prerequisites render=0.6.1 hash=28cfcc56b1fa"
 
       # 0. The virtual disk may be bigger than the template's partition table:
       #    a 20 GiB clone of an 8 GiB image leaves / at 7.6 GiB and the apt
@@ -730,6 +730,15 @@ write_files:
       modprobe br_netfilter
       modprobe nf_conntrack || log "modprobe nf_conntrack failed; continuing"
       sysctl --system
+      # sysctl skips a parameter whose module is not loaded: the guest looks
+      # configured and the value never took effect (nf_conntrack_max is the
+      # classic one - the module arrives with the first pod, long after this
+      # script ran). Say so instead of leaving it invisible.
+      for key in net.core.rmem_max net.netfilter.nf_conntrack_max; do
+        if ! sysctl -n "$key" >/dev/null 2>&1; then
+          log "WARNING: sysctl ${key} is not a live parameter after sysctl --system; if it belongs to a module, list the module in bootstrap.kernelModules"
+        fi
+      done
 
       # 2b. The Terraform baseline unloads Ubuntu's apparmor profile for runc:
       #     on kernels where it denies a mount, a pod fails at start with no
@@ -839,7 +848,7 @@ write_files:
       LOG=/var/log/k8s-node-join.log
       exec >>"$LOG" 2>&1
       log() { echo "[$(date -Is)] $*"; }
-      log "starting join render=0.6.0 hash=fa62d1fbd33d"
+      log "starting join render=0.6.1 hash=28cfcc56b1fa"
 
       MARKER=/etc/kubernetes/kubeadm-joined
       if [[ -f "$MARKER" ]]; then

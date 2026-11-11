@@ -34,6 +34,7 @@ type guestBootstrap struct {
 	NTPServers             []string
 	CACerts                []string
 	Sysctls                []string
+	SysctlNames            []string
 	KernelModules          []string
 	ContainerdSandboxImage string
 	ContainerdMirrors      []cloudinit.MirrorParam
@@ -102,6 +103,7 @@ func (r *WorkerPoolReconciler) effectiveBootstrap(ctx context.Context, pool *inf
 		NTPServers:    ntp,
 		CACerts:       certs,
 		Sysctls:       cloudinit.SysctlLines(sysctls),
+		SysctlNames:   cloudinit.SysctlNames(sysctls),
 		KernelModules: modules,
 		AptMirror:     aptMirror(apt),
 		AptSuites:     aptSuites(apt),
