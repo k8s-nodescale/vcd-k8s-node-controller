@@ -494,3 +494,55 @@ func TestEffectiveBootstrapReadsSSHKeysFromTheStore(t *testing.T) {
 		}
 	})
 }
+
+// A K8sWorkerPool is cluster-scoped, so a reference that names no namespace must
+// resolve somewhere real: the controller's namespace, where the chart puts the
+// shared objects. Otherwise every operator has to spell out nodescale-system for
+// a Secret next to the controller.
+func TestPoolReferencesDefaultToTheControllerNamespace(t *testing.T) {
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "worker-keys", Namespace: "nodescale-system"},
+		Data:       map[string][]byte{"authorized_keys": []byte("ssh-ed25519 AAAACI ci@example.com\n")},
+	}
+	ca := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "nodescale-ca", Namespace: "nodescale-system"},
+		Data:       map[string]string{"ca-bundle.pem": testCABundle},
+	}
+	r := bootstrapReconciler(t, secret, ca, installationConfigMap(t, ""))
+
+	pool := bootstrapPool(infrav1.BootstrapConfig{
+		SSHAuthorizedKeysRef: &infrav1.ConfigKeyRef{Kind: "Secret", Name: "worker-keys", Key: "authorized_keys"},
+		CABundleRef:          &infrav1.ConfigKeyRef{Kind: "ConfigMap", Name: "nodescale-ca", Key: "ca-bundle.pem"},
+	})
+	pool.Namespace = "" // cluster-scoped, as the CRD is
+
+	got, err := r.effectiveBootstrap(context.Background(), pool)
+	if err != nil {
+		t.Fatalf("effectiveBootstrap: %v", err)
+	}
+	if len(got.SSHAuthorizedKeys) != 1 || got.SSHAuthorizedKeys[0] != "ssh-ed25519 AAAACI ci@example.com" {
+		t.Fatalf("keys = %#v, want the Secret's key", got.SSHAuthorizedKeys)
+	}
+	if len(got.CACerts) != 2 {
+		t.Fatalf("got %d certificates, want 2 from the controller-namespace ConfigMap", len(got.CACerts))
+	}
+
+	// An explicit namespace still wins.
+	pool.Namespace = "cluster-a"
+	other := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "worker-keys", Namespace: "cluster-a"},
+		Data:       map[string][]byte{"authorized_keys": []byte("ssh-ed25519 AAAAOTHER other@example.com\n")},
+	}
+	caPool := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "nodescale-ca", Namespace: "cluster-a"},
+		Data:       map[string]string{"ca-bundle.pem": testCABundle},
+	}
+	r = bootstrapReconciler(t, secret, other, ca, caPool, installationConfigMap(t, ""))
+	got, err = r.effectiveBootstrap(context.Background(), pool)
+	if err != nil {
+		t.Fatalf("effectiveBootstrap: %v", err)
+	}
+	if len(got.SSHAuthorizedKeys) != 1 || got.SSHAuthorizedKeys[0] != "ssh-ed25519 AAAAOTHER other@example.com" {
+		t.Fatalf("keys = %#v, want the pool namespace's Secret", got.SSHAuthorizedKeys)
+	}
+}

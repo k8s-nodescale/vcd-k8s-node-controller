@@ -67,7 +67,8 @@ func (r *WorkerPoolReconciler) effectiveBootstrap(ctx context.Context, pool *inf
 	containerd := copyContainerd(spec.Containerd)
 	apt := copyApt(spec.Apt)
 	caRef := copyRef(spec.CABundleRef)
-	caNamespace := pool.Namespace
+	poolNamespace := r.poolRefNamespace(pool)
+	caNamespace := poolNamespace
 
 	if r.BootstrapConfigMap != "" {
 		def, err := r.readInstallationBootstrap(ctx)
@@ -108,7 +109,7 @@ func (r *WorkerPoolReconciler) effectiveBootstrap(ctx context.Context, pool *inf
 	// installation ConfigMap: the account and its keys describe a cluster.
 	var refKeys string
 	if spec.SSHAuthorizedKeysRef != nil {
-		value, err := r.readRef(ctx, spec.SSHAuthorizedKeysRef, pool.Namespace)
+		value, err := r.readRef(ctx, spec.SSHAuthorizedKeysRef, poolNamespace)
 		if err != nil {
 			return guestBootstrap{}, fmt.Errorf("spec.bootstrap.sshAuthorizedKeysRef: %w", err)
 		}
@@ -127,7 +128,7 @@ func (r *WorkerPoolReconciler) effectiveBootstrap(ctx context.Context, pool *inf
 		AptComponents:     aptComponents(apt),
 	}
 	if containerd != nil && containerd.ConfigRef != nil {
-		full, err := r.readRef(ctx, containerd.ConfigRef, pool.Namespace)
+		full, err := r.readRef(ctx, containerd.ConfigRef, poolNamespace)
 		if err != nil {
 			return guestBootstrap{}, fmt.Errorf("spec.bootstrap.containerd.configRef: %w", err)
 		}
@@ -175,6 +176,18 @@ func (r *WorkerPoolReconciler) readInstallationBootstrap(ctx context.Context) (i
 		return installationBootstrap{}, fmt.Errorf("parse %s/%s key bootstrap.yaml: %w", namespace, r.BootstrapConfigMap, err)
 	}
 	return out, nil
+}
+
+// poolRefNamespace is where a reference written in a pool resolves. A
+// K8sWorkerPool is cluster-scoped, so pool.Namespace is empty in practice and a
+// reference that names no namespace would resolve nowhere: the controller's own
+// namespace is the default, because that is where the chart puts the objects an
+// installation shares (the bootstrap ConfigMap, the CA Secret).
+func (r *WorkerPoolReconciler) poolRefNamespace(pool *infrav1.K8sWorkerPool) string {
+	if ns := strings.TrimSpace(pool.Namespace); ns != "" {
+		return ns
+	}
+	return r.PodNamespace
 }
 
 // readRef resolves one ConfigMap/Secret key. An empty namespace means

@@ -325,9 +325,11 @@ type ConfigKeyRef struct {
 	// Name is the object name.
 	Name string `json:"name"`
 
-	// Namespace defaults to the namespace of the K8sWorkerPool. A reference
-	// from the installation-wide bootstrap ConfigMap resolves in the
-	// controller's namespace instead.
+	// Namespace defaults to the namespace of the K8sWorkerPool, and to the
+	// controller's own namespace when the pool is cluster-scoped (which it is):
+	// that is where the chart puts the objects an installation shares. A
+	// reference from the installation-wide bootstrap ConfigMap always resolves
+	// in the controller's namespace.
 	// +optional
 	Namespace string `json:"namespace,omitempty"`
 

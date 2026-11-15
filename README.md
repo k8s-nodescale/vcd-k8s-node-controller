@@ -141,7 +141,7 @@ One `K8sWorkerPool` describes the worker set of a single cluster. You own
 | `bootstrap.osUser` | no | Guest account created by vCD guest customization. |
 | `bootstrap.osPasswordHash` | no | `/etc/shadow` hash, not a plain password. |
 | `bootstrap.sshAuthorizedKey` | no | Public key installed for `osUser`. |
-| `bootstrap.sshAuthorizedKeysRef` | no | `kind` (`ConfigMap`/`Secret`), `name`, `key`, `namespace` - a store holding public keys, one per line; added to `sshAuthorizedKey`, duplicates dropped, blank and `#` lines ignored. Rotate a key in the store without editing the pool. The keys still travel in the guest user-data (that is how cloud-init installs them), so this keeps them out of a widely readable CR, not off the VM. A missing object or key fails the create, naming this field. |
+| `bootstrap.sshAuthorizedKeysRef` | no | `kind` (`ConfigMap`/`Secret`), `name`, `key`, `namespace` (defaults to the controller's) - a store holding public keys, one per line; added to `sshAuthorizedKey`, duplicates dropped, blank and `#` lines ignored. Rotate a key in the store without editing the pool. The keys still travel in the guest user-data (that is how cloud-init installs them), so this keeps them out of a widely readable CR, not off the VM. A missing object or key fails the create, naming this field. |
 | `bootstrap.nicName` | no | Guest NIC name (`ens192` on the Ubuntu template). |
 | `bootstrap.sshAllowedSources[]` | no | Extra sshd `AllowUsers` patterns for the workers, e.g. `*@10.99.96.64/26`. The image ships a restrictive `AllowUsers` line; these are appended to it exactly like the Terraform baseline appends `allowed_ssh_ips`. |
 | `bootstrap.dns` | no | Resolvers written into the guest. |
@@ -606,9 +606,13 @@ nodescale-system/nodescale-bootstrap        (chart: values.bootstrap)
 The controller reads that ConfigMap once per reconcile and embeds the result
 into the new worker's user-data; the guest never talks to the Kubernetes API,
 and a pool that names nothing inherits everything. A pool reference
-(`bootstrap.caBundleRef`, `bootstrap.containerd.configRef`) resolves in the
-pool's namespace; a reference that comes from the installation resolves in the
-controller's namespace, which is where the chart put the ConfigMap.
+(`bootstrap.caBundleRef`, `bootstrap.containerd.configRef`,
+`bootstrap.sshAuthorizedKeysRef`) resolves in the namespace it names, then in
+the pool's namespace, then in the controller's own: a `K8sWorkerPool` is
+cluster-scoped, so in practice the controller's namespace is where a reference
+without one lands - that is where the chart puts the objects an installation
+shares. A reference that comes from the installation ConfigMap always resolves
+in the controller's namespace.
 
 **containerd `config.toml`.** It is generated in the guest, not shipped whole:
 the prerequisites script runs `containerd config default > /etc/containerd/config.toml`
