@@ -599,3 +599,41 @@ func TestGolden(t *testing.T) {
 		}
 	}
 }
+
+// Several authorized keys must render as several list items, not as one line
+// with a newline inside it: cloud-init's users module takes a list.
+func TestRenderInstallsEveryAuthorizedKey(t *testing.T) {
+	p := testParams()
+	p.SSHAuthorizedKeys = []string{
+		"ssh-ed25519 AAAAINLINE ops@example.com",
+		"ssh-ed25519 AAAACI ci@example.com",
+	}
+	userData, _ := mustRender(t, p)
+	if !strings.Contains(userData, "    ssh_authorized_keys:\n      - ssh-ed25519 AAAAINLINE ops@example.com\n      - ssh-ed25519 AAAACI ci@example.com\n") {
+		t.Fatalf("the key list is not rendered as two items:\n%s", headLines(userData, 30))
+	}
+	var parsed map[string]any
+	if err := yaml.Unmarshal([]byte(userData), &parsed); err != nil {
+		t.Fatalf("the rendered user-data is not YAML: %v", err)
+	}
+}
+
+// The keys are part of a render's identity: the same pool with another key set
+// is a different guest.
+func TestTheKeySetChangesTheRenderIdentity(t *testing.T) {
+	a := testParams()
+	a.SSHAuthorizedKeys = []string{"ssh-ed25519 AAAAONE one@example.com"}
+	b := testParams()
+	b.SSHAuthorizedKeys = []string{"ssh-ed25519 AAAATWO two@example.com"}
+	if specHash8(a) == specHash8(b) {
+		t.Fatal("the key set is not part of the spec hash")
+	}
+}
+
+func headLines(s string, n int) string {
+	lines := strings.SplitN(s, "\n", n+1)
+	if len(lines) > n {
+		lines = lines[:n]
+	}
+	return strings.Join(lines, "\n")
+}

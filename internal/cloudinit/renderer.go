@@ -24,7 +24,7 @@ import (
 
 // RenderVersion is bumped whenever the rendered output changes in a way that
 // matters to a running guest. It is stamped into every generated file.
-const RenderVersion = "0.6.1"
+const RenderVersion = "0.7.0"
 
 //go:embed templates/*.tmpl
 var templatesFS embed.FS
@@ -56,10 +56,14 @@ type Params struct {
 	DNSServersJSON string // JSON array, e.g. ["8.8.8.8","1.1.1.1"]
 	// DNSServersLine is the same list space-separated, for the resolved
 	// drop-in (systemd reads DNS= that way, not JSON).
-	DNSServersLine    string
-	OSUser            string
-	OSPasswordHash    string
-	SSHAuthorizedKey  string
+	DNSServersLine string
+	OSUser         string
+	OSPasswordHash string
+	// SSHAuthorizedKeys are installed for osUser, in order. The inline
+	// spec.bootstrap.sshAuthorizedKey comes first, then every key read from
+	// spec.bootstrap.sshAuthorizedKeysRef. Empty leaves cloud-init's users
+	// module alone.
+	SSHAuthorizedKeys []string
 	SSHAllowedSources []string
 	K8sVersion        string // apt version, e.g. "1.35.9-1.1"
 	K8sMinorRepo      string // e.g. "v1.35"
@@ -289,6 +293,10 @@ func specHash8(p Params) string {
 	}
 	// The guest policy is part of the identity too: a recreated VM whose NTP,
 	// CA bundle or containerd config changed is not "the same instance".
+	// The authorized keys are identity too: a recreated VM with another key set
+	// is not "the same instance".
+	b.WriteString(strings.Join(p.SSHAuthorizedKeys, "\n"))
+	b.WriteByte('|')
 	b.WriteString(strings.Join(p.NTPServers, ","))
 	b.WriteByte('|')
 	b.WriteString(strings.Join(p.CACerts, ","))
@@ -332,6 +340,32 @@ func CACertBlocks(bundle string) []string {
 		out = append(out, normalizePEM(rest[:j]))
 		rest = rest[j:]
 	}
+}
+
+// SSHKeyLines builds the authorized-key list from the inline key and the
+// content of sshAuthorizedKeysRef. The inline key comes first, then the keys in
+// the order the store lists them; duplicates are dropped, so a key that is both
+// inline and in the store is installed once. Blank lines and lines starting
+// with "#" are ignored, which is what makes a commented store usable.
+//
+// A key is not validated: cloud-init and sshd reject what they cannot parse,
+// and the operator's own key material is the only thing that can be wrong.
+func SSHKeyLines(inline, fromRef string) []string {
+	var out []string
+	seen := make(map[string]bool)
+	add := func(line string) {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") || seen[line] {
+			return
+		}
+		seen[line] = true
+		out = append(out, line)
+	}
+	add(inline)
+	for _, line := range strings.Split(fromRef, "\n") {
+		add(line)
+	}
+	return out
 }
 
 // normalizePEM removes the indentation a block picks up when it is copied out

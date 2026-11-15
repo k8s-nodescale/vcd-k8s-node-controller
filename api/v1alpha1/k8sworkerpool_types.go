@@ -248,6 +248,15 @@ type BootstrapConfig struct {
 	OSPasswordHash   string `json:"osPasswordHash,omitempty"`
 	SSHAuthorizedKey string `json:"sshAuthorizedKey,omitempty"`
 
+	// SSHAuthorizedKeysRef names a ConfigMap or Secret key holding public
+	// keys, one per line. They are added to the inline sshAuthorizedKey, so an
+	// operator can rotate a key in the store without editing the pool object;
+	// blank lines and lines starting with # are ignored. The keys still travel
+	// in the guest user-data (that is how cloud-init installs them), so this
+	// keeps them out of a widely readable CR, not off the VM.
+	// +optional
+	SSHAuthorizedKeysRef *ConfigKeyRef `json:"sshAuthorizedKeysRef,omitempty"`
+
 	// SSHAllowedSources are extra sshd AllowUsers patterns the worker admits,
 	// e.g. "*@10.99.96.64/26". The images ship a restrictive AllowUsers line
 	// (the Terraform baseline appends the same values from allowed_ssh_ips); a

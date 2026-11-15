@@ -15,9 +15,11 @@ users:
     {{- if .OSPasswordHash }}
     passwd: {{ .OSPasswordHash }}
     {{- end }}
-    {{- if .SSHAuthorizedKey }}
+    {{- if .SSHAuthorizedKeys }}
     ssh_authorized_keys:
-      - {{ .SSHAuthorizedKey }}
+      {{- range .SSHAuthorizedKeys }}
+      - {{ . }}
+      {{- end }}
     {{- end }}
 
 # The Terraform baseline allows password login, and an operator locked out of a

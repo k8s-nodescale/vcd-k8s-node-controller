@@ -1,5 +1,5 @@
 #cloud-config
-# render=0.6.1 hash=28cfcc56b1fa
+# render=0.7.0 hash=eeae8634f9f6
 preserve_hostname: false
 hostname: pool-wrk-01
 fqdn: pool-wrk-01
@@ -636,7 +636,7 @@ write_files:
       LOG=/var/log/k8s-node-prereqs.log
       exec >>"$LOG" 2>&1
       log() { echo "[$(date -Is)] $*"; }
-      log "starting prerequisites render=0.6.1 hash=28cfcc56b1fa"
+      log "starting prerequisites render=0.7.0 hash=eeae8634f9f6"
 
       # 0. The virtual disk may be bigger than the template's partition table:
       #    a 20 GiB clone of an 8 GiB image leaves / at 7.6 GiB and the apt
@@ -848,7 +848,7 @@ write_files:
       LOG=/var/log/k8s-node-join.log
       exec >>"$LOG" 2>&1
       log() { echo "[$(date -Is)] $*"; }
-      log "starting join render=0.6.1 hash=28cfcc56b1fa"
+      log "starting join render=0.7.0 hash=eeae8634f9f6"
 
       MARKER=/etc/kubernetes/kubeadm-joined
       if [[ -f "$MARKER" ]]; then

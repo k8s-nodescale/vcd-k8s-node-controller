@@ -115,7 +115,9 @@ Not implemented yet:
 
 - NSX-T ingress pools (`ingressPool.type: nsxt` is rejected with a clear event;
   the node is still drained and deleted, but its pool member must be removed by
-  hand).
+  hand). On vSphere the field is ignored entirely, silently - the planned
+  optional HAProxy workflow is not written yet, so a pool that sets
+  `ingressPool` there is a declaration, not a promise.
 - Automatic repair of a worker that is `Failed`: it is reported and kept, and
   a `Failed` drain is not retried for you. A VM that boots but never joins is
   parked by `spec.provisioning.timeout` with the VM kept.
@@ -139,6 +141,7 @@ One `K8sWorkerPool` describes the worker set of a single cluster. You own
 | `bootstrap.osUser` | no | Guest account created by vCD guest customization. |
 | `bootstrap.osPasswordHash` | no | `/etc/shadow` hash, not a plain password. |
 | `bootstrap.sshAuthorizedKey` | no | Public key installed for `osUser`. |
+| `bootstrap.sshAuthorizedKeysRef` | no | `kind` (`ConfigMap`/`Secret`), `name`, `key`, `namespace` - a store holding public keys, one per line; added to `sshAuthorizedKey`, duplicates dropped, blank and `#` lines ignored. Rotate a key in the store without editing the pool. The keys still travel in the guest user-data (that is how cloud-init installs them), so this keeps them out of a widely readable CR, not off the VM. A missing object or key fails the create, naming this field. |
 | `bootstrap.nicName` | no | Guest NIC name (`ens192` on the Ubuntu template). |
 | `bootstrap.sshAllowedSources[]` | no | Extra sshd `AllowUsers` patterns for the workers, e.g. `*@10.99.96.64/26`. The image ships a restrictive `AllowUsers` line; these are appended to it exactly like the Terraform baseline appends `allowed_ssh_ips`. |
 | `bootstrap.dns` | no | Resolvers written into the guest. |
@@ -167,7 +170,7 @@ One `K8sWorkerPool` describes the worker set of a single cluster. You own
 | `join.endpoint` | no | Control-plane address, `host:port` of the API VIP. |
 | `join.tokenTTL` | no | Lifetime of the per-VM bootstrap token (default `1h`). |
 | `join.labels` / `join.taints` | no | Pool-wide, applied to every Ready worker (`taints` in `key[=value]:Effect` form). |
-| `ingressPool` | no | `type` (`nsxv`/`nsxt`), `name`, `port`, `edge`. `port` is the **node port** the pool forwards to, not the virtual-server port; `edge` is the NSX-V edge that owns the pool. Workers are added on Ready and removed before a drain. |
+| `ingressPool` | no | `type` (`nsxv`/`nsxt`), `name`, `port`, `edge`. One pool per pool object. `port` is the **node port** the pool forwards to, not the virtual-server port; `edge` is the NSX-V edge gateway that owns the pool. Workers are added when they turn Ready and removed before a drain; see [Ingress pool membership](#ingress-pool-membership). |
 | `scaleDown.minReplicas` | no | Floor for the workers that can serve traffic (default `1`). A removal that would leave fewer is refused. Writing off a `Missing` slot takes nothing out of service, so the floor never blocks that cleanup. `0` disables the floor. |
 | `scaleDown.drainTimeout` | no | Budget for cordon+drain of one worker (default `10m`), and for the drain a rollout performs. When it expires the removal escalates past a blocking PodDisruptionBudget: the pods left on the node are deleted, the budget is named in `status`, and the removal continues with a fresh budget. |
 | `scaleDown.waitForPDB` | no | Refuse to bypass a PodDisruptionBudget (default `false`). With `true` a drain that cannot finish within `drainTimeout` parks the worker `Failed` and keeps its VM for a human instead of escalating. A rollout drain honours the same switch: the roll pauses with a `RolloutBlocked` warning and the worker untouched. |
@@ -242,11 +245,13 @@ so counting it would report room the pool cannot use. `spec.capacity.cpuMhzPerCo
 falls back to the host clock speed vCenter reports instead of the 2 GHz vCD
 assumption.
 
-vSphere has no load-balancer pool, which is why membership is a separate
-optional interface rather than part of the main contract: a provider that
-cannot edit a pool simply does not implement it, and the controller leaves
-membership to the operator. The vCD provider implements it for NSX-V and
-reports `ErrPoolNotConfigured` for a pool it cannot address (NSX-T today).
+Ingress-pool membership is a separate optional interface rather than part of the
+main compute contract, because not every platform has a pool the controller can
+reach. The vCD provider implements it for NSX-V; NSX-T is refused with
+`ErrPoolNotConfigured`. On vSphere nothing implements it today, and the field is
+therefore ignored - see [Ingress pool membership](#ingress-pool-membership) for
+what the field promises and `docs/ingress-pool-contract.md` for the planned
+optional HAProxy workflow.
 
 `status`:
 
@@ -275,6 +280,118 @@ In short: `spec.vcd` and `spec.vsphere` are alternatives, `spec.ipPlan` mirrors
 Terraform's `ip_plan`, and `spec.provider` is optional because one installation
 serves one platform.
 
+## Ingress pool membership
+
+A cluster's ingress traffic normally enters through a load balancer that forwards
+to a **server pool**: a list of `node address : node port` entries. `spec.ingressPool`
+is how nodescale keeps that list in step with the workers it manages. A worker
+joins the pool when its Node turns Ready, and leaves the pool before anything is
+drained.
+
+What the controller does **not** do:
+
+- it does not create the edge gateway, the server pool, its virtual server, its
+  monitors or its TLS material - they must already exist;
+- it does not discover pools, and it does not look for pools that already
+  contain this cluster's addresses;
+- it does not rewrite the pool it did not create: an NSX-V update starts from
+  the pool as the edge reports it, so members added by Terraform or by hand
+  survive the update untouched.
+
+### The field and the members are written by different things
+
+| | Written by | When |
+| --- | --- | --- |
+| `spec.ingressPool` (`type`, `name`, `edge`, `port`) | the installer (Terraform/Ansible) or a person applying the CR | once, when the pool object is created or changed |
+| the pool's member list | the controller | continuously, following node state |
+
+An empty `spec.ingressPool` means "no pool": no call is made on either
+platform. A field that names a pool the provider cannot address is a different
+case - see the table below.
+
+### Configuration
+
+```yaml
+spec:
+  ingressPool:
+    type: nsxv                          # nsxv today; nsxt is refused
+    edge: demo-edge-gateway             # edge gateway that owns the pool
+    name: demo-cluster-ingress-pool     # LB server pool on that edge
+    port: 30080                         # ingress-nginx NodePort, not the VIP port
+```
+
+- `edge` and `name` are the lookup: the controller finds the edge by name in the
+  pool's VDC, then the server pool by name on that edge. A typo in either means
+  the pool is never edited.
+- `port` is the **node port** each member is created with, and the monitor port.
+  It is not the port the client connects to.
+- one `K8sWorkerPool` maps to **one** pool. Two node groups in two pools are two
+  pool objects.
+- the addresses of the load-balancer VMs themselves are reserved in the address
+  plan (`ipPlan.kubeAPILB`, `ingressLB`, `lbNodeOffset`, `lbNodeCount`), so a
+  worker is never handed a VIP address.
+
+### What happens on each step
+
+| Step | Pool call |
+| --- | --- |
+| worker cloned | none - a VM without a kubelet is not a member |
+| Node turns Ready | `AddPoolMember` (event `IngressPoolMember`) |
+| drain starts (scale-down, `deleteWorkers`) | `RemovePoolMember` before the first eviction (`WorkerDeletionStarted` / `IngressPoolMemberNotRemoved`) |
+| rollout / recreate | removed before the drain, added back when the worker is Ready again |
+| worker deleted | nothing further - the member is already gone and is not re-added |
+| adopted (Terraform-created) worker | same as a created one: added on Ready |
+
+Membership is **removal, not "pause"**: NSX-V has an enabled/disabled member
+condition, but the controller splices the member out of the list and, for a
+worker that comes back, adds a fresh enabled entry. The member it creates is
+named `node-10-99-96-109` (NSX-V rejects a bare address as a member name), with
+the node address, `port`, `monitorPort: port`, `condition: enabled`, weight 1 and
+`maxConn: 100`.
+
+### When it is skipped or fails
+
+| Situation | What happens |
+| --- | --- |
+| `spec.ingressPool` empty | no call at all, on any platform |
+| `edge` empty, pool not found on the edge, `port` not set | `ErrPoolNotConfigured`: the add is skipped **silently** |
+| `type: nsxt` | refused with a named event; the worker is still drained and deleted, and its member has to be removed by hand |
+| add fails, any other reason | `IngressPoolFailed` warning naming the worker; the worker stays Ready |
+| removal fails during a scale-down | `IngressPoolMemberNotRemoved` warning, and the drain continues: the edge's health monitor takes the address out once the node stops answering |
+| removal fails during a rollout | the rollout step fails and the pass retries |
+| vSphere, no workflow configured | nothing, and no event - this is the honesty gap the planned workflow closes |
+
+The asymmetry in that table is worth knowing before it bites: the same
+misconfiguration is **silent when a worker joins** and only shows up as a warning
+when a worker is removed. Nothing in `status` reports membership, so today the
+events are the only trace (a dedicated status block is part of the planned
+workflow).
+
+### Checking it
+
+```bash
+kubectl -n nodescale-system get events \
+  --field-selector involvedObject.name=<pool-name> \
+  --sort-by=.lastTimestamp | grep IngressPool
+```
+
+And on the edge itself: the pool must list one member per Ready worker,
+addressed `node-ip:30080`. Because the controller does not read the pool back,
+a member removed by hand is not re-added until that worker leaves Ready and
+returns.
+
+### Limits
+
+- NSX-V only. There is no NSX-T path, and no LB outside vCD.
+- one pool per pool object; a worker cannot be in several pools through this
+  field.
+- members that are not slots of this pool object are preserved but never
+  checked, repaired or reported.
+- the update is a whole-pool `PUT` of the state read a moment earlier, so two
+  writers on the same pool (two installations, or an operator editing it while a
+  worker changes) can drop each other's change: the last writer wins.
+- no read-back into `status`; membership is not part of `Ready`.
+
 ## Layout
 
 ```
@@ -291,7 +408,7 @@ internal/ipam/           ip_plan-aware IP ledger/allocator (+ tests)
 internal/cloudinit/      renderer + embedded templates
 config/                  kustomize: crd, rbac, manager, samples
 charts/vcd-nodescale/    published Helm chart (CRDs in crds/)
-docs/                    design doc
+docs/                    design doc, ingress-pool contract (proposal)
 test/                    test strategy / e2e notes
 ```
 
@@ -830,6 +947,12 @@ spec:
     osUser: ubuntu
     osPasswordHash: "$6$REPLACE_WITH_HASH"   # /etc/shadow hash, not a password
     sshAuthorizedKey: "ssh-ed25519 AAAA... ops@example.com"
+    # Optional: more keys, one per line, kept outside the CR so they can be
+    # rotated without touching the pool object. The inline key above stays.
+    # sshAuthorizedKeysRef:
+    #   kind: Secret              # ConfigMap (default) or Secret
+    #   name: worker-ssh-keys
+    #   key: authorized_keys
     nicName: ens192
     dns: ["8.8.8.8", "1.1.1.1"]
     k8sVersion: 1.35.9-1.1

@@ -231,6 +231,40 @@ spec:
                     type: array
                   sshAuthorizedKey:
                     type: string
+                  sshAuthorizedKeysRef:
+                    description: |-
+                      SSHAuthorizedKeysRef names a ConfigMap or Secret key holding public
+                      keys, one per line. They are added to the inline sshAuthorizedKey, so an
+                      operator can rotate a key in the store without editing the pool object;
+                      blank lines and lines starting with # are ignored. The keys still travel
+                      in the guest user-data (that is how cloud-init installs them), so this
+                      keeps them out of a widely readable CR, not off the VM.
+                    properties:
+                      key:
+                        description: Key is the data key holding the value.
+                        type: string
+                      kind:
+                        description: |-
+                          Kind is ConfigMap (the default) or Secret. A CA bundle is public and
+                          belongs in a ConfigMap; Secret is accepted for installs that keep all
+                          their configuration in one store.
+                        enum:
+                        - ConfigMap
+                        - Secret
+                        type: string
+                      name:
+                        description: Name is the object name.
+                        type: string
+                      namespace:
+                        description: |-
+                          Namespace defaults to the namespace of the K8sWorkerPool. A reference
+                          from the installation-wide bootstrap ConfigMap resolves in the
+                          controller's namespace instead.
+                        type: string
+                    required:
+                    - key
+                    - name
+                    type: object
                   sysctls:
                     additionalProperties:
                       type: string

@@ -190,3 +190,44 @@ func TestSysctlNamesAreSorted(t *testing.T) {
 		}
 	}
 }
+
+// I-30: the inline key stays first, the store's keys follow in the order the
+// store lists them, and a key present in both is installed once. Comments and
+// blank lines are what make a shared store readable.
+func TestSSHKeyLinesMergesTheStoreIntoTheInlineKey(t *testing.T) {
+	inline := "ssh-ed25519 AAAAINLINE ops@example.com"
+	store := "# rotated 2026-11\n" +
+		"ssh-ed25519 AAAACI ci@example.com\n" +
+		"\n" +
+		inline + "\n" +
+		"  ssh-rsa AAAABACKUP backup@example.com  \n"
+
+	got := SSHKeyLines(inline, store)
+	want := []string{
+		inline,
+		"ssh-ed25519 AAAACI ci@example.com",
+		"ssh-rsa AAAABACKUP backup@example.com",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d keys, want %d: %#v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("key %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestSSHKeyLinesWithoutEitherSource(t *testing.T) {
+	if got := SSHKeyLines("", ""); len(got) != 0 {
+		t.Fatalf("got %#v, want no keys", got)
+	}
+	// A store that holds only comments and blank lines is not an error: the
+	// inline key (or nothing) is what the guest gets.
+	if got := SSHKeyLines("", "# nothing yet\n\n"); len(got) != 0 {
+		t.Fatalf("got %#v, want no keys", got)
+	}
+	if got := SSHKeyLines("", "ssh-ed25519 AAAAONLY ci@example.com\n"); len(got) != 1 {
+		t.Fatalf("got %#v, want the store key alone", got)
+	}
+}

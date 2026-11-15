@@ -32,7 +32,7 @@ for a worker on this path.
 | 9 | SSH password authentication | TF `runcmd` + `ssh_pwauth` | **yes** | `ssh_pwauth: true` + drop-in |
 | 10 | sshd drop-in (pubkey, password, kbd-interactive, no root) | TF `runcmd` (sed on `sshd_config.d`) | **yes** | `/etc/ssh/sshd_config.d/01-k8s-auth.conf`, mode 0600 |
 | 11 | sshd `AllowUsers` sources (`allowed_ssh_ips`) | TF `runcmd` | **yes** | `bootstrap.sshAllowedSources[]`, each appended once |
-| 12 | SSH authorized key | TF `ssh_authorized_keys` | **yes** | `bootstrap.sshAuthorizedKey` |
+| 12 | SSH authorized key | TF `ssh_authorized_keys` | **yes** | `bootstrap.sshAuthorizedKey`, plus `bootstrap.sshAuthorizedKeysRef` for keys held in a ConfigMap/Secret (render 0.7.0) |
 | 13 | `systemctl restart sshd` | TF `runcmd` | **partial** | no restart in early boot: the drop-in is read by the next connection, and sshd is started by the image long after cloud-init wrote it |
 | 14 | `sssd` restart | TF `runcmd` | **n/a** | no sssd in this path |
 
@@ -138,7 +138,7 @@ installation policy:
 
 | Baseline variable | Controller |
 | --- | --- |
-| `vm_user_name`, `vm_user_password`, `vm_user_ssh_key` | `spec.bootstrap.osUser`, `osPasswordHash`, `sshAuthorizedKey` |
+| `vm_user_name`, `vm_user_password`, `vm_user_ssh_key` | `spec.bootstrap.osUser`, `osPasswordHash`, `sshAuthorizedKey` (+ `sshAuthorizedKeysRef` for a key store) |
 | `ssh_ips` | `spec.bootstrap.sshAllowedSources` |
 | `ntp.servers` | `spec.bootstrap.ntpServers`, default in `bootstrap.yaml` |
 | `ca_certs.trusted` | `spec.bootstrap.caBundleRef` / chart `bootstrap.caBundle` |

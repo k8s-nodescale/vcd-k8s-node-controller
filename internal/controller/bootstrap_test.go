@@ -426,3 +426,71 @@ func TestEffectiveBootstrapFullConfigRef(t *testing.T) {
 		t.Error("a full config still produced site values; the guest would load both")
 	}
 }
+
+// I-30: the keys live in a ConfigMap/Secret so they can be rotated without
+// editing the pool object. The inline key keeps working and comes first.
+func TestEffectiveBootstrapReadsSSHKeysFromTheStore(t *testing.T) {
+	const inline = "ssh-ed25519 AAAAINLINE ops@example.com"
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "worker-keys", Namespace: "cluster-a"},
+		Data: map[string][]byte{"authorized_keys": []byte(
+			"# rotated 2026-11\nssh-ed25519 AAAACI ci@example.com\nssh-rsa AAAABACKUP backup@example.com\n")},
+	}
+	configMap := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "worker-keys-cm", Namespace: "cluster-a"},
+		Data:       map[string]string{"authorized_keys": "ssh-ed25519 AAAACM cm@example.com\n"},
+	}
+
+	t.Run("secret in the pool namespace", func(t *testing.T) {
+		r := bootstrapReconciler(t, secret, configMap, installationConfigMap(t, ""))
+		got, err := r.effectiveBootstrap(context.Background(), bootstrapPool(infrav1.BootstrapConfig{
+			SSHAuthorizedKey:     inline,
+			SSHAuthorizedKeysRef: &infrav1.ConfigKeyRef{Kind: "Secret", Name: "worker-keys", Key: "authorized_keys"},
+		}))
+		if err != nil {
+			t.Fatalf("effectiveBootstrap: %v", err)
+		}
+		want := []string{inline, "ssh-ed25519 AAAACI ci@example.com", "ssh-rsa AAAABACKUP backup@example.com"}
+		if len(got.SSHAuthorizedKeys) != len(want) {
+			t.Fatalf("got %#v, want %#v", got.SSHAuthorizedKeys, want)
+		}
+		for i := range want {
+			if got.SSHAuthorizedKeys[i] != want[i] {
+				t.Errorf("key %d = %q, want %q", i, got.SSHAuthorizedKeys[i], want[i])
+			}
+		}
+	})
+
+	t.Run("configmap is the default kind", func(t *testing.T) {
+		r := bootstrapReconciler(t, secret, configMap, installationConfigMap(t, ""))
+		got, err := r.effectiveBootstrap(context.Background(), bootstrapPool(infrav1.BootstrapConfig{
+			SSHAuthorizedKeysRef: &infrav1.ConfigKeyRef{Name: "worker-keys-cm", Key: "authorized_keys"},
+		}))
+		if err != nil {
+			t.Fatalf("effectiveBootstrap: %v", err)
+		}
+		if len(got.SSHAuthorizedKeys) != 1 || got.SSHAuthorizedKeys[0] != "ssh-ed25519 AAAACM cm@example.com" {
+			t.Fatalf("got %#v, want the ConfigMap key alone", got.SSHAuthorizedKeys)
+		}
+	})
+
+	t.Run("a missing key names the field", func(t *testing.T) {
+		r := bootstrapReconciler(t, secret, installationConfigMap(t, ""))
+		_, err := r.effectiveBootstrap(context.Background(), bootstrapPool(infrav1.BootstrapConfig{
+			SSHAuthorizedKeysRef: &infrav1.ConfigKeyRef{Kind: "Secret", Name: "worker-keys", Key: "nope"},
+		}))
+		if err == nil || !strings.Contains(err.Error(), "spec.bootstrap.sshAuthorizedKeysRef") {
+			t.Fatalf("err = %v, want it to name spec.bootstrap.sshAuthorizedKeysRef", err)
+		}
+	})
+
+	t.Run("a missing secret names the field", func(t *testing.T) {
+		r := bootstrapReconciler(t, installationConfigMap(t, ""))
+		_, err := r.effectiveBootstrap(context.Background(), bootstrapPool(infrav1.BootstrapConfig{
+			SSHAuthorizedKeysRef: &infrav1.ConfigKeyRef{Kind: "Secret", Name: "absent", Key: "authorized_keys"},
+		}))
+		if err == nil || !strings.Contains(err.Error(), "spec.bootstrap.sshAuthorizedKeysRef") {
+			t.Fatalf("err = %v, want it to name spec.bootstrap.sshAuthorizedKeysRef", err)
+		}
+	})
+}

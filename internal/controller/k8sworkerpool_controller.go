@@ -1224,7 +1224,7 @@ func (r *WorkerPoolReconciler) createWorker(ctx context.Context, pool *infrav1.K
 		DNSServersLine:         strings.Join(pool.Spec.Bootstrap.DNS, " "),
 		OSUser:                 pool.Spec.Bootstrap.OSUser,
 		OSPasswordHash:         pool.Spec.Bootstrap.OSPasswordHash,
-		SSHAuthorizedKey:       pool.Spec.Bootstrap.SSHAuthorizedKey,
+		SSHAuthorizedKeys:      guest.SSHAuthorizedKeys,
 		SSHAllowedSources:      pool.Spec.Bootstrap.SSHAllowedSources,
 		K8sVersion:             pool.Spec.Bootstrap.K8sVersion,
 		K8sMinorRepo:           pool.Spec.Bootstrap.K8sMinorRepo,

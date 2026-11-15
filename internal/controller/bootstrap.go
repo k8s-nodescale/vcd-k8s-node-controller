@@ -31,6 +31,11 @@ type installationBootstrap struct {
 // installation defaults filled in and every ConfigMap/Secret reference replaced
 // by its content, ready for the renderer.
 type guestBootstrap struct {
+	// SSHAuthorizedKeys is the pool's inline key plus whatever
+	// spec.bootstrap.sshAuthorizedKeysRef holds, deduplicated. The SSH key is
+	// cluster identity, so unlike the other fields there is no
+	// installation-wide default for it.
+	SSHAuthorizedKeys      []string
 	NTPServers             []string
 	CACerts                []string
 	Sysctls                []string
@@ -99,15 +104,27 @@ func (r *WorkerPoolReconciler) effectiveBootstrap(ctx context.Context, pool *inf
 		}
 	}
 
+	// The key list is the one bootstrap input that is never taken from the
+	// installation ConfigMap: the account and its keys describe a cluster.
+	var refKeys string
+	if spec.SSHAuthorizedKeysRef != nil {
+		value, err := r.readRef(ctx, spec.SSHAuthorizedKeysRef, pool.Namespace)
+		if err != nil {
+			return guestBootstrap{}, fmt.Errorf("spec.bootstrap.sshAuthorizedKeysRef: %w", err)
+		}
+		refKeys = value
+	}
+
 	out := guestBootstrap{
-		NTPServers:    ntp,
-		CACerts:       certs,
-		Sysctls:       cloudinit.SysctlLines(sysctls),
-		SysctlNames:   cloudinit.SysctlNames(sysctls),
-		KernelModules: modules,
-		AptMirror:     aptMirror(apt),
-		AptSuites:     aptSuites(apt),
-		AptComponents: aptComponents(apt),
+		SSHAuthorizedKeys: cloudinit.SSHKeyLines(spec.SSHAuthorizedKey, refKeys),
+		NTPServers:        ntp,
+		CACerts:           certs,
+		Sysctls:           cloudinit.SysctlLines(sysctls),
+		SysctlNames:       cloudinit.SysctlNames(sysctls),
+		KernelModules:     modules,
+		AptMirror:         aptMirror(apt),
+		AptSuites:         aptSuites(apt),
+		AptComponents:     aptComponents(apt),
 	}
 	if containerd != nil && containerd.ConfigRef != nil {
 		full, err := r.readRef(ctx, containerd.ConfigRef, pool.Namespace)
