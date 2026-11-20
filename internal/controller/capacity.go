@@ -40,6 +40,33 @@ func cpuMHzPerCore(pool *infrav1.K8sWorkerPool, capacity cloud.PlatformCapacity)
 	return defaultCPUMHzPerCore
 }
 
+// cpuPerCore is how many vCPUs the pre-flight lets one physical core carry.
+//
+// Only a physical number may be overcommitted. A quota is what the platform will
+// actually grant, so dividing it would admit a request the platform then refuses
+// - exactly the failure the pre-flight exists to prevent. vCD's limit is a
+// quota; vSphere's is the hosts' own capacity.
+func cpuPerCore(pool *infrav1.K8sWorkerPool, capacity cloud.PlatformCapacity) int64 {
+	if !capacity.Physical {
+		return 1
+	}
+	if n := pool.Spec.Capacity.CPUPerCore; n != nil && *n > 1 {
+		return int64(*n)
+	}
+	return 1
+}
+
+// cpuChargeMHz is the MHz one vCPU is charged at: the core speed divided by the
+// overcommit assumption, rounded up so the charge is never optimistic.
+func cpuChargeMHz(pool *infrav1.K8sWorkerPool, capacity cloud.PlatformCapacity) int64 {
+	mhz := cpuMHzPerCore(pool, capacity)
+	ratio := cpuPerCore(pool, capacity)
+	if ratio <= 1 || mhz <= 0 {
+		return mhz
+	}
+	return (mhz + ratio - 1) / ratio
+}
+
 // capacityAllows runs the pre-flight for one request and returns why it does not
 // fit when it does not.
 //
@@ -62,11 +89,17 @@ func (r *WorkerPoolReconciler) capacityAllows(ctx context.Context, pool *infrav1
 			"pool", pool.Name, "error", err)
 		return true, ""
 	}
-	ok, short := capacity.Fits(req, cpuMHzPerCore(pool, capacity))
+	ok, short := capacity.Fits(req, cpuChargeMHz(pool, capacity))
 	if ok {
 		return true, ""
 	}
-	return false, strings.Join(short, "; ")
+	why := strings.Join(short, "; ")
+	// The shortfall is stated in the charge the gate used; say which assumption
+	// that was, or the number looks like a plain core speed.
+	if ratio := cpuPerCore(pool, capacity); ratio > 1 {
+		why += fmt.Sprintf(" (CPU charged at %d vCPU : 1 core)", ratio)
+	}
+	return false, why
 }
 
 // workerCapacityRequest is the capacity one new worker of this pool adds.

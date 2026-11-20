@@ -88,6 +88,9 @@ func (p *Provider) Capacity(ctx context.Context) (cloud.PlatformCapacity, error)
 	out := cloud.PlatformCapacity{Model: model}
 	out.Datacenter = p.placement.Datacenter
 	out.Cluster = p.placement.Cluster
+	// The hosts of the cluster are the numbers: real cores, real memory. The
+	// pre-flight may therefore apply an overcommit assumption to them.
+	out.Physical = true
 	usable := 0
 	for i := range mhs {
 		m := &mhs[i]

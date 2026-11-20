@@ -56,6 +56,11 @@ func (r *WorkerPoolReconciler) refreshCapacityStatus(ctx context.Context, pool *
 			snap.Model = capacity.Model
 			snap.Datacenter = capacity.Datacenter
 			snap.Cluster = capacity.Cluster
+			// The assumption the pre-flight is applying, published so the page
+			// explains the same arithmetic instead of guessing it.
+			snap.Physical = capacity.Physical
+			snap.CPUMHzPerCore = cpuMHzPerCore(pool, capacity)
+			snap.CPUPerCore = int32(cpuPerCore(pool, capacity))
 			snap.CPUMHz = capacity.CPU.Used
 			snap.CPULimitMHz = capacity.CPU.Limit
 			snap.MemoryMB = capacity.MemoryMB.Used

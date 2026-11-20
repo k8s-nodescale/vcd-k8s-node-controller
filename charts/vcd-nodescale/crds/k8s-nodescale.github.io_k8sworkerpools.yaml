@@ -296,6 +296,26 @@ spec:
                     format: int64
                     minimum: 100
                     type: integer
+                  cpuPerCore:
+                    default: 1
+                    description: |-
+                      CPUPerCore is how many vCPUs the pre-flight lets one physical core carry,
+                      where the platform reports physical capacity (vSphere: the hosts of the
+                      pool's compute cluster). That number is a capacity the owner may choose to
+                      overcommit, and this field is that choice: 1 charges a worker its whole
+                      vCPU count in core speed, 2 charges half of it, and so on. It is ignored
+                      where the platform reports a quota instead (vCD), because dividing a quota
+                      would admit a request the platform then refuses - the failure the
+                      pre-flight exists to prevent.
+
+                      It changes only when a create is considered to fit. It never changes the
+                      size of a worker, never evicts one, and lowering it while workers are
+                      Queued simply leaves them queued. An unset value is 1, which is the
+                      pre-flight as it behaved before the field existed.
+                    format: int32
+                    maximum: 8
+                    minimum: 1
+                    type: integer
                   preflight:
                     default: true
                     description: |-
@@ -637,6 +657,10 @@ spec:
                       many is refused; writing off a slot whose VM is already gone takes
                       nothing out of service and is never refused by the floor. It defaults to
                       1: emptying the pool has to be asked for with minReplicas: 0.
+
+                      No omitempty: 0 is a meaningful floor ("the pool may be emptied"), and a
+                      field dropped from the payload would come back as the default 1 on the
+                      next write.
                     format: int32
                     minimum: 0
                     type: integer
@@ -652,6 +676,8 @@ spec:
                       bypassed. Set this where a PDB must never be overridden and a human
                       should decide.
                     type: boolean
+                required:
+                - minReplicas
                 type: object
               vcd:
                 description: |-
@@ -771,6 +797,17 @@ spec:
                       it enforces.
                     format: int64
                     type: integer
+                  cpuMHzPerCore:
+                    format: int64
+                    type: integer
+                  cpuPerCore:
+                    description: |-
+                      CPUPerCore is the overcommit assumption the pre-flight is using, and
+                      CPUMHzPerCore the core speed it charges a vCPU at. They are published so
+                      the page explains the same arithmetic the gate applies, instead of
+                      guessing it.
+                    format: int32
+                    type: integer
                   datacenter:
                     description: |-
                       Datacenter and Cluster name the scope the numbers above are read from,
@@ -822,6 +859,13 @@ spec:
                       what makes "refresh after a scale completed" decidable.
                     format: int32
                     type: integer
+                  physical:
+                    description: |-
+                      Physical says the CPU and memory numbers above are the physical capacity
+                      of the hosts (vSphere), not a quota the platform enforces (vCD). Only a
+                      physical number may be overcommitted; the page offers the assumption only
+                      when this is true.
+                    type: boolean
                   podBlockSize:
                     description: |-
                       PodBlockSize and PodUsablePerBlock describe the CNI's block: a /26 is 64

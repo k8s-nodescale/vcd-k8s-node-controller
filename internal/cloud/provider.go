@@ -136,9 +136,14 @@ type PlatformCapacity struct {
 	// empty on vCD, where the vDC is the whole scope.
 	Datacenter string
 	Cluster    string
-	CPU        ResourceCapacity // MHz
-	MemoryMB   ResourceCapacity // MB
-	Storage    []StorageProfileCapacity
+	// Physical says CPU and memory are the physical capacity of those hosts
+	// (vSphere), not a quota the platform enforces (vCD). An overcommit
+	// assumption may only be applied to a physical number: dividing a quota
+	// would admit a request the platform then refuses.
+	Physical bool
+	CPU      ResourceCapacity // MHz
+	MemoryMB ResourceCapacity // MB
+	Storage  []StorageProfileCapacity
 	// Datastores are the datastores the scope makes available to a clone,
 	// one entry per datastore, the pool's own marked Default. It is the list
 	// behind the storage bar: the bar shows the datastore a worker is written

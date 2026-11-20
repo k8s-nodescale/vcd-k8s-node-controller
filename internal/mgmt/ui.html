@@ -177,6 +177,29 @@
   .capnote.ind { margin-left: calc(var(--caplbl) + 8px); }
   /* the CIDR a note is about, in the colour the bars use for "room left" */
   .cidr { color: var(--ok); }
+  /* the "+N" of one dimension: how many more workers it alone would admit. The
+     binding one is the reason the pool stops where it does, so it takes the
+     accent. */
+  .fit { flex: 0 0 auto; font-size: 10px; line-height: 15px; color: var(--muted);
+         border: 1px solid var(--line); border-radius: 999px; padding: 0 6px;
+         white-space: nowrap; }
+  .fit.bind { color: var(--accent); border-color: var(--accent); font-weight: 600; }
+  /* the one sentence the pane answers, and the assumption behind its CPU half */
+  .fitline { display: flex; align-items: center; justify-content: space-between; gap: 10px;
+             flex-wrap: wrap; margin-top: 10px; padding-top: 9px;
+             border-top: 1px solid var(--line); }
+  .fitline b { font-size: 13px; }
+  .fitline .bind { color: var(--accent); font-weight: 600; }
+  .sw { display: inline-flex; align-items: center; gap: 8px; margin: 0;
+        background: var(--flagbg); border: 1px solid var(--line); border-radius: 999px;
+        padding: 3px 10px; font-size: 11px; color: var(--fg); cursor: pointer; }
+  .sw input { accent-color: var(--accent); margin: 0; }
+  .info.qbtn { padding: 0; background: none; font-family: inherit; }
+  .fitbox { margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--line); }
+  .fitbox table { width: 100%; border-collapse: collapse; font-size: 11px; }
+  .fitbox td { padding: 3px 0; border-top: 1px solid var(--line); color: var(--muted); }
+  .fitbox tr:first-child td { border-top: 0; }
+  .fitbox td:last-child { text-align: right; color: var(--fg); white-space: nowrap; }
   /* the datastore list behind the storage bar: the button sits in the label,
      the list three rows tall under the row and scrolls past that */
   .caplbl .more { margin-left: 2px; padding: 0 3px; border: 0; background: none;
@@ -432,7 +455,7 @@
   } catch (e) {}
   var state = { pools: [], current: null, stamp: "", stale: false, me: null, draft: null,
                 flavorDraft: null, flavorEdit: false, pendingDelete: null, diskDraft: null,
-                pendingDisks: null,
+                pendingDisks: null, fitOpen: false,
                 flags: { taints: false, volumes: false, sts: false, dense: false, ds: false } };
   var pick = document.getElementById("poolPick");
 
@@ -595,7 +618,7 @@
     return decimals ? v.toFixed(decimals) : String(Math.round(v));
   }
 
-  function capRow(label, share, used, limit, unit, decimals) {
+  function capRow(label, share, used, limit, unit, decimals, fit, isBind) {
     var pct = share && share.percent != null ? share.percent : null;
     var cls = share && share.level === "high" ? "d-high" : share && share.level === "warn" ? "d-warn" : "d-ok";
     var text = pct == null ? "–" : pct.toFixed(0) + "%";
@@ -604,32 +627,50 @@
       : capNumber(used, decimals) + " / " + capNumber(limit, decimals) + " " + unit;
     return '<div class="caprow"><span class="caplbl">' + label + "</span>" +
       '<span class="dbar ' + cls + '"><i style="width:' + (pct || 0) + '%"></i><b>' + text + "</b></span>" +
-      '<span class="capnum">' + num + "</span></div>";
+      '<span class="capnum">' + num + "</span>" + fitChip(fit, isBind) + "</div>";
   }
 
-  // podRow counts the pod network in nodes rather than in addresses: 110 pods
-  // per node is the kubelet default, so the range carries IPs/110 nodes, and
-  // each node that exists takes one slot. The slots are drawn one per node the
-  // range can carry, filled for the nodes that are already there.
-  function podRow(c) {
+  // fitChip is one dimension's own answer: how many more workers it alone would
+  // admit. The binding one is why the pool stops where it does, so that is the
+  // one the accent lands on.
+  function fitChip(n, isBind) {
+    if (n == null || n === undefined) { return ""; }
+    return '<span class="fit' + (isBind ? " bind" : "") + '">+' + n + "</span>";
+  }
+
+  // podCalc is the pod network counted in nodes rather than in addresses: 110
+  // pods per node is the kubelet default, so the range carries IPs/110 nodes and
+  // each node that exists takes one slot. Shared by the row that draws the slots
+  // and the fit that counts them, so the two cannot disagree.
+  function podCalc(c) {
     var usable = c.podUsablePerBlock || 0;
     var blockAddr = c.podBlockSize > 0 ? Math.pow(2, 32 - c.podBlockSize) : 0;
     var blocks = c.podBlocks || 0;
     var nodes = c.podNodes || 0;
     var dense = !!state.flags.dense;
 
-    // Blocks a node needs: the kubelet ceiling when the operator says every
-    // node may run 110 pods, otherwise what the fullest node carries today.
+    // Blocks a node needs: the kubelet ceiling when the operator says every node
+    // may run 110 pods, otherwise what the fullest node carries today.
     var perNode = 1;
     if (usable > 0) {
       perNode = dense
         ? Math.max(1, Math.ceil(110 / usable))
         : Math.max(1, Math.ceil(Math.max(c.podMaxPerNode || 1, 1) / usable));
     }
-
     var capacity = blocks > 0 ? Math.floor(blocks / perNode) : 0;
     var assigned = Math.min(nodes, capacity);
-    var free = Math.max(0, capacity - assigned);
+    return {
+      usable: usable, blockAddr: blockAddr, blocks: blocks, nodes: nodes, dense: dense,
+      perNode: perNode, capacity: capacity, assigned: assigned,
+      free: Math.max(0, capacity - assigned)
+    };
+  }
+
+  function podRow(c, dims, bind) {
+    var pc = podCalc(c);
+    var usable = pc.usable, blockAddr = pc.blockAddr, blocks = pc.blocks;
+    var dense = pc.dense, perNode = pc.perNode;
+    var capacity = pc.capacity, assigned = pc.assigned, free = pc.free;
 
     var segs = "";
     if (capacity > 0 && capacity <= 48) {
@@ -656,6 +697,7 @@
         '<span class="caplbl"></span>' +
         '<span class="pslots">' + segs + "</span>" +
         '<span class="capnum">' + assigned + " / " + capacity + " nodes</span>" +
+        (capacity > 0 ? fitChip(free, !!bind && bind.key === "pod network") : "") +
       "</div>" +
       '<div class="caprow podfoot">' +
         '<span class="capfree"><b>Remaining Capacity ' + free + (free === 1 ? " Node" : " Nodes") + "</b>" +
@@ -668,7 +710,7 @@
   // The capacity pane answers one question: does another worker fit. The
   // numbers come from the pool status, which the controller writes from the
   // platform, so they are as fresh as the last scale operation.
-  function ipRow(p) {
+  function ipRow(p, dims, bind) {
     var used = p.ipWindowUsed || 0;
     var size = p.ipWindowSize || 0;
     if (!p.ipNetwork || size <= 0) { return ""; }
@@ -705,6 +747,7 @@
         '<span class="caplbl"></span>' +
         '<span class="dbar d-' + lvl + '"><i style="width:' + share.toFixed(1) + '%"></i></span>' +
         '<span class="capnum">' + used + " / " + size + " workers</span>" +
+        fitChip(Math.max(0, size - used), !!bind && bind.key === "addresses") +
       "</div>" + note;
   }
 
@@ -953,17 +996,29 @@
       box.innerHTML = '<span class="small muted">the controller has not published a capacity snapshot yet</span>';
       return;
     }
+    // Per-dimension answers first, then the smallest one: that number, and the
+    // dimension it came from, is what the pane is read for.
+    var dims = fitDims(p, c);
+    var fit = dims.length ? dims[0].n : null;
+    var bind = dims.length ? dims[0] : null;
+    for (var i = 1; i < dims.length; i++) {
+      if (dims[i].n < fit) { fit = dims[i].n; bind = dims[i]; }
+    }
+
     var rows = [
-      capRow("vCPU", c.cpu, c.cpuMHz / 1000, c.cpuLimitMHz / 1000, "GHz", 1),
-      capRow("RAM", c.memory, c.memoryMB / 1024, c.memoryLimitMB / 1024, "GB", 0),
-      storageRow(c)
+      capRow("vCPU" + cpuTip(c), c.cpu, c.cpuMHz / 1000, c.cpuLimitMHz / 1000, "GHz", 1,
+        c.fit && c.fit.cpu, bind && bind.key === "vCPU"),
+      capRow("RAM", c.memory, c.memoryMB / 1024, c.memoryLimitMB / 1024, "GB", 0,
+        c.fit && c.fit.memory, bind && bind.key === "RAM"),
+      storageRow(c, c.fit && c.fit.storage, bind && bind.key === "storage")
     ];
     if (p && p.ipNetwork) {
-      rows.push(ipRow(p));
+      rows.push(ipRow(p, dims, bind));
     }
     if (c.podCIDR) {
-      rows.push(podRow(c));
+      rows.push(podRow(c, dims, bind));
     }
+    rows.push(fitLine(p, c, dims, fit, bind));
     if (c.storageName && !(c.datastores && c.datastores.length)) {
       // With a datastore inventory the datastore in use is the tinted row behind
       // "...", so this note would only repeat it. A vCD storage profile has no
@@ -983,6 +1038,104 @@
         renderCapacity(p);
       };
     }
+    var fq = document.getElementById("fitq");
+    if (fq) {
+      fq.onclick = function () {
+        state.fitOpen = !state.fitOpen;
+        renderCapacity(p);
+      };
+    }
+    var assum = document.getElementById("cpuAssum");
+    if (assum) {
+      // The switch is a pool setting, not a local preference: the pre-flight
+      // reads the same field, so the number on screen and the number that admits
+      // a worker cannot disagree.
+      assum.onchange = function () {
+        post("cpu-per-core", { cpuPerCore: assum.checked ? 2 : 1 });
+      };
+    }
+  }
+
+  // fitDims is what the page knows about "how many more": the three the
+  // controller publishes (CPU at the pre-flight's own assumption, memory, disk)
+  // plus the two the page already counts - pod blocks and addresses in the ip
+  // range. A dimension that cannot be measured is left out, because a missing
+  // number must not become the reason the pool stops.
+  function fitDims(p, c) {
+    var out = [];
+    var f = c.fit || {};
+    if (f.cpu != null) {
+      out.push({ key: "vCPU", n: f.cpu, basis: cpuCharge(c) });
+    }
+    if (f.memory != null) {
+      out.push({ key: "RAM", n: f.memory,
+        basis: (f.memoryPerWorkerMB / 1024).toFixed(0) + " GB per worker, the flavour's allocation" });
+    }
+    if (f.storage != null) {
+      out.push({ key: "storage", n: f.storage,
+        basis: (f.diskPerWorkerMB / 1024).toFixed(0) + " GB provisioned per worker" });
+    }
+    if (c.podCIDR) {
+      var pc = podCalc(c);
+      if (pc.capacity > 0) {
+        out.push({ key: "pod network", n: pc.free, basis: "nodes the pod CIDR can still carry" });
+      }
+    }
+    if (p && p.ipWindowSize > 0) {
+      out.push({ key: "addresses", n: Math.max(0, p.ipWindowSize - (p.ipWindowUsed || 0)),
+        basis: "addresses free in the ip range" });
+    }
+    return out;
+  }
+
+  // cpuCharge describes the one number the CPU fit rests on, in the terms the
+  // pre-flight uses.
+  function cpuCharge(c) {
+    var f = c.fit || {};
+    var ratio = c.cpuPerCore || 1;
+    var s = ((f.cpuPerWorkerMHz || 0) / 1000).toFixed(1) + " GHz per worker";
+    if (ratio > 1) { s += " (" + ratio + " vCPU : 1 core)"; }
+    return s;
+  }
+
+  function cpuTip(c) {
+    var ratio = c.cpuPerCore || 1;
+    var mhz = (c.fit && c.fit.cpuPerWorkerMHz) || 0;
+    return tip("One worker is charged " + (mhz / 1000).toFixed(1) +
+      " GHz of the cluster's free CPU" +
+      (ratio > 1 ? " (vCPUs are counted " + ratio + " per physical core: spec.capacity.cpuPerCore)"
+                 : " (one vCPU per physical core)") +
+      ". CPU may be oversubscribed; memory and disk are charged in full.");
+  }
+
+  // fitLine is the one sentence the pane exists to answer, plus the assumption
+  // behind the CPU half of it. The assumption is offered only where the platform
+  // reports physical capacity: a quota cannot be overcommitted.
+  function fitLine(p, c, dims, fit, bind) {
+    if (fit == null) { return ""; }
+    var s = '<div class="fitline"><span>FITS <b>' + fit + "</b> MORE WORKER" + (fit === 1 ? "" : "S") +
+      " \u00b7 limited by <span class=\"bind\">" + esc(bind.key) + "</span> " +
+      '<button class="info sm qbtn" type="button" id="fitq" title="how the number is computed">?</button></span>';
+    if (c.physical) {
+      s += '<label class="sw" title="how many vCPUs the pre-flight lets one physical core carry: 1 charges a worker its whole vCPU count in core speed, 2 charges half of it">' +
+        "<span>Assume 2 vCPU : 1 core</span>" +
+        '<input type="checkbox" id="cpuAssum"' + ((c.cpuPerCore || 1) >= 2 ? " checked" : "") + "></label>";
+    }
+    s += "</div>";
+    if (state.fitOpen) { s += fitBox(dims, fit, c); }
+    return s;
+  }
+
+  function fitBox(dims, fit, c) {
+    var rows = dims.map(function (d) {
+      return "<tr><td>" + esc(d.key) + ' <span class="muted">- ' + esc(d.basis) + "</span></td>" +
+        "<td>+" + d.n + "</td></tr>";
+    });
+    return '<div class="fitbox"><table>' + rows.join("") +
+      "<tr><td><b>fits</b> - the smallest of the five</td><td><b>+" + fit + "</b></td></tr></table>" +
+      '<div class="capnote">The compute numbers are the hosts\u2019 free capacity, shared with every other VM on them: what the cluster can still absorb, not a quota for this pool.' +
+      ((c.cpuPerCore || 1) > 2 ? " spec.capacity.cpuPerCore is " + c.cpuPerCore + "; this page toggles 1 and 2." : "") +
+      "</div></div>";
   }
 
   // setCapTitle names the scope the numbers come from. On vSphere that is a
@@ -1006,14 +1159,14 @@
   // storageRow is capRow with the datastore inventory behind it: the bar can
   // only show the datastore a worker is written to, the "..." opens the list of
   // what the cluster offers. The list is three rows tall and scrolls.
-  function storageRow(c) {
+  function storageRow(c, fitN, isBind) {
     var list = c.datastores || [];
     var label = "Storage";
     if (list.length) {
       label += ' <button class="more" id="dsMore" type="button" aria-expanded="' +
         (state.flags.ds ? "true" : "false") + '" title="datastores this cluster offers">\u2026</button>';
     }
-    var row = capRow(label, c.storage, c.storageMB / 1024, c.storageLimitMB / 1024, "GB", 0);
+    var row = capRow(label, c.storage, c.storageMB / 1024, c.storageLimitMB / 1024, "GB", 0, fitN, isBind);
     if (list.length && state.flags.ds) {
       row += dsBox(list);
     }

@@ -188,6 +188,7 @@ One `K8sWorkerPool` describes the worker set of a single cluster. You own
 | `provisioning.timeout` | no | How long a VM may run without its Kubernetes Node before the worker is parked as `Failed` (default `15m`). The VM is kept for inspection and the pool reports `Ready=False`/`WorkerFailed`; a registration that arrives later still promotes the worker to `Ready`. |
 | `capacity.preflight` | no | Read the vDC's free capacity before a create or a resize and park work that cannot fit (default `true`). See [When the vDC is full](#when-the-vdc-is-full). |
 | `capacity.cpuMhzPerCore` | no | MHz per vCPU used for the CPU estimate when the vDC does not report its own speed to the controller account (default `2000`). The admin view of the vDC is read once; a tenant account that cannot read it falls back to this number. |
+| `capacity.cpuPerCore` | no | How many vCPUs the pre-flight lets one **physical** core carry, where the platform reports physical capacity (vSphere). `1` (default) charges a worker its whole vCPU count in core speed, `2` charges half of it. Ignored where the limit is a quota (vCD). See [Overcommitting CPU](#overcommitting-cpu-where-the-limit-is-physical-vsphere). |
 
 #### Platform providers
 
@@ -1144,6 +1145,42 @@ The system disk of a new worker is `spec.flavor.osDiskGB`. When that is unset th
 clone keeps the template size, which the controller cannot read here, so it uses
 an existing worker's `status.nodes[].flavor.osDiskGB` as the estimate (0 until
 the pool has one).
+
+#### Overcommitting CPU where the limit is physical (vSphere)
+
+On vSphere the CPU limit is the real capacity of the pool's compute-cluster
+hosts, and vSphere will not stop you from putting more vCPUs on those hosts than
+they have cores. That is a decision the owner makes, and `capacity.cpuPerCore` is
+where it is recorded: `1` (the default) charges one worker its whole vCPU count in
+core speed - `6 vCPU x 2600 MHz = 15.6 GHz` - and `2` charges half of it, so the
+same free capacity admits twice as many workers.
+
+```
+spec:
+  capacity:
+    cpuPerCore: 2     # 2 vCPU per physical core; 1 is the default (no overcommit)
+```
+
+Three properties worth knowing:
+
+- It only changes the admission check. No worker is resized, none is removed, and
+  a slot parked as `Queued` starts on the next pass once the assumption makes it
+  fit. Lowering it never evicts anything: queued slots simply stay queued.
+- It is ignored where the limit is a quota rather than physical capacity (vCD).
+  Dividing a quota would admit a request the platform then refuses, which is the
+  failure the pre-flight exists to prevent.
+- The charge is the core speed divided by the assumption, rounded **up**, and the
+  shortfall message names it: `CPU: 6 vCPU at 1300 MHz need 7800 MHz, 34700 MHz
+  free (CPU charged at 2 vCPU : 1 core)`. Without the note, `1300 MHz` reads like
+  a core speed that does not exist.
+
+Memory and disk are never overcommitted here: their charge is the flavour's
+allocation in full, because a VM that cannot get its pages stalls and a thin disk
+that fills stops the datastore - neither is a recoverable scheduling choice.
+
+The page offers the same setting as `Assume 2 vCPU : 1 core` beside its fit line
+and writes this field, so the number it shows and the number that admits a worker
+cannot disagree.
 
 #### When a worker never registers
 

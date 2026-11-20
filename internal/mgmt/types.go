@@ -228,6 +228,16 @@ type Capacity struct {
 	PodUsablePerBlock int32  `json:"podUsablePerBlock,omitempty"`
 	PodMaxPerNode     int32  `json:"podMaxPerNode,omitempty"`
 	At                string `json:"at,omitempty"`
+	// CPUPerCore is the overcommit assumption the pre-flight is using: how many
+	// vCPUs it lets one physical core carry. 1 is a vCPU per core.
+	CPUPerCore int32 `json:"cpuPerCore,omitempty"`
+	// Physical says the CPU and memory numbers are the hosts' own capacity
+	// (vSphere) rather than a quota (vCD); the assumption above applies only
+	// here, and the page offers to change it only here.
+	Physical bool `json:"physical,omitempty"`
+	// Fit is how many more workers of this pool's flavour still fit, per
+	// dimension. The page shows the smallest and names the dimension.
+	Fit *Fit `json:"fit,omitempty"`
 
 	CPU     *Share `json:"cpu,omitempty"`
 	Memory  *Share `json:"memory,omitempty"`
@@ -235,6 +245,26 @@ type Capacity struct {
 	// Datastores is the storage inventory of the scope, shown next to the
 	// single storage bar; empty where the platform has no such list.
 	Datastores []Datastore `json:"datastores,omitempty"`
+}
+
+// Fit is how many more workers of one flavour the platform has room for, in the
+// terms each dimension is actually limited by. A nil number means the dimension
+// is not limited (or not measurable), which the page shows as unknown rather
+// than as zero.
+//
+// The three numbers are not the same kind of promise: CPU can be oversubscribed
+// by the assumption in Capacity.CPUPerCore, while memory and disk are the
+// flavour's allocation in full, because overcommitting those is not a policy
+// but a failure mode.
+type Fit struct {
+	CPU     *int32 `json:"cpu,omitempty"`
+	Memory  *int32 `json:"memory,omitempty"`
+	Storage *int32 `json:"storage,omitempty"`
+	// The charge behind each number, so the page can explain it: MHz of CPU,
+	// MB of memory and MB of provisioned disk one worker costs.
+	CPUPerWorkerMHz   int64 `json:"cpuPerWorkerMHz,omitempty"`
+	MemoryPerWorkerMB int64 `json:"memoryPerWorkerMB,omitempty"`
+	DiskPerWorkerMB   int64 `json:"diskPerWorkerMB,omitempty"`
 }
 
 // Datastore is one datastore the pool's cluster offers: what it holds, what is

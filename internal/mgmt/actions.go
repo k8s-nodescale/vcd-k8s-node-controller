@@ -142,6 +142,25 @@ func (s *Server) DeleteWorkers(ctx context.Context, name string, workers []strin
 	})
 }
 
+// SetCPUPerCore records how many vCPUs the pre-flight lets one physical core
+// carry. It changes only the admission check: no worker is resized, none is
+// removed, and a worker parked as Queued starts on the next pass if the new
+// assumption now fits it.
+//
+// The range is the field's own (1..8). A platform that reports a quota instead
+// of physical capacity ignores the value, and the controller is the only place
+// that decides which is which, so a write here is never refused for it.
+func (s *Server) SetCPUPerCore(ctx context.Context, name string, perCore int32) error {
+	if perCore < 1 || perCore > 8 {
+		return fmt.Errorf("%w: cpuPerCore must be between 1 and 8", ErrInvalid)
+	}
+	return s.update(ctx, name, fmt.Sprintf("cpuPerCore=%d", perCore), func(p *infrav1.K8sWorkerPool) error {
+		v := perCore
+		p.Spec.Capacity.CPUPerCore = &v
+		return nil
+	})
+}
+
 func containsName(list []string, name string) bool {
 	for _, v := range list {
 		if v == name {

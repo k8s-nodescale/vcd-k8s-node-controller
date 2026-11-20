@@ -70,6 +70,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST "+p+"/api/pools/{name}/flavor", s.postFlavor)
 	mux.HandleFunc("POST "+p+"/api/pools/{name}/delete-workers", s.postDeleteWorkers)
 	mux.HandleFunc("POST "+p+"/api/pools/{name}/disks", s.postDisks)
+	mux.HandleFunc("POST "+p+"/api/pools/{name}/cpu-per-core", s.postCPUPerCore)
 	if p != "" {
 		mux.HandleFunc("GET "+p, func(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, p+"/", http.StatusFound)
@@ -242,6 +243,21 @@ func (s *Server) postDisks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) postCPUPerCore(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		CPUPerCore int32 `json:"cpuPerCore"`
+	}
+	if err := decode(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := s.SetCPUPerCore(r.Context(), r.PathValue("name"), body.CPUPerCore); err != nil {
+		writeError(w, statusFor(err), err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "cpuPerCore": body.CPUPerCore})
 }
 
 func (s *Server) postDeleteWorkers(w http.ResponseWriter, r *http.Request) {

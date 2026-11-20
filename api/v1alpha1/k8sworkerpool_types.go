@@ -172,6 +172,25 @@ type CapacityPolicy struct {
 	// +kubebuilder:default=2000
 	// +optional
 	CPUMHzPerCore int64 `json:"cpuMhzPerCore,omitempty"`
+
+	// CPUPerCore is how many vCPUs the pre-flight lets one physical core carry,
+	// where the platform reports physical capacity (vSphere: the hosts of the
+	// pool's compute cluster). That number is a capacity the owner may choose to
+	// overcommit, and this field is that choice: 1 charges a worker its whole
+	// vCPU count in core speed, 2 charges half of it, and so on. It is ignored
+	// where the platform reports a quota instead (vCD), because dividing a quota
+	// would admit a request the platform then refuses - the failure the
+	// pre-flight exists to prevent.
+	//
+	// It changes only when a create is considered to fit. It never changes the
+	// size of a worker, never evicts one, and lowering it while workers are
+	// Queued simply leaves them queued. An unset value is 1, which is the
+	// pre-flight as it behaved before the field existed.
+	// +kubebuilder:default=1
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=8
+	// +optional
+	CPUPerCore *int32 `json:"cpuPerCore,omitempty"`
 }
 
 // ProvisioningPolicy bounds how long a created VM may run without its Node.
@@ -686,6 +705,20 @@ type CapacityStatus struct {
 	StorageMB      int64 `json:"storageMB,omitempty"`
 	StorageLimitMB int64 `json:"storageLimitMB,omitempty"`
 
+	// CPUPerCore is the overcommit assumption the pre-flight is using, and
+	// CPUMHzPerCore the core speed it charges a vCPU at. They are published so
+	// the page explains the same arithmetic the gate applies, instead of
+	// guessing it.
+	// +optional
+	CPUPerCore int32 `json:"cpuPerCore,omitempty"`
+	// +optional
+	CPUMHzPerCore int64 `json:"cpuMHzPerCore,omitempty"`
+	// Physical says the CPU and memory numbers above are the physical capacity
+	// of the hosts (vSphere), not a quota the platform enforces (vCD). Only a
+	// physical number may be overcommitted; the page offers the assumption only
+	// when this is true.
+	// +optional
+	Physical bool `json:"physical,omitempty"`
 	// Datacenter and Cluster name the scope the numbers above are read from,
 	// where the platform has one. On vSphere it is the compute cluster: its
 	// hosts are the compute a pool may use and its datastores are the storage,
