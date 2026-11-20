@@ -761,6 +761,8 @@ spec:
                     description: At is when the snapshot was taken.
                     format: date-time
                     type: string
+                  cluster:
+                    type: string
                   cpuLimitMHz:
                     format: int64
                     type: integer
@@ -769,6 +771,41 @@ spec:
                       it enforces.
                     format: int64
                     type: integer
+                  datacenter:
+                    description: |-
+                      Datacenter and Cluster name the scope the numbers above are read from,
+                      where the platform has one. On vSphere it is the compute cluster: its
+                      hosts are the compute a pool may use and its datastores are the storage,
+                      not the datacenter's. Empty on vCD, whose scope is the whole vDC.
+                    type: string
+                  datastores:
+                    description: |-
+                      Datastores is the storage the scope makes available, one entry per
+                      datastore, the pool's own marked Default. It answers "what else is
+                      there" next to the single bar, which can only show the one a worker is
+                      written to.
+                    items:
+                      description: |-
+                        DatastoreCapacity is one datastore of the scope, in the same units as the
+                        storage bar: what it holds and what is already written to it.
+                      properties:
+                        capacityMB:
+                          format: int64
+                          type: integer
+                        default:
+                          description: |-
+                            Default marks the datastore the pool names in spec.vsphere.datastore:
+                            the one a clone is written to.
+                          type: boolean
+                        name:
+                          type: string
+                        usedMB:
+                          format: int64
+                          type: integer
+                      required:
+                      - name
+                      type: object
+                    type: array
                   memoryLimitMB:
                     format: int64
                     type: integer

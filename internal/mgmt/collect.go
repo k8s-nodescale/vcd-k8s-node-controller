@@ -372,6 +372,8 @@ func (c *Collector) poolView(ctx context.Context, p *infrav1.K8sWorkerPool, byNo
 	if cap := p.Status.Capacity; cap != nil {
 		view.Capacity = &Capacity{
 			Model:             cap.Model,
+			Datacenter:        cap.Datacenter,
+			Cluster:           cap.Cluster,
 			CPUMHz:            cap.CPUMHz,
 			CPULimitMHz:       cap.CPULimitMHz,
 			MemoryMB:          cap.MemoryMB,
@@ -392,6 +394,15 @@ func (c *Collector) poolView(ctx context.Context, p *infrav1.K8sWorkerPool, byNo
 			CPU:               shareOf(cap.CPUMHz, cap.CPULimitMHz),
 			Memory:            shareOf(cap.MemoryMB, cap.MemoryLimitMB),
 			Storage:           shareOf(cap.StorageMB, cap.StorageLimitMB),
+		}
+		for _, d := range cap.Datastores {
+			view.Capacity.Datastores = append(view.Capacity.Datastores, Datastore{
+				Name:       d.Name,
+				Default:    d.Default,
+				CapacityMB: d.CapacityMB,
+				UsedMB:     d.UsedMB,
+				Share:      shareOf(d.UsedMB, d.CapacityMB),
+			})
 		}
 	}
 

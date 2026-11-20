@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/vmware/govmomi"
 	"github.com/vmware/govmomi/vim25/mo"
 	"github.com/vmware/govmomi/vim25/types"
 
@@ -76,7 +77,7 @@ func (p *Provider) Capacity(ctx context.Context) (cloud.PlatformCapacity, error)
 	}
 	var mhs []mo.HostSystem
 	if len(refs) > 0 {
-		if err := cl.Retrieve(ctx, refs, []string{"name", "summary"}, &mhs); err != nil {
+		if err := cl.Retrieve(ctx, refs, []string{"name", "summary", "datastore"}, &mhs); err != nil {
 			return cloud.PlatformCapacity{}, fmt.Errorf("vsphere: read hosts of cluster %q: %w", p.placement.Cluster, err)
 		}
 	}
@@ -85,6 +86,8 @@ func (p *Provider) Capacity(ctx context.Context) (cloud.PlatformCapacity, error)
 	sort.Slice(mhs, func(i, j int) bool { return mhs[i].Name < mhs[j].Name })
 
 	out := cloud.PlatformCapacity{Model: model}
+	out.Datacenter = p.placement.Datacenter
+	out.Cluster = p.placement.Cluster
 	usable := 0
 	for i := range mhs {
 		m := &mhs[i]
@@ -124,7 +127,116 @@ func (p *Provider) Capacity(ctx context.Context) (cloud.PlatformCapacity, error)
 			UsedMB:  (mds.Summary.Capacity - mds.Summary.FreeSpace) / mb,
 		}}
 	}
+
+	dss, err := datastoresOf(ctx, cl, mhs, ds.Reference())
+	if err != nil {
+		return cloud.PlatformCapacity{}, fmt.Errorf("vsphere: datastores of cluster %q: %w", p.placement.Cluster, err)
+	}
+	out.Datastores = dss
 	return out, nil
+}
+
+// datastoresOf lists the datastores a clone of this scope can land on: the ones
+// every usable host of the cluster mounts, because vCenter may place the VM on
+// whichever host takes it, and the pool's own datastore marked Default.
+//
+// The numbers are the datastore's capacity and what is already written to it,
+// which is what a bar needs. A datastore whose size vCenter does not report is
+// left out instead of being shown as zero.
+func datastoresOf(ctx context.Context, cl *govmomi.Client, hosts []mo.HostSystem, own types.ManagedObjectReference) ([]cloud.StorageProfileCapacity, error) {
+	refs := commonDatastores(hosts)
+	if len(refs) == 0 {
+		return nil, nil
+	}
+	var mds []mo.Datastore
+	if err := cl.Retrieve(ctx, refs, []string{"name", "summary"}, &mds); err != nil {
+		return nil, err
+	}
+	sort.Slice(mds, func(i, j int) bool { return datastoreName(&mds[i]) < datastoreName(&mds[j]) })
+	const mb = int64(1024 * 1024)
+	out := make([]cloud.StorageProfileCapacity, 0, len(mds))
+	for i := range mds {
+		d := &mds[i]
+		if d.Summary.Capacity <= 0 {
+			continue
+		}
+		out = append(out, cloud.StorageProfileCapacity{
+			Name:    datastoreName(d),
+			Default: d.Reference() == own,
+			LimitMB: d.Summary.Capacity / mb,
+			UsedMB:  (d.Summary.Capacity - d.Summary.FreeSpace) / mb,
+		})
+	}
+	return out, nil
+}
+
+func datastoreName(d *mo.Datastore) string {
+	if d.Summary.Name != "" {
+		return d.Summary.Name
+	}
+	return d.Name
+}
+
+// commonDatastores is the set of datastores every usable host of the scope
+// mounts. Hosts in maintenance or disconnected are skipped: they take no
+// clone, so their mounts must not narrow the list.
+//
+// When no datastore is common to all of them (mixed mounts, a half-built
+// cluster) the union is returned instead: the list describes the cluster, and
+// the clone remains the authority on whether a datastore is reachable.
+func commonDatastores(hosts []mo.HostSystem) []types.ManagedObjectReference {
+	var set []types.ManagedObjectReference
+	for i := range hosts {
+		h := &hosts[i]
+		if !hostUsable(h) || len(h.Datastore) == 0 {
+			continue
+		}
+		if set == nil {
+			set = append(set, h.Datastore...)
+			continue
+		}
+		set = intersectRefs(set, h.Datastore)
+	}
+	if len(set) > 0 {
+		return set
+	}
+	for i := range hosts {
+		h := &hosts[i]
+		if !hostUsable(h) {
+			continue
+		}
+		set = unionRefs(set, h.Datastore)
+	}
+	return set
+}
+
+func intersectRefs(a, b []types.ManagedObjectReference) []types.ManagedObjectReference {
+	seen := make(map[types.ManagedObjectReference]struct{}, len(b))
+	for _, r := range b {
+		seen[r] = struct{}{}
+	}
+	out := a[:0]
+	for _, r := range a {
+		if _, ok := seen[r]; ok {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func unionRefs(a, b []types.ManagedObjectReference) []types.ManagedObjectReference {
+	seen := make(map[types.ManagedObjectReference]struct{}, len(a)+len(b))
+	for _, r := range a {
+		seen[r] = struct{}{}
+	}
+	for _, r := range b {
+		if _, ok := seen[r]; ok {
+			continue
+		}
+		seen[r] = struct{}{}
+		a = append(a, r)
+	}
+	return a
 }
 
 // hostUsable reports whether the host can take a clone right now.

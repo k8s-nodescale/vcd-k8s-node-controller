@@ -109,7 +109,8 @@ type ResourceCapacity struct {
 	Used int64
 }
 
-// StorageProfileCapacity is one storage profile of the vDC.
+// StorageProfileCapacity is one storage profile of the vDC, or one datastore
+// when the platform has no profiles.
 type StorageProfileCapacity struct {
 	Name    string
 	Default bool
@@ -129,9 +130,21 @@ type PlatformCapacity struct {
 	// CPUMHzPerCore is the speed the vDC rates one vCPU at, as configured on
 	// the vDC. Zero means it was not readable for this account.
 	CPUMHzPerCore int64
-	CPU           ResourceCapacity // MHz
-	MemoryMB      ResourceCapacity // MB
-	Storage       []StorageProfileCapacity
+	// Datacenter and Cluster name the platform object the numbers are scoped
+	// to, when the platform has one. vSphere's unit is the compute cluster: a
+	// datacenter-wide total would advertise room no pool can reach. Both are
+	// empty on vCD, where the vDC is the whole scope.
+	Datacenter string
+	Cluster    string
+	CPU        ResourceCapacity // MHz
+	MemoryMB   ResourceCapacity // MB
+	Storage    []StorageProfileCapacity
+	// Datastores are the datastores the scope makes available to a clone,
+	// one entry per datastore, the pool's own marked Default. It is the list
+	// behind the storage bar: the bar shows the datastore a worker is written
+	// to, this shows what else the cluster offers. Empty where the platform
+	// has no such inventory (vCD profiles already are the inventory).
+	Datastores []StorageProfileCapacity
 }
 
 // CapacityRequest is the capacity one worker would add.

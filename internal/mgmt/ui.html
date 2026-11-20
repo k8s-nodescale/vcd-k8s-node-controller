@@ -164,11 +164,31 @@
   .pane.capacity { flex: 1 1 300px; min-width: 260px; }
   .caprows { display: flex; flex-direction: column; gap: 9px; }
   .caprow { display: flex; align-items: center; gap: 8px; font-size: 12px; }
-  .caplbl { width: 56px; color: var(--muted); }
+  .caplbl { width: 64px; color: var(--muted); }
   .caprow .dbar { flex: 1 1 auto; min-width: 60px; }
   .capnum { font-size: 11px; color: var(--muted); white-space: nowrap; }
   .capnote { font-size: 11px; color: var(--muted); margin-top: 2px; }
   .capnote.warn { color: var(--warn); }
+  /* the datastore list behind the storage bar: the button sits in the label,
+     the list three rows tall under the row and scrolls past that */
+  .caplbl .more { margin-left: 2px; padding: 0 3px; border: 0; background: none;
+                  color: var(--muted); font: inherit; cursor: pointer; line-height: 1; }
+  .caplbl .more:hover, .caplbl .more[aria-expanded="true"] { color: var(--fg); }
+  .dsbox { margin: -3px 0 0 72px; border: 1px solid var(--line); border-radius: 6px;
+           background: var(--bg); padding: 2px 6px 4px; }
+  .dslist { max-height: 72px; overflow-y: auto; }
+  .dsrow { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 8px;
+           align-items: baseline; padding: 3px 0; font-size: 11px; }
+  .dsrow + .dsrow { border-top: 1px solid var(--line); }
+  .dsname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .dsname .pool-tag { margin-left: 4px; padding: 0 4px; border-radius: 3px;
+                      font-size: 9px; text-transform: uppercase; letter-spacing: .03em;
+                      color: var(--accent); border: 1px solid var(--accent); }
+  .dsnum, .dsfree { color: var(--muted); white-space: nowrap; }
+  .dsfree.d-warn { color: var(--warn); }
+  .dsfree.d-high { color: var(--high); }
+  .dsfoot { margin-top: 3px; padding-top: 3px; border-top: 1px solid var(--line);
+            font-size: 10px; color: var(--muted); }
   /* the pod network is counted in nodes, so its bar is a row of slots: one per
      node the range can carry, filled when a node holds one */
   .caprow.pod { margin-top: 2px; }
@@ -342,7 +362,7 @@
         <div class="small muted" id="gates" style="margin-top:4px"></div>
       </div>
       <div class="pane capacity">
-        <div class="pane-title">DATACENTER COMPUTE CAPACITY:</div>
+        <div class="pane-title" id="capTitle">DATACENTER COMPUTE CAPACITY:</div>
         <div class="caprows" id="capRows"><span class="small muted">no snapshot yet</span></div>
       </div>
     </div>
@@ -380,14 +400,14 @@
   try {
     var savedFlags = JSON.parse(localStorage.getItem("nodescale-ui-nodeinfo") || "{}");
     if (savedFlags && typeof savedFlags === "object") {
-      ["taints", "volumes", "sts", "dense"].forEach(function (k) {
+      ["taints", "volumes", "sts", "dense", "ds"].forEach(function (k) {
         if (typeof savedFlags[k] === "boolean") { state.flags[k] = savedFlags[k]; }
       });
     }
   } catch (e) {}
   var state = { pools: [], current: null, stamp: "", stale: false, me: null, draft: null,
                 flavorDraft: null, pendingDelete: null, diskDraft: null, pendingDisks: null,
-                flags: { taints: false, volumes: false, sts: false, dense: false } };
+                flags: { taints: false, volumes: false, sts: false, dense: false, ds: false } };
   var pick = document.getElementById("poolPick");
 
   function esc(s) {
@@ -875,6 +895,7 @@
   function renderCapacity(p) {
     var box = document.getElementById("capRows");
     var c = p && p.capacity;
+    setCapTitle(c);
     if (!c) {
       box.innerHTML = '<span class="small muted">the controller has not published a capacity snapshot yet</span>';
       return;
@@ -882,7 +903,7 @@
     var rows = [
       capRow("vCPU", c.cpu, c.cpuMHz / 1000, c.cpuLimitMHz / 1000, "GHz", 1),
       capRow("RAM", c.memory, c.memoryMB / 1024, c.memoryLimitMB / 1024, "GB", 0),
-      capRow("Storage", c.storage, c.storageMB / 1024, c.storageLimitMB / 1024, "GB", 0)
+      storageRow(c)
     ];
     if (p && p.ipNetwork) {
       rows.push(ipRow(p));
@@ -891,13 +912,84 @@
       rows.push(podRow(c));
     }
     if (c.storageName) {
-      rows.push('<div class="capnote">storage profile ' + esc(c.storageName) + "</div>");
+      rows.push('<div class="capnote">' + (c.datastores && c.datastores.length ? "datastore" : "storage profile") +
+        " " + esc(c.storageName) + "</div>");
     }
     if (c.at) {
       rows.push('<div class="capnote">snapshot ' + new Date(c.at).toLocaleTimeString() +
         (c.observedReplicas != null ? " at " + c.observedReplicas + " workers" : "") + "</div>");
     }
     box.innerHTML = rows.join("");
+    var more = document.getElementById("dsMore");
+    if (more) {
+      more.onclick = function () {
+        state.flags.ds = !state.flags.ds;
+        try { localStorage.setItem("nodescale-ui-nodeinfo", JSON.stringify(state.flags)); } catch (e) {}
+        renderCapacity(p);
+      };
+    }
+  }
+
+  // setCapTitle names the scope the numbers come from. On vSphere that is a
+  // compute cluster inside a datacenter, not the datacenter: the totals are its
+  // hosts and its datastores, and saying so is the difference between "there is
+  // room somewhere" and "there is room here".
+  function setCapTitle(c) {
+    var el = document.getElementById("capTitle");
+    if (!el) { return; }
+    if (c && c.datacenter && c.cluster) {
+      el.textContent = "vSphere DC " + c.datacenter + "\\Cluster: " + c.cluster + " COMPUTE CAPACITY:";
+      el.title = "the scope is this compute cluster: its hosts and its datastores, not the whole datacenter";
+      return;
+    }
+    el.textContent = "DATACENTER COMPUTE CAPACITY:";
+    el.removeAttribute("title");
+  }
+
+  // storageRow is capRow with the datastore inventory behind it: the bar can
+  // only show the datastore a worker is written to, the "..." opens the list of
+  // what the cluster offers. The list is three rows tall and scrolls.
+  function storageRow(c) {
+    var list = c.datastores || [];
+    var label = "Storage";
+    if (list.length) {
+      label += ' <button class="more" id="dsMore" type="button" aria-expanded="' +
+        (state.flags.ds ? "true" : "false") + '" title="datastores this cluster offers">\u2026</button>';
+    }
+    var row = capRow(label, c.storage, c.storageMB / 1024, c.storageLimitMB / 1024, "GB", 0);
+    if (list.length && state.flags.ds) {
+      row += dsBox(list);
+    }
+    return row;
+  }
+
+  function dsBox(list) {
+    var totalCap = 0, totalUsed = 0;
+    var rows = list.map(function (d) {
+      var capGB = (d.capacityMB || 0) / 1024;
+      var freeGB = Math.max(0, capGB - (d.usedMB || 0) / 1024);
+      totalCap += capGB;
+      totalUsed += (d.usedMB || 0) / 1024;
+      var pct = d.share && d.share.percent != null ? Math.round(d.share.percent) : null;
+      var cls = d.share && d.share.level === "high" ? "d-high" : d.share && d.share.level === "warn" ? "d-warn" : "";
+      return '<div class="dsrow">' +
+        '<span class="dsname" title="' + esc(d.name) + '">' + esc(d.name) +
+          (d.default ? '<span class="pool-tag" title="the datastore this pool writes to">pool</span>' : "") + "</span>" +
+        '<span class="dsnum">' + fmtGB((d.usedMB || 0) / 1024) + " / " + fmtGB(capGB) + "</span>" +
+        '<span class="dsfree ' + cls + '">' + fmtGB(freeGB) + " free" +
+          (pct != null ? " \u00b7 " + pct + "%" : "") + "</span>" +
+        "</div>";
+    });
+    return '<div class="dsbox"><div class="dslist">' + rows.join("") + "</div>" +
+      '<div class="dsfoot">' + list.length + " datastore" + (list.length === 1 ? "" : "s") +
+      " in this cluster \u00b7 " + fmtGB(totalCap - totalUsed) + " free of " + fmtGB(totalCap) +
+      "</div></div>";
+  }
+
+  function fmtGB(gb) {
+    if (gb == null || isNaN(gb)) { return "?"; }
+    if (gb >= 1024) { return (gb / 1024).toFixed(1) + " TB"; }
+    return Math.round(gb) + " GB";
   }
 
   // alignPanes keeps the two control panes on a common grid: the replica

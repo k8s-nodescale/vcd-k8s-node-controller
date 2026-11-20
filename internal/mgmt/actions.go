@@ -9,6 +9,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	infrav1 "github.com/k8s-nodescale/vcd-k8s-node-controller/api/v1alpha1"
 )
@@ -163,6 +164,7 @@ func (s *Server) update(ctx context.Context, name, action string, mutate func(*i
 		if why := busyReason(p); why != "" {
 			return fmt.Errorf("%w: an operation is already in progress: %s", ErrInvalid, why)
 		}
+		before := p.DeepCopy()
 		if err := mutate(p); err != nil {
 			return err
 		}
@@ -173,6 +175,12 @@ func (s *Server) update(ctx context.Context, name, action string, mutate func(*i
 			p.Annotations[lastActionAnnotation] = fmt.Sprintf("%s (%s) %s at %s",
 				actor.Username, actor.Role, action, time.Now().UTC().Format(time.RFC3339))
 		}
-		return s.Client.Update(ctx, p)
+		// A merge patch carries only what changed. A full Update re-serialises
+		// the whole object, and a zero value behind `omitempty` vanishes: a pool
+		// with spec.scaleDown.minReplicas: 0 came back with the CRD default (1)
+		// after any click, and that is InvalidSpec the moment allowLastWorker is
+		// set (found live on 2026-11-20). A narrow patch also stops a click from
+		// overwriting a spec field somebody else changed meanwhile.
+		return s.Client.Patch(ctx, p, client.MergeFrom(before))
 	})
 }

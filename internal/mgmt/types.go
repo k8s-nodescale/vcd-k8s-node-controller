@@ -203,6 +203,8 @@ type Disk struct {
 // percentages are computed here like every other share, so the page only paints.
 type Capacity struct {
 	Model             string `json:"model,omitempty"`
+	Datacenter        string `json:"datacenter,omitempty"`
+	Cluster           string `json:"cluster,omitempty"`
 	CPUMHz            int64  `json:"cpuMHz,omitempty"`
 	CPULimitMHz       int64  `json:"cpuLimitMHz,omitempty"`
 	MemoryMB          int64  `json:"memoryMB,omitempty"`
@@ -224,4 +226,17 @@ type Capacity struct {
 	CPU     *Share `json:"cpu,omitempty"`
 	Memory  *Share `json:"memory,omitempty"`
 	Storage *Share `json:"storage,omitempty"`
+	// Datastores is the storage inventory of the scope, shown next to the
+	// single storage bar; empty where the platform has no such list.
+	Datastores []Datastore `json:"datastores,omitempty"`
+}
+
+// Datastore is one datastore the pool's cluster offers: what it holds, what is
+// written to it, and its own share, so the page only paints.
+type Datastore struct {
+	Name       string `json:"name"`
+	Default    bool   `json:"default,omitempty"`
+	CapacityMB int64  `json:"capacityMB,omitempty"`
+	UsedMB     int64  `json:"usedMB,omitempty"`
+	Share      *Share `json:"share,omitempty"`
 }

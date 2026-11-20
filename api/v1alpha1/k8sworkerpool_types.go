@@ -593,7 +593,11 @@ type ScaleDownPolicy struct {
 	// 1: emptying the pool has to be asked for with minReplicas: 0.
 	// +kubebuilder:default=1
 	// +kubebuilder:validation:Minimum=0
-	MinReplicas  int32           `json:"minReplicas,omitempty"`
+	//
+	// No omitempty: 0 is a meaningful floor ("the pool may be emptied"), and a
+	// field dropped from the payload would come back as the default 1 on the
+	// next write.
+	MinReplicas  int32           `json:"minReplicas"`
 	DrainTimeout metav1.Duration `json:"drainTimeout,omitempty"`
 
 	// DeleteWorkers names specific workers to remove, in order, regardless of
@@ -679,9 +683,23 @@ type CapacityStatus struct {
 	// +optional
 	StorageName string `json:"storageName,omitempty"`
 	// +optional
-	StorageMB int64 `json:"storageMB,omitempty"`
-	// +optional
+	StorageMB      int64 `json:"storageMB,omitempty"`
 	StorageLimitMB int64 `json:"storageLimitMB,omitempty"`
+
+	// Datacenter and Cluster name the scope the numbers above are read from,
+	// where the platform has one. On vSphere it is the compute cluster: its
+	// hosts are the compute a pool may use and its datastores are the storage,
+	// not the datacenter's. Empty on vCD, whose scope is the whole vDC.
+	// +optional
+	Datacenter string `json:"datacenter,omitempty"`
+	// +optional
+	Cluster string `json:"cluster,omitempty"`
+	// Datastores is the storage the scope makes available, one entry per
+	// datastore, the pool's own marked Default. It answers "what else is
+	// there" next to the single bar, which can only show the one a worker is
+	// written to.
+	// +optional
+	Datastores []DatastoreCapacity `json:"datastores,omitempty"`
 	// PodCIDR is the cluster's pod network. Its address count sized against
 	// the per-node allowance (110 pods, the kubelet default) is what decides
 	// whether another node can be added at all.
@@ -721,6 +739,20 @@ type CapacityStatus struct {
 	// what makes "refresh after a scale completed" decidable.
 	// +optional
 	ObservedReplicas int32 `json:"observedReplicas,omitempty"`
+}
+
+// DatastoreCapacity is one datastore of the scope, in the same units as the
+// storage bar: what it holds and what is already written to it.
+type DatastoreCapacity struct {
+	Name string `json:"name"`
+	// Default marks the datastore the pool names in spec.vsphere.datastore:
+	// the one a clone is written to.
+	// +optional
+	Default bool `json:"default,omitempty"`
+	// +optional
+	CapacityMB int64 `json:"capacityMB,omitempty"`
+	// +optional
+	UsedMB int64 `json:"usedMB,omitempty"`
 }
 
 // IPLedger is the persistent IP allocation ledger.

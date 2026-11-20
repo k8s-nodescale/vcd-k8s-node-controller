@@ -54,10 +54,23 @@ func (r *WorkerPoolReconciler) refreshCapacityStatus(ctx context.Context, pool *
 	if err == nil {
 		if capacity, cerr := prov.Capacity(ctx); cerr == nil {
 			snap.Model = capacity.Model
+			snap.Datacenter = capacity.Datacenter
+			snap.Cluster = capacity.Cluster
 			snap.CPUMHz = capacity.CPU.Used
 			snap.CPULimitMHz = capacity.CPU.Limit
 			snap.MemoryMB = capacity.MemoryMB.Used
 			snap.MemoryLimitMB = capacity.MemoryMB.Limit
+			// The inventory is published as the platform reported it: the page
+			// shows what the cluster offers next to the one datastore the bar
+			// can carry, and computes the shares itself.
+			for _, d := range capacity.Datastores {
+				snap.Datastores = append(snap.Datastores, infrav1.DatastoreCapacity{
+					Name:       d.Name,
+					Default:    d.Default,
+					CapacityMB: d.LimitMB,
+					UsedMB:     d.UsedMB,
+				})
+			}
 			// One profile, never a sum: profiles have their own limits, and
 			// adding them describes a quota that does not exist. The default
 			// is the one a clone lands on.
