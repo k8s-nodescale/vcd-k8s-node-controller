@@ -28,6 +28,16 @@ func poolFit(p *infrav1.K8sWorkerPool) *Fit {
 	}
 	out := &Fit{}
 
+	// The workers admitted but not yet measured: their VMs exist, their load is
+	// not in the platform's figure, so their standing charge is spent already.
+	var starting int64
+	for i := range p.Status.Nodes {
+		switch p.Status.Nodes[i].Phase {
+		case infrav1.NodePhaseProvisioning, infrav1.NodePhaseJoining:
+			starting++
+		}
+	}
+
 	// CPU
 	if c.CPULimitMHz > 0 && c.CPUMHzPerCore > 0 && p.Spec.Flavor.CPUs > 0 {
 		ratio := int64(perCoreFor(p, c))
@@ -39,7 +49,7 @@ func poolFit(p *infrav1.K8sWorkerPool) *Fit {
 		per := int64(p.Spec.Flavor.CPUs) * perCore
 		if per > 0 {
 			out.CPUPerWorkerMHz = per
-			if free := c.CPULimitMHz - c.CPUMHz; free >= 0 {
+			if free := c.CPULimitMHz - c.CPUMHz - starting*per; free >= 0 {
 				n := int32(free / per)
 				out.CPU = &n
 			}
@@ -50,7 +60,7 @@ func poolFit(p *infrav1.K8sWorkerPool) *Fit {
 	if c.MemoryLimitMB > 0 && p.Spec.Flavor.MemoryMB > 0 {
 		per := int64(p.Spec.Flavor.MemoryMB)
 		out.MemoryPerWorkerMB = per
-		if free := c.MemoryLimitMB - c.MemoryMB; free >= 0 {
+		if free := c.MemoryLimitMB - c.MemoryMB - starting*per; free >= 0 {
 			n := int32(free / per)
 			out.Memory = &n
 		}

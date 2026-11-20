@@ -120,6 +120,9 @@
   .dbar { position: relative; flex: 1 1 auto; min-width: 34px; height: 15px;
           border-radius: 4px; background: var(--chip); overflow: hidden; }
   .dbar i { position: absolute; left: 0; top: 0; bottom: 0; display: block; }
+  /* admitted but not yet measured: the standing charge of a starting worker */
+  .dbar u.res { position: absolute; top: 0; bottom: 0; background: rgba(255, 255, 255, .22);
+                border-left: 1px solid rgba(255, 255, 255, .45); }
   .dbar b { position: relative; display: block; text-align: center; font-size: 10px;
             font-weight: 600; line-height: 15px; color: var(--fg);
             font-variant-numeric: tabular-nums; }
@@ -623,15 +626,20 @@
     return decimals ? v.toFixed(decimals) : String(Math.round(v));
   }
 
-  function capRow(label, share, used, limit, unit, decimals, fit, isBind) {
+  function capRow(label, share, used, limit, unit, decimals, fit, isBind, reservedPct) {
     var pct = share && share.percent != null ? share.percent : null;
     var cls = share && share.level === "high" ? "d-high" : share && share.level === "warn" ? "d-warn" : "d-ok";
     var text = pct == null ? "–" : pct.toFixed(0) + "%";
     var num = pct == null
       ? "no limit reported"
       : capNumber(used, decimals) + " / " + capNumber(limit, decimals) + " " + unit;
+    // The reserved segment is what the pool has committed but the host has not
+    // been made to pay yet: it is drawn after the measured fill.
+    var rp = Math.max(0, Math.min(100 - (pct || 0), reservedPct || 0));
     return '<div class="caprow"><span class="caplbl">' + label + "</span>" +
-      '<span class="dbar ' + cls + '"><i style="width:' + (pct || 0) + '%"></i><b>' + text + "</b></span>" +
+      '<span class="dbar ' + cls + '"><i style="width:' + (pct || 0) + '%"></i>' +
+      (rp > 0 ? '<u class="res" style="left:' + (pct || 0) + '%;width:' + rp + '%"></u>' : "") +
+      '<b>' + text + "</b></span>" +
       '<span class="capnum">' + num + "</span>" + fitChip(fit, isBind) + "</div>";
   }
 
@@ -1023,11 +1031,14 @@
       if (i > 0 && dims[i].n < fit) { fit = dims[i].n; bind = dims[i]; }
     }
 
+    var res = reservedOf(p, c);
     var rows = [
       capRow("vCPU" + cpuTip(c, perCore, p.flavor.cpus), c.cpu, c.cpuMHz / 1000, c.cpuLimitMHz / 1000, "GHz", 1,
-        cpuFit, bind && bind.key === "vCPU"),
+        cpuFit, bind && bind.key === "vCPU",
+        c.cpuLimitMHz > 0 ? res.cpuMHz / c.cpuLimitMHz * 100 : 0),
       capRow("RAM", c.memory, c.memoryMB / 1024, c.memoryLimitMB / 1024, "GB", 0,
-        c.fit && c.fit.memory, bind && bind.key === "RAM"),
+        c.fit && c.fit.memory, bind && bind.key === "RAM",
+        c.memoryLimitMB > 0 ? res.memMB / c.memoryLimitMB * 100 : 0),
       storageRow(c, c.fit && c.fit.storage, bind && bind.key === "storage")
     ];
     if (p && p.ipNetwork) {
@@ -1088,6 +1099,25 @@
     }
   }
 
+  // reservedOf is the standing charge of the workers that are admitted but whose
+  // load the platform has not measured yet: a worker in Provisioning or Joining
+  // consumes almost nothing, so the free figure does not move when it is created.
+  // Without this the pane promises room that the previous click already spent.
+  function reservedOf(p, c) {
+    var n = 0;
+    (p && p.nodes ? p.nodes : []).forEach(function (w) {
+      if (w.phase === "Provisioning" || w.phase === "Joining") { n++; }
+    });
+    var out = { workers: n, cpuMHz: 0, memMB: 0 };
+    if (!n || !c || !p.flavor) { return out; }
+    var cpus = p.flavor.cpus || 0;
+    if (c.cpuMHzPerCore > 0 && cpus > 0) {
+      out.cpuMHz = n * cpus * Math.ceil(c.cpuMHzPerCore / (c.cpuPerCore || 1));
+    }
+    if (p.flavor.memoryMB > 0) { out.memMB = n * p.flavor.memoryMB; }
+    return out;
+  }
+
   // fitDims is what the page knows about "how many more": the three the
   // controller publishes (CPU at the pre-flight's own assumption, memory, disk)
   // plus the two the page already counts - pod blocks and addresses in the ip
@@ -1096,25 +1126,29 @@
   function fitDims(p, c, perCore) {
     var out = [];
     var f = c.fit || {};
+    var res = reservedOf(p, c);
     // CPU is charged here rather than read from the snapshot, so the switch shows
     // its effect at once: core speed and the pool's vCPU count are both known,
     // and the rule is the pre-flight's (round the per-vCPU charge up).
     if (c.cpuMHzPerCore > 0 && c.cpuLimitMHz > 0 && p && p.flavor && p.flavor.cpus > 0) {
       var ratio = perCore || 1;
       var per = p.flavor.cpus * Math.ceil(c.cpuMHzPerCore / ratio);
-      var free = c.cpuLimitMHz - c.cpuMHz;
+      var free = c.cpuLimitMHz - c.cpuMHz - res.cpuMHz;
       out.push({ key: "vCPU", n: free >= 0 ? Math.floor(free / per) : 0,
         basis: cpuCharge(c, perCore, p.flavor.cpus) + "; free " +
-          (Math.max(0, free) / 1000).toFixed(1) + " GHz of " + (c.cpuLimitMHz / 1000).toFixed(1) });
+          (Math.max(0, free) / 1000).toFixed(1) + " GHz of " + (c.cpuLimitMHz / 1000).toFixed(1) +
+          (res.cpuMHz > 0 ? " after " + res.workers + " starting worker" +
+            (res.workers === 1 ? "" : "s") + " charge " + (res.cpuMHz / 1000).toFixed(1) + " GHz" : "") });
     } else if (f.cpu != null) {
       // An old snapshot that carries no core speed: the controller's number is
       // better than nothing, it just cannot follow the switch.
       out.push({ key: "vCPU", n: f.cpu, basis: cpuCharge(c, perCore, p && p.flavor ? p.flavor.cpus : 0) });
     }
-    if (f.memory != null) {
-      out.push({ key: "RAM", n: f.memory,
+    if (f.memory != null && f.memoryPerWorkerMB > 0) {
+      var freeMem = c.memoryLimitMB - c.memoryMB - res.memMB;
+      out.push({ key: "RAM", n: freeMem >= 0 ? Math.floor(freeMem / f.memoryPerWorkerMB) : 0,
         basis: (f.memoryPerWorkerMB / 1024).toFixed(0) + " GB per worker, the flavour's allocation; free " +
-          fmtGB(Math.max(0, c.memoryLimitMB - c.memoryMB) / 1024) + " of " + fmtGB(c.memoryLimitMB / 1024) });
+          fmtGB(Math.max(0, freeMem) / 1024) + " of " + fmtGB(c.memoryLimitMB / 1024) });
     }
     if (f.storage != null) {
       out.push({ key: "storage", n: f.storage,

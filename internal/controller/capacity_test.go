@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -354,5 +355,51 @@ func TestScaleUpChargesTheWholeBatch(t *testing.T) {
 	}
 	if provisioning != 3 || queued != 1 {
 		t.Fatalf("phases: %d provisioning, %d queued, want 3 and 1", provisioning, queued)
+	}
+}
+
+// A worker admitted by an earlier pass is still Provisioning and consumes almost
+// nothing, so the platform's free figure has not moved. Its charge must be spent
+// before the next worker is admitted, or a scale-out keeps adding VMs pass after
+// pass while the pane says there is no room.
+func TestScaleUpChargesTheWorkersAlreadyStarting(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(3)
+	// One worker exists and is still starting.
+	pool.Status.Nodes = []infrav1.WorkerNodeStatus{{
+		Name: "pool-wrk-01", IP: "192.168.100.7", Phase: infrav1.NodePhaseProvisioning,
+		ProviderID: "vm-1", ProvisioningStartedAt: &metav1.Time{Time: time.Now()},
+	}}
+	pool.Status.ObservedReplicas = 1
+	fc := &fakeCloud{
+		vms:       []cloud.VM{{ID: "vm-1", Name: "pool-wrk-01", IP: "192.168.100.7", CPU: 2, MemoryMB: 4096}},
+		noConsume: true,
+		capacity: cloud.PlatformCapacity{
+			Physical: true, Measured: true, CPUMHzPerCore: 2600,
+			// Room for two charges in total, one of which the starting worker holds.
+			CPU:      cloud.ResourceCapacity{Limit: 2 * 2 * 2600, Used: 0},
+			MemoryMB: cloud.ResourceCapacity{Limit: 1 << 20, Used: 0},
+		},
+	}
+	r := newTestReconciler(t, fc, &fakeKube{}, pool)
+
+	if _, err := r.Reconcile(ctx, requestFor(pool)); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if len(fc.created) != 1 {
+		t.Fatalf("created %d VMs, want 1: the starting worker's charge leaves room for one", len(fc.created))
+	}
+	got := getPool(t, r, pool)
+	var provisioning, queued int
+	for _, n := range got.Status.Nodes {
+		switch n.Phase {
+		case infrav1.NodePhaseProvisioning:
+			provisioning++
+		case infrav1.NodePhaseQueued:
+			queued++
+		}
+	}
+	if provisioning != 2 || queued != 1 {
+		t.Fatalf("%d provisioning, %d queued, want 2 and 1", provisioning, queued)
 	}
 }

@@ -167,6 +167,21 @@ func resizeCapacityRequest(have, target *infrav1.FlavorStatus) cloud.CapacityReq
 	return req
 }
 
+// inFlight counts the pool's workers whose VM exists but whose load the platform
+// has not measured yet: a worker in Provisioning or Joining consumes almost
+// nothing, so the free figure does not move when it is admitted. Their standing
+// charge is what keeps a scale-out from being optimistic pass after pass.
+func inFlight(nodes []infrav1.WorkerNodeStatus) int32 {
+	var n int32
+	for i := range nodes {
+		switch nodes[i].Phase {
+		case infrav1.NodePhaseProvisioning, infrav1.NodePhaseJoining:
+			n++
+		}
+	}
+	return n
+}
+
 // batchRequest is n copies of one worker's request: what this pass has already
 // admitted plus the one it is about to admit. The pre-flight charges nominal
 // MHz per worker while the platform reports measured usage, so without counting

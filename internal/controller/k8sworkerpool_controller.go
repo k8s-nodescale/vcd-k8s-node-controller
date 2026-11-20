@@ -1029,7 +1029,10 @@ func (r *WorkerPoolReconciler) scaleUp(ctx context.Context, before, pool *infrav
 		// checks against the same free MHz would all pass, which is how a request
 		// for four workers was created in full while the page said two fit
 		// (2026-11-20). batchRequest counts them.
-		if ok, why := r.capacityAllowsBatch(ctx, pool, workerCapacityRequest(pool, pool.Status.Nodes), i+1); !ok {
+		// The workers admitted before this pass are still Provisioning and their
+		// usage is not in the platform's figure, so they are charged here too.
+		if ok, why := r.capacityAllowsBatch(ctx, pool, workerCapacityRequest(pool, pool.Status.Nodes),
+			1+inFlight(pool.Status.Nodes)); !ok {
 			if err := r.queueSlots(ctx, pool, alloc, n-i, why); err != nil {
 				return err
 			}

@@ -132,3 +132,26 @@ func TestCapacityViewCarriesTheChargeBasis(t *testing.T) {
 		t.Fatal("physical was dropped from the view")
 	}
 }
+
+// A worker that is still starting has a VM but no measured load. Its standing
+// charge is spent, so it must reduce the number of workers that still fit - the
+// pane promised room that the previous click had already committed.
+func TestFitChargesWorkersThatAreStillStarting(t *testing.T) {
+	p := fitPool(1)
+	if f := poolFit(p); f.CPU == nil || *f.CPU != 2 {
+		t.Fatalf("cpu = %v, want 2 with nothing starting", f.CPU)
+	}
+	p.Status.Nodes = []infrav1.WorkerNodeStatus{
+		{Name: "w-1", Phase: infrav1.NodePhaseReady},
+		{Name: "w-2", Phase: infrav1.NodePhaseProvisioning},
+		{Name: "w-3", Phase: infrav1.NodePhaseJoining},
+	}
+	f := poolFit(p)
+	// 34680 - 2*15600 = 3480, which fits nothing.
+	if f.CPU == nil || *f.CPU != 0 {
+		t.Fatalf("cpu = %v, want 0 while two workers are starting", f.CPU)
+	}
+	if f.Memory == nil || *f.Memory != 201 {
+		t.Fatalf("memory = %v, want 201 after the two reservations", f.Memory)
+	}
+}
