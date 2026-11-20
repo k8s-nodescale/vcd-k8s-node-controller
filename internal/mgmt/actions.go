@@ -134,7 +134,7 @@ func (s *Server) DeleteWorkers(ctx context.Context, name string, workers []strin
 	return s.updateUnlessBusy(ctx, name, action, func(p *infrav1.K8sWorkerPool) bool {
 		// Only workers that cannot be serving: a Ready one is a member of the
 		// pool and removing it spends the drain budget, so it keeps the lock.
-		return noneServe(p.Status.Nodes, workers)
+		return removableWhileBusy(p.Status.Nodes, workers)
 	}, func(p *infrav1.K8sWorkerPool) error {
 		for _, w := range workers {
 			if w == "" || containsName(p.Spec.ScaleDown.DeleteWorkers, w) {
@@ -219,19 +219,24 @@ func (s *Server) updateUnlessBusy(ctx context.Context, name, action string, exem
 	})
 }
 
-// noneServe reports whether none of the named workers is able to serve traffic.
-// A slot in Provisioning, Joining, Queued, Failed, Missing or Deleting is not a
-// member of the pool yet, or no longer one; an unknown name cannot be either,
-// and the controller drops it with a warning event.
-func noneServe(nodes []infrav1.WorkerNodeStatus, names []string) bool {
+// removableWhileBusy reports whether every named worker may be removed while
+// another operation is in flight. An unknown name qualifies: the controller drops
+// it with a warning event.
+//
+// Provisioning and Joining are deliberately excluded: both are a worker in
+// flight, both are bounded by spec.provisioning.timeout (a VM without a Node, and
+// a Node that never becomes Ready), and deleting a half-finished create from under
+// the controller is not something a stray click should do. Failed, Missing and
+// Queued are the states those budgets end in, so they are the way out of a worker
+// that never came up.
+func removableWhileBusy(nodes []infrav1.WorkerNodeStatus, names []string) bool {
 	for _, name := range names {
 		for i := range nodes {
 			if !strings.EqualFold(nodes[i].Name, name) {
 				continue
 			}
 			switch nodes[i].Phase {
-			case infrav1.NodePhaseProvisioning, infrav1.NodePhaseJoining,
-				infrav1.NodePhaseQueued, infrav1.NodePhaseFailed,
+			case infrav1.NodePhaseQueued, infrav1.NodePhaseFailed,
 				infrav1.NodePhaseMissing, infrav1.NodePhaseDeleting:
 			default:
 				return false

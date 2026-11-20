@@ -1394,7 +1394,10 @@
   // runs: removing it spends no drain budget, and it is the way out of a worker
   // that never came up. Mirrors noneServe() in the sidecar, which is what accepts
   // or refuses the write.
-  var NOT_SERVING = ["Provisioning", "Joining", "Queued", "Failed", "Missing", "Deleting"];
+  // Provisioning and Joining are not in the list on purpose: the worker is in
+  // flight and the watchdog bounds it (spec.provisioning.timeout). A stray click
+  // must not delete a half-finished clone or a node that may still come up.
+  var NOT_SERVING = ["Queued", "Failed", "Missing", "Deleting"];
   function removableWhileBusy(n) { return NOT_SERVING.indexOf(n.phase) >= 0; }
 
   function workerRow(p, n, admin) {

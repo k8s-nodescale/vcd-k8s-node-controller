@@ -529,10 +529,28 @@ func (r *WorkerPoolReconciler) refreshReadiness(ctx context.Context, pool *infra
 				r.ensureIngressPool(ctx, pool, st)
 			}
 		default:
+			// The Node exists but is not Ready. The clock bounds this state the
+			// same way it bounds a VM that never registered: without it a NotReady
+			// worker has no timer at all, and since a converging worker is not
+			// deletable from the page (earlier work, 2026-11-20), nothing could
+			// ever end it.
+			wasJoining := st.Phase == infrav1.NodePhaseJoining
 			st.Phase = infrav1.NodePhaseJoining
 			st.K8sReady = false
 			st.Message = "node registered, waiting for Ready"
-			st.ProvisioningStartedAt = nil
+			if !wasJoining || st.ProvisioningStartedAt == nil {
+				now := metav1.Now()
+				st.ProvisioningStartedAt = &now
+			}
+			if budget := provisioningTimeout(pool); time.Since(st.ProvisioningStartedAt.Time) >= budget {
+				st.Phase = infrav1.NodePhaseFailed
+				st.Message = fmt.Sprintf(
+					"the Node has been registered but not Ready for %s (spec.provisioning.timeout=%s); the VM is kept for inspection",
+					time.Since(st.ProvisioningStartedAt.Time).Round(time.Minute), budget)
+				r.eventf(pool, corev1.EventTypeWarning, "WorkerNotReadyTimeout",
+					fmt.Sprintf("worker %s: %s", st.Name, st.Message))
+				break
+			}
 			r.renewBootstrapToken(ctx, pool, st)
 		}
 		if !ok {

@@ -78,10 +78,10 @@ func TestMinReplicasZeroIsSerialised(t *testing.T) {
 	}
 }
 
-// A worker stuck in Provisioning locked every control, including the delete that
-// would have freed it (2026-11-20). Removing a slot that cannot be serving spends
-// no drain budget, so it is allowed while another operation is in flight.
-func TestDeleteWorkersIsAllowedWhileAWorkerIsProvisioning(t *testing.T) {
+// A create that is running is left alone: the watchdog bounds it
+// (spec.provisioning.timeout), and deleting a half-finished clone from under the
+// controller is not something a stray click should do.
+func TestDeleteOfWorkersInProvisioningStaysLocked(t *testing.T) {
 	p := testPool(2)
 	p.Status.Nodes = []infrav1.WorkerNodeStatus{
 		{Name: "kion-web-dev-wrk-01", Phase: infrav1.NodePhaseReady},
@@ -91,16 +91,35 @@ func TestDeleteWorkersIsAllowedWhileAWorkerIsProvisioning(t *testing.T) {
 	if why := busyReason(p); why == "" {
 		t.Fatal("the pool is not busy; the test proves nothing")
 	}
-	s := &Server{Client: c}
-	if err := s.DeleteWorkers(context.Background(), "kion-web-dev", []string{"kion-web-dev-wrk-02"}); err != nil {
-		t.Fatalf("deleting a provisioning worker must be allowed: %v", err)
+	err := (&Server{Client: c}).DeleteWorkers(context.Background(), "kion-web-dev",
+		[]string{"kion-web-dev-wrk-02"})
+	if !errors.Is(err, ErrInvalid) {
+		t.Fatalf("err = %v, want a refused request while the create runs", err)
 	}
-	got := &infrav1.K8sWorkerPool{}
-	if err := c.Get(context.Background(), client.ObjectKey{Name: "kion-web-dev"}, got); err != nil {
-		t.Fatal(err)
-	}
-	if len(got.Spec.ScaleDown.DeleteWorkers) != 1 {
-		t.Fatalf("deleteWorkers = %v, want the stuck worker", got.Spec.ScaleDown.DeleteWorkers)
+}
+
+// The states a bounded create ends in are the way out of a worker that never came
+// up. Provisioning and Joining are in flight and stay locked: the watchdog bounds
+// both.
+func TestDeleteOfWorkersIsBypassedByTheLockForTerminalPhases(t *testing.T) {
+	for _, phase := range []infrav1.NodePhase{
+		infrav1.NodePhaseFailed, infrav1.NodePhaseQueued, infrav1.NodePhaseMissing,
+	} {
+		t.Run(string(phase), func(t *testing.T) {
+			p := testPool(2)
+			p.Status.Nodes = []infrav1.WorkerNodeStatus{
+				{Name: "kion-web-dev-wrk-01", Phase: infrav1.NodePhaseProvisioning},
+				{Name: "kion-web-dev-wrk-02", Phase: phase},
+			}
+			c := testClient(t, p)
+			if why := busyReason(p); why == "" {
+				t.Fatal("the pool is not busy; the test proves nothing")
+			}
+			if err := (&Server{Client: c}).DeleteWorkers(context.Background(), "kion-web-dev",
+				[]string{"kion-web-dev-wrk-02"}); err != nil {
+				t.Fatalf("deleting a %s worker while busy must be allowed: %v", phase, err)
+			}
+		})
 	}
 }
 
@@ -116,5 +135,21 @@ func TestDeleteWorkersStaysLockedForAServingWorker(t *testing.T) {
 	err := s.DeleteWorkers(context.Background(), "kion-web-dev", []string{"kion-web-dev-wrk-01"})
 	if !errors.Is(err, ErrInvalid) {
 		t.Fatalf("err = %v, want a refused request", err)
+	}
+}
+
+// A Node that registered but is not Ready is still in flight: the watchdog bounds
+// it (spec.provisioning.timeout), so the delete stays locked like any other
+// converging worker.
+func TestDeleteOfWorkersInJoiningStaysLocked(t *testing.T) {
+	p := testPool(2)
+	p.Status.Nodes = []infrav1.WorkerNodeStatus{
+		{Name: "kion-web-dev-wrk-01", Phase: infrav1.NodePhaseProvisioning},
+		{Name: "kion-web-dev-wrk-02", Phase: infrav1.NodePhaseJoining},
+	}
+	err := (&Server{Client: testClient(t, p)}).DeleteWorkers(context.Background(), "kion-web-dev",
+		[]string{"kion-web-dev-wrk-02"})
+	if !errors.Is(err, ErrInvalid) {
+		t.Fatalf("err = %v, want a refused request while the node is converging", err)
 	}
 }
