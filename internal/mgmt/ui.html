@@ -191,6 +191,8 @@
          border: 1px solid var(--line); border-radius: 999px; padding: 0 6px;
          white-space: nowrap; }
   .fit.bind { color: var(--accent); border-color: var(--accent); font-weight: 600; }
+  /* nothing fits: the chip reads as a stop, not as the current dimension */
+  .fit.zero { color: var(--high); border-color: var(--high); font-weight: 600; }
   /* the one sentence the pane answers, and the assumption behind its CPU half */
   .fitline { display: flex; align-items: center; justify-content: space-between; gap: 10px;
              flex-wrap: wrap; margin-top: 10px; padding-top: 9px;
@@ -209,6 +211,11 @@
   .fitbox table { width: 100%; border-collapse: collapse; font-size: 11px; }
   .fitbox td { padding: 3px 0; border-top: 1px solid var(--line); color: var(--muted); }
   .fitbox tr:first-child td { border-top: 0; }
+  .fitbox tr.calcrow td { border-top: 0; padding-top: 0; }
+  .fitcalc { margin: 2px 0 8px; padding: 6px 8px; border-left: 2px solid var(--high);
+             background: var(--shade); border-radius: 4px; font-size: 11px;
+             color: var(--muted); line-height: 1.6; font-variant-numeric: tabular-nums; }
+  .fitcalc div + div { margin-top: 1px; }
   .fitbox td:last-child { text-align: right; color: var(--fg); white-space: nowrap; }
   /* the datastore list behind the storage bar: the button sits in the label,
      the list three rows tall under the row and scrolls past that */
@@ -651,7 +658,8 @@
   // one the accent lands on.
   function fitChip(n, isBind) {
     if (n == null || n === undefined) { return ""; }
-    return '<span class="fit' + (isBind ? " bind" : "") + '">+' + n + "</span>";
+    var cls = n === 0 ? " zero" : (isBind ? " bind" : "");
+    return '<span class="fit' + cls + '">+' + n + "</span>";
   }
 
   // podCalc is the pod network counted in nodes rather than in addresses: 110
@@ -1196,11 +1204,32 @@
         var n = workersWithVM(p);
         var committed = others + n * per;
         var room = c.cpuLimitMHz - committed;
-        out.push({ key: "vCPU", n: room > 0 ? Math.floor(room / per) : 0,
-          basis: cpuCharge(c, perCore, p.flavor.cpus) + "; others " + (others / 1000).toFixed(1) +
+        var fits = room > 0 ? Math.floor(room / per) : 0;
+        var dim = { key: "vCPU", n: fits, basis: fits === 0 ? "" :
+          cpuCharge(c, perCore, p.flavor.cpus) + "; others " + (others / 1000).toFixed(1) +
             " GHz + " + n + " worker" + (n === 1 ? "" : "s") + " charged " +
             ((n * per) / 1000).toFixed(1) + " = " + (committed / 1000).toFixed(1) +
-            " of " + (c.cpuLimitMHz / 1000).toFixed(1) });
+            " of " + (c.cpuLimitMHz / 1000).toFixed(1) };
+        if (fits === 0) {
+          // "0" alone invites the question the bar cannot answer: it shows 71 %
+          // used, so why nothing? Spell the arithmetic out where the reader is
+          // already looking.
+          var ghz = function (v) { return (v / 1000).toFixed(1); };
+          var ratio = perCore || 1;
+          var need = others + (n + 1) * per;
+          var over = committed - c.cpuLimitMHz;
+          dim.calc = [
+            n + " worker" + (n === 1 ? "" : "s") + ", " + p.flavor.cpus + " vCPU each, " +
+              ratio + " vCPU : 1 core \u2192 " + ghz(per) + " GHz charge per worker",
+            "used " + ghz(c.cpuMHz) + " GHz = ours " + ghz(ours) + " + others " + ghz(others),
+            "standing: others " + ghz(others) + " + " + n + " x " + ghz(per) + " = " +
+              ghz(committed) + " of " + ghz(c.cpuLimitMHz) +
+              (over > 0 ? " \u2192 already " + ghz(over) + " GHz over" : ""),
+            "one more: " + ghz(others) + " + " + (n + 1) + " x " + ghz(per) + " = " +
+              ghz(need) + " \u2192 room " + ghz(c.cpuLimitMHz - need) + " \u2192 0"
+          ];
+        }
+        out.push(dim);
       } else {
         var free = c.cpuLimitMHz - c.cpuMHz - res.cpuMHz;
         out.push({ key: "vCPU", n: free >= 0 ? Math.floor(free / per) : 0,
@@ -1320,8 +1349,15 @@
 
   function fitBox(dims, fit, c) {
     var rows = dims.map(function (d) {
-      return "<tr><td>" + esc(d.key) + ' <span class="muted">- ' + esc(d.basis) + "</span></td>" +
-        "<td>+" + d.n + "</td></tr>";
+      var row = "<tr><td>" + esc(d.key) +
+        (d.basis ? ' <span class="muted">- ' + esc(d.basis) + "</span>" : "") +
+        "</td><td>+" + d.n + "</td></tr>";
+      if (d.calc && d.calc.length) {
+        row += '<tr class="calcrow"><td colspan="2"><div class="fitcalc">' +
+          d.calc.map(function (l) { return "<div>" + esc(l) + "</div>"; }).join("") +
+          "</div></td></tr>";
+      }
+      return row;
     });
     return '<div class="fitbox"><table>' + rows.join("") +
       "<tr><td><b>fits</b> - the smallest of the five</td><td><b>+" + fit + "</b></td></tr></table>" +

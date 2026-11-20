@@ -1207,6 +1207,17 @@ page draws the pool's claim as the light segment after the measured fill, so
 "92 GHz used" can read as "9 of it yours, 83 somebody else's, and your eight
 workers already claim the machine".
 
+When nothing fits, the `+0` chip is red and the breakdown replaces the one-line
+basis with the arithmetic itself, generated from the live numbers:
+
+    3 workers, 6 vCPU each, 1 vCPU : 1 core -> 15.6 GHz charge per worker
+    used 88.9 GHz = ours 1.7 + others 87.2
+    standing: others 87.2 + 3 x 15.6 = 134.0 of 124.8 -> already 9.2 GHz over
+    one more: 87.2 + 4 x 15.6 = 149.6 -> room -24.8 -> 0
+
+That is the answer to "the bar says 71 % used, why does nothing fit": the bar
+measures, the entitlement charges.
+
 A platform whose figure is a quota (vCD) has no such split: its limit is already
 the pool's, so the measured rule applies there unchanged.
 
