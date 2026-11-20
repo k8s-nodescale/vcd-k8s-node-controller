@@ -1894,8 +1894,8 @@ The ingress has no `host` by default (`ui.ingress.host`), so it answers on any
 name; set one where a real hostname exists.
 
 The header prints the release the page belongs to (the chart's `appVersion`,
-passed as `--release`), next to the snapshot time, so a screenshot or a support
-call says which build is being looked at.
+passed as `--release`) beside the product name, so a screenshot or a support call
+says which build is being looked at.
 
 HTTPS works on the ingress controller's HTTPS port with its own self-signed
 certificate, and the page is also served over plain HTTP. No redirect is set:

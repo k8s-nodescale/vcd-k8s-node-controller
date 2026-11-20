@@ -60,6 +60,10 @@
   }
   header h1 { font-size: 15px; margin: 0; letter-spacing: .02em; line-height: 1.25; }
   header h1 small { display: block; font-size: 11px; font-weight: 400; color: var(--muted); }
+  /* the release sits beside the product name, not in the far corner: it belongs
+     to the title, and the cluster name keeps its own line underneath */
+  header h1 .ver { margin-left: 8px; font-size: 11px; font-weight: 400;
+                   color: var(--muted); letter-spacing: 0; vertical-align: 1px; }
   #whoami { font-size: 13px; white-space: nowrap; }
   .chip.group.ok { background: rgba(30, 123, 52, .16); }
   .chip.group.warn { background: rgba(179, 92, 0, .16); }
@@ -336,13 +340,12 @@
 </head>
 <body>
 <header>
-  <h1>nodescale-ui<small id="clusterName"></small></h1>
+  <h1>nodescale-ui<span class="ver" id="version" title="nodescale release">__VERSION__</span><small id="clusterName"></small></h1>
   <span class="spacer"></span>
   <span class="small muted" id="viewerNote" style="display:none">read only</span>
   <button class="ghost icon" id="theme" title="switch the colours">night</button>
   <span id="whoami" title="signed-in account"></span>
   <button class="ghost" id="signOut" title="sign out" style="display:none">sign out</button>
-  <span class="small muted" id="version" title="nodescale release">__VERSION__</span>
   <span class="small muted" id="stamp">loading…</span>
 </header>
 
