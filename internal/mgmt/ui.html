@@ -162,19 +162,25 @@
      block to the taller one and the buttons end up on one level */
   /* the third pane is the one that grows: the other two stop at their content */
   .pane.capacity { flex: 1 1 300px; min-width: 260px; }
-  .caprows { display: flex; flex-direction: column; gap: 9px; }
+  .caprows { --caplbl: 76px; display: flex; flex-direction: column; gap: 9px; }
   .caprow { display: flex; align-items: center; gap: 8px; font-size: 12px; }
-  .caplbl { width: 64px; color: var(--muted); }
+  /* One label column for every capacity row, so the compute bars, the address
+     window and the pod network all start on the same x. The label never wraps:
+     the "..." of the storage row belongs beside the word, not under it. */
+  .caplbl { flex: 0 0 var(--caplbl); width: var(--caplbl); color: var(--muted);
+            white-space: nowrap; }
   .caprow .dbar { flex: 1 1 auto; min-width: 60px; }
   .capnum { font-size: 11px; color: var(--muted); white-space: nowrap; }
   .capnote { font-size: 11px; color: var(--muted); margin-top: 2px; }
   .capnote.warn { color: var(--warn); }
+  /* the CIDR a note is about, in the colour the bars use for "room left" */
+  .cidr { color: var(--ok); }
   /* the datastore list behind the storage bar: the button sits in the label,
      the list three rows tall under the row and scrolls past that */
   .caplbl .more { margin-left: 2px; padding: 0 3px; border: 0; background: none;
                   color: var(--muted); font: inherit; cursor: pointer; line-height: 1; }
   .caplbl .more:hover, .caplbl .more[aria-expanded="true"] { color: var(--fg); }
-  .dsbox { margin: -3px 0 0 72px; border: 1px solid var(--line); border-radius: 6px;
+  .dsbox { margin: -3px 0 0 calc(var(--caplbl) + 8px); border: 1px solid var(--line); border-radius: 6px;
            background: var(--bg); padding: 2px 6px 4px; }
   .dslist { max-height: 72px; overflow-y: auto; }
   .dsrow { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 8px;
@@ -192,7 +198,10 @@
   /* the pod network is counted in nodes, so its bar is a row of slots: one per
      node the range can carry, filled when a node holds one */
   .caprow.pod { margin-top: 2px; }
-  .caprow.pod .caplbl, .caprow.podbar .caplbl { width: auto; }
+  /* the heading row carries the whole CIDR, so its label is as wide as the
+     text; the bar row gets an empty label of the standard width instead, which
+     is what lines it up with the bars above */
+  .caprow.pod .caplbl { flex: 0 1 auto; width: auto; }
   .caprow.podbar { margin-top: -3px; }
   .pslots { display: flex; gap: 3px; flex: 1 1 auto; min-width: 60px; height: 15px; }
   .pslots i { flex: 1 1 0; min-width: 2px; border-radius: 3px;
@@ -627,6 +636,7 @@
 
     return '<div class="caprow pod"><span class="caplbl">POD CIDR ' + esc(c.podCIDR) + "</span></div>" +
       '<div class="caprow podbar" title="' + esc("blocks " + (c.podBlocksUsed || 0) + " of " + blocks + " used") + '">' +
+        '<span class="caplbl"></span>' +
         '<span class="pslots">' + segs + "</span>" +
         '<span class="capnum">' + assigned + " / " + capacity + " nodes</span>" +
       "</div>" +
@@ -647,24 +657,43 @@
     if (!p.ipNetwork || size <= 0) { return ""; }
     var share = Math.min(100, used / size * 100);
     var lvl = share >= 90 ? "high" : share >= 80 ? "warn" : "ok";
-    var range = p.ipWindowFrom + " - " + p.ipWindowTo;
-    var note = '<div class="capnote">window ' + esc(range) + " of " + esc(p.ipNetwork) +
+    // A window of one address is not a range: "a - a" reads like a typo.
+    var range = p.ipWindowFrom === p.ipWindowTo
+      ? p.ipWindowFrom : p.ipWindowFrom + " - " + p.ipWindowTo;
+    // The window is this pool's own reservation, not subnet occupancy: nodeCount
+    // addresses from wNodeOffset, while the dvm, the load balancers and the
+    // masters each keep their own offsets in the same CIDR. Naming them is what
+    // makes "3 / 17" readable next to a cluster that runs eight VMs.
+    var note = '<div class="capnote" title="' + esc("spec.ipPlan: " + size +
+      " worker addresses starting at wNodeOffset. The dvm, the load balancers and the masters keep their own offsets in " +
+      p.ipNetwork + ", so they are not part of this count.") + '">' +
+      "window <b>[" + esc(range) + "]</b> of " + cidrOf(p.ipNetwork) +
       " belongs to this pool</div>";
     if (p.ipSuggest) {
       note += '<div class="capnote" title="' +
         esc("free in " + p.ipNetwork + ": " + (p.ipFree || []).join(", ")) + '">next free window: ' +
         esc(p.ipSuggest) + "</div>";
     } else if (p.ipNoGap) {
-      note += '<div class="capnote warn">no free addresses left in ' + esc(p.ipNetwork) +
+      note += '<div class="capnote warn">no free addresses left in ' + cidrOf(p.ipNetwork) +
         " for another pool</div>";
     } else if (p.ipFree && p.ipFree.length) {
-      note += '<div class="capnote">free in ' + esc(p.ipNetwork) + ": " + esc(p.ipFree.join(", ")) + "</div>";
+      note += '<div class="capnote" title="' + esc("the gaps between the pool windows; the " +
+        "addresses below the first window hold the plan's fixed offsets and are never offered to another pool") +
+        '">free for another pool in ' + cidrOf(p.ipNetwork) + ": " + esc(p.ipFree.join(", ")) + "</div>";
     }
-    return '<div class="caprow pod"><span class="caplbl">NODE IPS ' + esc(p.ipNetwork) + "</span></div>" +
-      '<div class="caprow podbar" title="' + esc(range + " - " + used + " of " + size + " addresses used") + '">' +
+    return '<div class="caprow pod"><span class="caplbl">NODE IPS ' + cidrOf(p.ipNetwork) + "</span></div>" +
+      '<div class="caprow podbar" title="' +
+        esc(range + " - " + used + " of " + size + " worker addresses handed out") + '">' +
+        '<span class="caplbl"></span>' +
         '<span class="dbar d-' + lvl + '"><i style="width:' + share.toFixed(1) + '%"></i></span>' +
-        '<span class="capnum">' + used + " / " + size + "</span>" +
+        '<span class="capnum">' + used + " / " + size + " workers</span>" +
       "</div>" + note;
+  }
+
+  // cidrOf marks the subnet a note is about: in a window or a gap the address
+  // that matters most is the network they are carved out of.
+  function cidrOf(cidr) {
+    return '<span class="cidr" title="the subnet this pool plans its addresses in">' + esc(cidr) + "</span>";
   }
 
   // The disk editor. Sizes are edited as a draft and only reach the CRD through

@@ -118,7 +118,7 @@ func TestAddressSpacesUseShiftedWindows(t *testing.T) {
 		},
 	}
 	sp := buildAddressSpaces([]infrav1.K8sWorkerPool{pool})["10.99.96.64/26"]
-	if len(sp.free) != 1 || sp.free[0] != "10.99.96.126 - 10.99.96.126" {
+	if len(sp.free) != 1 || sp.free[0] != "10.99.96.126" {
 		t.Fatalf("free = %v, want only .126 after the shifted window", sp.free)
 	}
 }

@@ -304,6 +304,12 @@ func buildAddressSpaces(pools []infrav1.K8sWorkerPool) map[string]addressSpace {
 		}
 		sp := addressSpace{}
 		for _, g := range gaps {
+			// One spare address is an address, not a range: "a - a" reads like
+			// a typo and hides that the gap is a single host.
+			if g[0] == g[1] {
+				sp.free = append(sp.free, addr(g[0]))
+				continue
+			}
 			sp.free = append(sp.free, addr(g[0])+" - "+addr(g[1]))
 		}
 		// The first gap that holds a default-sized pool, otherwise the largest
