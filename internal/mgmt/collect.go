@@ -367,6 +367,7 @@ func (c *Collector) poolView(ctx context.Context, p *infrav1.K8sWorkerPool, byNo
 		}
 	}
 	view.Busy = busyReason(p)
+	view.Preflight = p.Spec.Capacity.Preflight == nil || *p.Spec.Capacity.Preflight
 
 	from, to, size, declared := ipWindow(p.Spec.IPPlan)
 	view.IPNetwork = p.Spec.IPPlan.CIDR

@@ -75,6 +75,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST "+p+"/api/pools/{name}/delete-workers", s.postDeleteWorkers)
 	mux.HandleFunc("POST "+p+"/api/pools/{name}/disks", s.postDisks)
 	mux.HandleFunc("POST "+p+"/api/pools/{name}/cpu-per-core", s.postCPUPerCore)
+	mux.HandleFunc("POST "+p+"/api/pools/{name}/refresh-capacity", s.postRefreshCapacity)
+	mux.HandleFunc("POST "+p+"/api/pools/{name}/preflight", s.postPreflight)
 	if p != "" {
 		mux.HandleFunc("GET "+p, func(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, p+"/", http.StatusFound)
@@ -271,6 +273,29 @@ func (s *Server) postCPUPerCore(w http.ResponseWriter, r *http.Request) {
 	}
 	s.collectNow(r.Context())
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "cpuPerCore": body.CPUPerCore})
+}
+
+func (s *Server) postRefreshCapacity(w http.ResponseWriter, r *http.Request) {
+	if err := s.RefreshCapacity(r.Context(), r.PathValue("name")); err != nil {
+		writeError(w, statusFor(err), err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) postPreflight(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := decode(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := s.SetPreflight(r.Context(), r.PathValue("name"), body.Enabled); err != nil {
+		writeError(w, statusFor(err), err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "enabled": body.Enabled})
 }
 
 func (s *Server) postDeleteWorkers(w http.ResponseWriter, r *http.Request) {

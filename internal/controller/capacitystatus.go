@@ -44,7 +44,8 @@ func (r *WorkerPoolReconciler) refreshCapacityStatus(ctx context.Context, pool *
 	cur := pool.Status.Capacity
 	if cur != nil &&
 		cur.ObservedReplicas == pool.Status.ObservedReplicas &&
-		time.Since(cur.At.Time) < capacityStatusTTL {
+		time.Since(cur.At.Time) < capacityStatusTTL &&
+		!refreshRequested(pool, cur) {
 		return
 	}
 
@@ -290,4 +291,20 @@ func (r *WorkerPoolReconciler) calicoBudget(ctx context.Context, out *podBudget)
 		}
 	}
 	return true
+}
+
+// refreshRequested reports whether an operator asked for a fresh snapshot since
+// the last one. The page writes infrav1.CapacityRefreshAnnotation and the
+// controller honours it once, which is what makes "update now" possible without
+// shortening the TTL for everybody.
+func refreshRequested(pool *infrav1.K8sWorkerPool, cur *infrav1.CapacityStatus) bool {
+	raw := pool.Annotations[infrav1.CapacityRefreshAnnotation]
+	if raw == "" {
+		return false
+	}
+	at, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return false
+	}
+	return cur == nil || at.After(cur.At.Time)
 }

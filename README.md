@@ -1214,6 +1214,16 @@ The page offers the same setting as `Assume 2 vCPU : 1 core` beside its fit line
 and writes this field, so the number it shows and the number that admits a worker
 cannot disagree.
 
+The snapshot it reads is ten minutes old by design (`capacityStatusTTL`); the
+`refresh` beside the snapshot time asks for a new one immediately, which the page
+does by writing `k8s-nodescale.github.io/capacity-refresh-at` and the controller
+honours on its next pass.
+
+`capacity planner` beside the fit line is `spec.capacity.preflight`. Turning it off
+is a deliberate choice to plan the resources yourself: the controller stops reading
+the platform's capacity, stops parking workers that do not fit, and takes no
+snapshot - the page then says so instead of showing numbers nobody refreshes.
+
 #### When a worker never registers
 
 A VM that boots but never registers a Node (a broken cloud-init, an apt mirror

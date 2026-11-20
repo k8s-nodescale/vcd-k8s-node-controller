@@ -162,13 +162,17 @@ type Pool struct {
 	// Activity is what the pool is doing right now, in one word: the rollout
 	// phase when a replacement is running, otherwise the step the newest
 	// worker is at (Provisioning, Joining, Draining ...). See activity().
-	Activity        string    `json:"activity,omitempty"`
-	Message         string    `json:"message,omitempty"`
-	MinReplicas     int32     `json:"minReplicas"`
-	AllowLastWorker bool      `json:"allowLastWorker"`
-	DeleteWorkers   []string  `json:"deleteWorkers,omitempty"`
-	Flavor          Flavor    `json:"flavor"`
-	Capacity        *Capacity `json:"capacity,omitempty"`
+	Activity        string   `json:"activity,omitempty"`
+	Message         string   `json:"message,omitempty"`
+	MinReplicas     int32    `json:"minReplicas"`
+	AllowLastWorker bool     `json:"allowLastWorker"`
+	DeleteWorkers   []string `json:"deleteWorkers,omitempty"`
+	Flavor          Flavor   `json:"flavor"`
+	// Preflight is spec.capacity.preflight: whether the controller reads the
+	// platform's capacity at all. Off means the owner plans the resources, and
+	// the page says so instead of showing numbers nobody refreshes.
+	Preflight bool      `json:"preflight"`
+	Capacity  *Capacity `json:"capacity,omitempty"`
 	// The address window the pool owns inside its CIDR. Two pools can share a
 	// CIDR only if their windows do not overlap, so the page has to show where
 	// this one starts and ends, not just the network.

@@ -1056,7 +1056,9 @@
     }
     if (c.at) {
       rows.push('<div class="capnote">snapshot ' + new Date(c.at).toLocaleTimeString() +
-        (c.observedReplicas != null ? " at " + c.observedReplicas + " workers" : "") + "</div>");
+        (c.observedReplicas != null ? " at " + c.observedReplicas + " workers" : "") +
+        ' <button class="more" id="capRefresh" type="button" title="read the platform again now">' +
+        "refresh</button></div>");
     }
     box.innerHTML = rows.join("");
     var more = document.getElementById("dsMore");
@@ -1072,6 +1074,21 @@
       fq.onclick = function () {
         state.fitOpen = !state.fitOpen;
         renderCapacity(p);
+      };
+    }
+    var capRefresh = document.getElementById("capRefresh");
+    if (capRefresh) {
+      capRefresh.onclick = function () {
+        capRefresh.disabled = true;
+        post("refresh-capacity", {});
+      };
+    }
+    var pfs = document.getElementById("preflightSw");
+    if (pfs) {
+      pfs.disabled = !isAdmin();
+      pfs.onchange = function () {
+        pfs.disabled = true;
+        post("preflight", { enabled: pfs.checked });
       };
     }
     var assum = document.getElementById("cpuAssum");
@@ -1146,6 +1163,7 @@
   // number must not become the reason the pool stops.
   function fitDims(p, c, perCore) {
     var out = [];
+    if (p && p.preflight === false) { return out; }
     var f = c.fit || {};
     var res = reservedOf(p, c);
     // CPU is charged here rather than read from the snapshot, so the switch shows
@@ -1239,10 +1257,15 @@
   // behind the CPU half of it. The assumption is offered only where the platform
   // reports physical capacity: a quota cannot be overcommitted.
   function fitLine(p, c, dims, fit, bind) {
+    if (p && p.preflight === false) {
+      return '<div class="fitline"><span>capacity planner off - the controller reads no capacity and creates ' +
+        'workers as asked</span>' + preflightSwitch(false) + "</div>";
+    }
     if (fit == null) { return ""; }
     var s = '<div class="fitline"><span>FITS <b>' + fit + "</b> MORE WORKER" + (fit === 1 ? "" : "S") +
       " \u00b7 limited by <span class=\"bind\">" + esc(bind.key) + "</span> " +
       '<button class="info sm qbtn" type="button" id="fitq" title="how the number is computed">?</button></span>';
+    s += preflightSwitch(true);
     if (c.physical) {
       s += '<label class="sw" title="how many vCPUs the pre-flight lets one physical core carry: 1 charges a worker its whole vCPU count in core speed, 2 charges half of it">' +
         "<span>Assume 2 vCPU : 1 core</span>" +
@@ -1251,6 +1274,16 @@
     s += "</div>";
     if (state.fitOpen) { s += fitBox(dims, fit, c); }
     return s;
+  }
+
+  // preflightSwitch is the operator's deliberate choice to keep the capacity
+  // planner, or to plan the resources themselves. Off means the controller stops
+  // reading capacity and stops parking workers that do not fit.
+  function preflightSwitch(on) {
+    return '<label class="sw" title="the controller reads the platform capacity and parks a worker that does not fit; ' +
+      'off leaves the planning to you">' +
+      "<span>capacity planner</span>" +
+      '<input type="checkbox" id="preflightSw"' + (on ? " checked" : "") + "></label>";
   }
 
   function fitBox(dims, fit, c) {

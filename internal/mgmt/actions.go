@@ -245,3 +245,31 @@ func removableWhileBusy(nodes []infrav1.WorkerNodeStatus, names []string) bool {
 	}
 	return true
 }
+
+// RefreshCapacity asks the controller for a fresh capacity snapshot: the page
+// writes an annotation the controller compares with the snapshot's own time. It
+// is exempt from the one-operation-at-a-time rule - reading capacity harms
+// nothing, and a running operation is when the numbers are wanted most.
+func (s *Server) RefreshCapacity(ctx context.Context, name string) error {
+	return s.updateUnlessBusy(ctx, name, "refresh-capacity",
+		func(*infrav1.K8sWorkerPool) bool { return true },
+		func(p *infrav1.K8sWorkerPool) error {
+			if p.Annotations == nil {
+				p.Annotations = map[string]string{}
+			}
+			p.Annotations[infrav1.CapacityRefreshAnnotation] = time.Now().UTC().Format(time.RFC3339)
+			return nil
+		})
+}
+
+// SetPreflight turns the capacity planner on or off. Off means the controller
+// neither reads the platform's capacity nor parks a worker that does not fit, and
+// takes no snapshot - the owner plans the resources by themselves, which the page
+// says instead of showing numbers it no longer refreshes.
+func (s *Server) SetPreflight(ctx context.Context, name string, enabled bool) error {
+	return s.update(ctx, name, fmt.Sprintf("preflight=%t", enabled), func(p *infrav1.K8sWorkerPool) error {
+		v := enabled
+		p.Spec.Capacity.Preflight = &v
+		return nil
+	})
+}

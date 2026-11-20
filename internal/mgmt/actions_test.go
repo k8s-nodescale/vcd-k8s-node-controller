@@ -153,3 +153,45 @@ func TestDeleteOfWorkersInJoiningStaysLocked(t *testing.T) {
 		t.Fatalf("err = %v, want a refused request while the node is converging", err)
 	}
 }
+
+// "Refresh now" writes an annotation the controller compares with the snapshot's
+// own time, and it stays possible while an operation runs: reading capacity harms
+// nothing, and a running operation is when the numbers are wanted most.
+func TestRefreshCapacityAsksTheController(t *testing.T) {
+	p := testPool(2)
+	p.Status.Nodes = []infrav1.WorkerNodeStatus{
+		{Name: "kion-web-dev-wrk-01", Phase: infrav1.NodePhaseReady},
+		{Name: "kion-web-dev-wrk-02", Phase: infrav1.NodePhaseProvisioning},
+	}
+	c := testClient(t, p)
+	if why := busyReason(p); why == "" {
+		t.Fatal("the pool is not busy; the test proves nothing")
+	}
+	if err := (&Server{Client: c}).RefreshCapacity(context.Background(), "kion-web-dev"); err != nil {
+		t.Fatalf("refresh while busy: %v", err)
+	}
+	got := &infrav1.K8sWorkerPool{}
+	if err := c.Get(context.Background(), client.ObjectKey{Name: "kion-web-dev"}, got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Annotations[infrav1.CapacityRefreshAnnotation] == "" {
+		t.Fatalf("annotations = %v, want the refresh request", got.Annotations)
+	}
+}
+
+// The planner switch is a spec field, so it is the owner's decision that survives
+// a restart and is visible in the object.
+func TestSetPreflightWritesTheSpec(t *testing.T) {
+	c := testClient(t, testPool(1))
+	s := &Server{Client: c}
+	if err := s.SetPreflight(context.Background(), "kion-web-dev", false); err != nil {
+		t.Fatalf("preflight off: %v", err)
+	}
+	got := &infrav1.K8sWorkerPool{}
+	if err := c.Get(context.Background(), client.ObjectKey{Name: "kion-web-dev"}, got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Spec.Capacity.Preflight == nil || *got.Spec.Capacity.Preflight {
+		t.Fatalf("preflight = %v, want false", got.Spec.Capacity.Preflight)
+	}
+}

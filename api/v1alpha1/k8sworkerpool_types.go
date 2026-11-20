@@ -77,6 +77,12 @@ const (
 	RolloutPhaseQueued = "Queued"
 )
 
+// CapacityRefreshAnnotation is set by the management page to ask for a fresh
+// capacity snapshot. The controller compares it with the snapshot's own time and
+// re-reads the platform once; it is not a spec field because it is a request, not
+// a desired state.
+const CapacityRefreshAnnotation = "k8s-nodescale.github.io/capacity-refresh-at"
+
 // K8sWorkerPoolSpec defines the desired worker pool.
 //
 // The address window is a hard ceiling, unlike the capacity estimate: a worker
