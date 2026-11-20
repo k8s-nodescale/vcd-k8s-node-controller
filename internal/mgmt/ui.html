@@ -1390,22 +1390,33 @@
 
   function poolKey(p) { return p.name; }
 
+  // A slot that cannot serve traffic is removable even while another operation
+  // runs: removing it spends no drain budget, and it is the way out of a worker
+  // that never came up. Mirrors noneServe() in the sidecar, which is what accepts
+  // or refuses the write.
+  var NOT_SERVING = ["Provisioning", "Joining", "Queued", "Failed", "Missing", "Deleting"];
+  function removableWhileBusy(n) { return NOT_SERVING.indexOf(n.phase) >= 0; }
+
   function workerRow(p, n, admin) {
     var act;
     if (n.deleting) {
       act = '<span class="small muted">removing…</span>';
-    } else if (p.busy) {
-      act = '<span class="small muted" title="' + esc(p.busy) + '">locked</span>';
     } else if (!admin) {
       act = '<span class="small muted">view only</span>';
     } else if (state.pendingDelete && state.pendingDelete.pool === poolKey(p) && state.pendingDelete.worker === n.name) {
+      // (the confirmation below wins over the busy lock: the row it belongs to
+      // is one the lock does not cover)
       // A second click on the same row, not a native dialog a browser may
       // suppress: this is the confirmation.
       act = '<span class="small confirm">delete it?</span> ' +
         '<button class="danger" data-yes="' + esc(n.name) + '" data-pool="' + esc(poolKey(p)) + '">yes</button> ' +
         '<button class="ghost small" data-no="1">no</button>';
+    } else if (p.busy && !removableWhileBusy(n)) {
+      act = '<span class="small muted" title="' + esc(p.busy) + '">locked</span>';
     } else {
-      act = '<button class="danger" data-del="' + esc(n.name) + '" data-pool="' + esc(poolKey(p)) + '">delete</button>';
+      act = '<button class="danger" data-del="' + esc(n.name) + '" data-pool="' + esc(poolKey(p)) +
+        '"' + (p.busy ? ' title="this worker cannot serve, so removing it does not need the drain budget"' : "") +
+        '>delete</button>';
     }
 
     // The switches under the pool name decide what a row carries beyond its
