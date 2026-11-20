@@ -312,3 +312,47 @@ func TestQueuedWorkerStaysQueuedWhenTheCreateFails(t *testing.T) {
 		t.Fatalf("message after a failed create = %q", n.Message)
 	}
 }
+
+// A scale-out is one batch, and the pre-flight has to charge its own admissions.
+// The platform reports measured usage, so a worker admitted a second ago has not
+// changed the free figure yet; without counting the batch, every one-worker check
+// sees the same free capacity and the whole request is created - which is how
+// four workers were started on 2026-11-20 while the page said two fit.
+func TestScaleUpChargesTheWholeBatch(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(4)
+	// Room for exactly three test workers (2 vCPU x 2600 MHz each).
+	// A measured platform: the created workers are not booked, exactly like the
+	// host usage vSphere reports.
+	fc := &fakeCloud{noConsume: true, capacity: cloud.PlatformCapacity{
+		Physical:      true,
+		Measured:      true,
+		CPUMHzPerCore: 2600,
+		CPU:           cloud.ResourceCapacity{Limit: 3 * 2 * 2600, Used: 0},
+		MemoryMB:      cloud.ResourceCapacity{Limit: 1 << 20, Used: 0},
+	}}
+	r := newTestReconciler(t, fc, &fakeKube{}, pool)
+
+	if _, err := r.Reconcile(ctx, requestFor(pool)); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	got := getPool(t, r, pool)
+	if len(fc.created) != 3 {
+		for _, n := range got.Status.Nodes {
+			t.Logf("node %s %s %q", n.Name, n.Phase, n.Message)
+		}
+		t.Fatalf("created %d VMs, want 3: the fourth must be queued", len(fc.created))
+	}
+	var provisioning, queued int
+	for _, n := range got.Status.Nodes {
+		switch n.Phase {
+		case infrav1.NodePhaseProvisioning:
+			provisioning++
+		case infrav1.NodePhaseQueued:
+			queued++
+		}
+	}
+	if provisioning != 3 || queued != 1 {
+		t.Fatalf("phases: %d provisioning, %d queued, want 3 and 1", provisioning, queued)
+	}
+}

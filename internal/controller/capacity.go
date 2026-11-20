@@ -74,6 +74,15 @@ func cpuChargeMHz(pool *infrav1.K8sWorkerPool, capacity cloud.PlatformCapacity) 
 // and attempting the create (the behaviour before the pre-flight existed) is
 // better than a pool that cannot scale because a read broke.
 func (r *WorkerPoolReconciler) capacityAllows(ctx context.Context, pool *infrav1.K8sWorkerPool, req cloud.CapacityRequest) (bool, string) {
+	return r.capacityAllowsBatch(ctx, pool, req, 1)
+}
+
+// capacityAllowsBatch is capacityAllows for a scale-out that admits several
+// workers in one pass. Where the platform's Used is measured (vSphere) the
+// workers admitted earlier in the pass are charged too, because their usage is
+// not in the figure yet; where it is allocated (vCD) they are already counted and
+// charging them again would halve the batch.
+func (r *WorkerPoolReconciler) capacityAllowsBatch(ctx context.Context, pool *infrav1.K8sWorkerPool, req cloud.CapacityRequest, admitted int32) (bool, string) {
 	if !capacityPreflightEnabled(pool) {
 		return true, ""
 	}
@@ -88,6 +97,9 @@ func (r *WorkerPoolReconciler) capacityAllows(ctx context.Context, pool *infrav1
 		log.FromContext(ctx).V(1).Info("capacity pre-flight skipped: the vDC capacity could not be read",
 			"pool", pool.Name, "error", err)
 		return true, ""
+	}
+	if capacity.Measured && admitted > 1 {
+		req = batchRequest(req, admitted)
 	}
 	ok, short := capacity.Fits(req, cpuChargeMHz(pool, capacity))
 	if ok {
@@ -153,6 +165,21 @@ func resizeCapacityRequest(have, target *infrav1.FlavorStatus) cloud.CapacityReq
 		req.StorageMB = map[string]int64{"": int64(d) * 1024}
 	}
 	return req
+}
+
+// batchRequest is n copies of one worker's request: what this pass has already
+// admitted plus the one it is about to admit. The pre-flight charges nominal
+// MHz per worker while the platform reports measured usage, so without counting
+// its own batch it sees the same free capacity for every worker of a scale-out.
+func batchRequest(one cloud.CapacityRequest, n int32) cloud.CapacityRequest {
+	if n <= 1 {
+		return one
+	}
+	out := one
+	for i := int32(1); i < n; i++ {
+		out = addCapacityRequest(out, one)
+	}
+	return out
 }
 
 // addCapacityRequest sums two requests, so a batch can be checked as one.

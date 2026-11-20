@@ -1125,6 +1125,13 @@ parked as `Queued`, its name and address stay reserved, and the pool reports
       "2 worker(s) queued for vDC capacity: demo-cluster-wrk-04 (10.10.0.10), ...
        (waiting for vDC capacity: memory: need 8192 MB, 4096 MB free)"
 
+A scale-out is checked as a batch, not one worker at a time. Where the platform's
+used capacity is *measured* (vSphere's host usage), a worker created a second ago
+has not moved the figure, so the pass charges its own admissions: asking for four
+workers when two fit creates two and queues two. Where the platform *books* a VM
+into its allocation as it is created (vCD), the figure already includes it and the
+check charges one worker at a time.
+
 `status.observedReplicas` counts the queued slots, so a scale-out is accepted and
 visible instead of being retried as a failing create. Every pass retries the
 queue: as soon as the vDC has room, the VM is created under the same name and

@@ -141,6 +141,13 @@ type PlatformCapacity struct {
 	// assumption may only be applied to a physical number: dividing a quota
 	// would admit a request the platform then refuses.
 	Physical bool
+	// Measured says Used is what the platform observes on the hosts, so a VM
+	// created a moment ago has not moved it yet. A pre-flight that admits a
+	// batch must then charge its own admissions, or every one-worker check in
+	// the pass reads the same free number (vSphere). Where Used is allocated
+	// (vCD books the VM as it is created) that would charge it twice, so the
+	// flag stays false and only one worker is charged at a time.
+	Measured bool
 	CPU      ResourceCapacity // MHz
 	MemoryMB ResourceCapacity // MB
 	Storage  []StorageProfileCapacity

@@ -42,6 +42,10 @@ type fakeCloud struct {
 	calls           int
 	failAt          int
 	failAfterCreate bool
+	// noConsume keeps a created VM out of the fake capacity, the way a platform
+	// that reports measured host usage behaves: a worker created a moment ago has
+	// not moved the number yet.
+	noConsume bool
 }
 
 // For makes the fake a cloud.Factory: one fake serves every pool, whatever
@@ -98,7 +102,9 @@ func (f *fakeCloud) CreateVM(ctx context.Context, spec cloud.CreateVMSpec) (clou
 	}
 	f.vms = append(f.vms, vm)
 	f.created = append(f.created, spec)
-	f.consume(spec)
+	if !f.noConsume {
+		f.consume(spec)
+	}
 	return vm, nil
 }
 

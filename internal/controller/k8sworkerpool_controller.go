@@ -1003,7 +1003,15 @@ func (r *WorkerPoolReconciler) scaleUp(ctx context.Context, before, pool *infrav
 		// pass. Park the rest of the request instead: the slots keep their
 		// name and address and resumeQueuedCreates starts them once the vDC
 		// has room.
-		if ok, why := r.capacityAllows(ctx, pool, workerCapacityRequest(pool, pool.Status.Nodes)); !ok {
+		//
+		// The check charges this pass's own admissions, not just the one worker
+		// about to be created. The platform reports what the hosts *measure*,
+		// while the pre-flight charges a nominal amount per worker, so a VM
+		// admitted a second ago has not moved the free figure yet: four one-worker
+		// checks against the same free MHz would all pass, which is how a request
+		// for four workers was created in full while the page said two fit
+		// (2026-11-20). batchRequest counts them.
+		if ok, why := r.capacityAllowsBatch(ctx, pool, workerCapacityRequest(pool, pool.Status.Nodes), i+1); !ok {
 			if err := r.queueSlots(ctx, pool, alloc, n-i, why); err != nil {
 				return err
 			}

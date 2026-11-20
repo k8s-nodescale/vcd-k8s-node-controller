@@ -91,6 +91,9 @@ func (p *Provider) Capacity(ctx context.Context) (cloud.PlatformCapacity, error)
 	// The hosts of the cluster are the numbers: real cores, real memory. The
 	// pre-flight may therefore apply an overcommit assumption to them.
 	out.Physical = true
+	// Host usage is measured, not allocated: a worker created seconds ago is not
+	// in the figure yet, so the pre-flight has to charge its own batch.
+	out.Measured = true
 	usable := 0
 	for i := range mhs {
 		m := &mhs[i]
