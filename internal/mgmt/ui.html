@@ -455,7 +455,7 @@
   } catch (e) {}
   var state = { pools: [], current: null, stamp: "", stale: false, me: null, draft: null,
                 flavorDraft: null, flavorEdit: false, pendingDelete: null, diskDraft: null,
-                pendingDisks: null, fitOpen: false,
+                pendingDisks: null, fitOpen: false, perCore: null, perCoreAt: 0,
                 flags: { taints: false, volumes: false, sts: false, dense: false, ds: false } };
   var pick = document.getElementById("poolPick");
 
@@ -996,18 +996,31 @@
       box.innerHTML = '<span class="small muted">the controller has not published a capacity snapshot yet</span>';
       return;
     }
+    // The CPU assumption the page paints with. It is read from the spec by the
+    // server, but the value the operator just clicked is kept for a few seconds:
+    // the sidecar runs two replicas, each with its own collection, so a read can
+    // land on the other pod's cache (up to ui.refreshInterval old) and undo the
+    // click on screen. After the grace the server is authoritative again.
+    if (state.perCore == null || Date.now() - state.perCoreAt > 20000) {
+      state.perCore = c.cpuPerCore || 1;
+      state.perCoreAt = Date.now();
+    }
+    var perCore = state.perCore;
+
     // Per-dimension answers first, then the smallest one: that number, and the
     // dimension it came from, is what the pane is read for.
-    var dims = fitDims(p, c);
+    var dims = fitDims(p, c, perCore);
     var fit = dims.length ? dims[0].n : null;
     var bind = dims.length ? dims[0] : null;
-    for (var i = 1; i < dims.length; i++) {
-      if (dims[i].n < fit) { fit = dims[i].n; bind = dims[i]; }
+    var cpuFit = null;
+    for (var i = 0; i < dims.length; i++) {
+      if (dims[i].key === "vCPU") { cpuFit = dims[i].n; }
+      if (i > 0 && dims[i].n < fit) { fit = dims[i].n; bind = dims[i]; }
     }
 
     var rows = [
-      capRow("vCPU" + cpuTip(c), c.cpu, c.cpuMHz / 1000, c.cpuLimitMHz / 1000, "GHz", 1,
-        c.fit && c.fit.cpu, bind && bind.key === "vCPU"),
+      capRow("vCPU" + cpuTip(c, perCore, p.flavor.cpus), c.cpu, c.cpuMHz / 1000, c.cpuLimitMHz / 1000, "GHz", 1,
+        cpuFit, bind && bind.key === "vCPU"),
       capRow("RAM", c.memory, c.memoryMB / 1024, c.memoryLimitMB / 1024, "GB", 0,
         c.fit && c.fit.memory, bind && bind.key === "RAM"),
       storageRow(c, c.fit && c.fit.storage, bind && bind.key === "storage")
@@ -1049,9 +1062,23 @@
     if (assum) {
       // The switch is a pool setting, not a local preference: the pre-flight
       // reads the same field, so the number on screen and the number that admits
-      // a worker cannot disagree.
+      // a worker cannot disagree. It is a write, so it obeys the same lock as
+      // every other write - a pool with an operation in flight refuses them all -
+      // and it goes dead for the round trip, so a double click cannot race its own
+      // refresh.
+      assum.disabled = !!p.busy || !isAdmin();
+      if (p.busy) {
+        assum.parentNode.title = "an operation is already in progress: " + p.busy +
+          "; the assumption unlocks when the pool is idle";
+      }
       assum.onchange = function () {
-        post("cpu-per-core", { cpuPerCore: assum.checked ? 2 : 1 });
+        // Paint first: the number on the pane is derived from this value, and the
+        // write only has to catch up with what the operator already sees.
+        state.perCore = assum.checked ? 2 : 1;
+        state.perCoreAt = Date.now();
+        assum.disabled = true;
+        renderCapacity(p);
+        post("cpu-per-core", { cpuPerCore: state.perCore });
       };
     }
   }
@@ -1061,11 +1088,22 @@
   // plus the two the page already counts - pod blocks and addresses in the ip
   // range. A dimension that cannot be measured is left out, because a missing
   // number must not become the reason the pool stops.
-  function fitDims(p, c) {
+  function fitDims(p, c, perCore) {
     var out = [];
     var f = c.fit || {};
-    if (f.cpu != null) {
-      out.push({ key: "vCPU", n: f.cpu, basis: cpuCharge(c) });
+    // CPU is charged here rather than read from the snapshot, so the switch shows
+    // its effect at once: core speed and the pool's vCPU count are both known,
+    // and the rule is the pre-flight's (round the per-vCPU charge up).
+    if (c.cpuMHzPerCore > 0 && c.cpuLimitMHz > 0 && p && p.flavor && p.flavor.cpus > 0) {
+      var ratio = perCore || 1;
+      var per = p.flavor.cpus * Math.ceil(c.cpuMHzPerCore / ratio);
+      var free = c.cpuLimitMHz - c.cpuMHz;
+      out.push({ key: "vCPU", n: free >= 0 ? Math.floor(free / per) : 0,
+        basis: cpuCharge(c, perCore, p.flavor.cpus) });
+    } else if (f.cpu != null) {
+      // An old snapshot that carries no core speed: the controller's number is
+      // better than nothing, it just cannot follow the switch.
+      out.push({ key: "vCPU", n: f.cpu, basis: cpuCharge(c, perCore, p && p.flavor ? p.flavor.cpus : 0) });
     }
     if (f.memory != null) {
       out.push({ key: "RAM", n: f.memory,
@@ -1090,19 +1128,20 @@
 
   // cpuCharge describes the one number the CPU fit rests on, in the terms the
   // pre-flight uses.
-  function cpuCharge(c) {
-    var f = c.fit || {};
-    var ratio = c.cpuPerCore || 1;
-    var s = ((f.cpuPerWorkerMHz || 0) / 1000).toFixed(1) + " GHz per worker";
+  function cpuCharge(c, perCore, cpus) {
+    var ratio = perCore || 1;
+    var mhz = c.cpuMHzPerCore > 0 && cpus > 0
+      ? Math.ceil(c.cpuMHzPerCore / ratio) * cpus
+      : ((c.fit && c.fit.cpuPerWorkerMHz) || 0);
+    var s = (mhz / 1000).toFixed(1) + " GHz per worker";
     if (ratio > 1) { s += " (" + ratio + " vCPU : 1 core)"; }
     return s;
   }
 
-  function cpuTip(c) {
-    var ratio = c.cpuPerCore || 1;
-    var mhz = (c.fit && c.fit.cpuPerWorkerMHz) || 0;
-    return tip("One worker is charged " + (mhz / 1000).toFixed(1) +
-      " GHz of the cluster's free CPU" +
+  function cpuTip(c, perCore, cpus) {
+    var ratio = perCore || 1;
+    var charge = cpuCharge(c, perCore, cpus);
+    return tip("One worker is charged " + charge + " of the cluster's free CPU" +
       (ratio > 1 ? " (vCPUs are counted " + ratio + " per physical core: spec.capacity.cpuPerCore)"
                  : " (one vCPU per physical core)") +
       ". CPU may be oversubscribed; memory and disk are charged in full.");
@@ -1119,7 +1158,7 @@
     if (c.physical) {
       s += '<label class="sw" title="how many vCPUs the pre-flight lets one physical core carry: 1 charges a worker its whole vCPU count in core speed, 2 charges half of it">' +
         "<span>Assume 2 vCPU : 1 core</span>" +
-        '<input type="checkbox" id="cpuAssum"' + ((c.cpuPerCore || 1) >= 2 ? " checked" : "") + "></label>";
+        '<input type="checkbox" id="cpuAssum"' + ((state.perCore || 1) >= 2 ? " checked" : "") + "></label>";
     }
     s += "</div>";
     if (state.fitOpen) { s += fitBox(dims, fit, c); }
@@ -1691,6 +1730,8 @@
     state.draft = null;
     state.flavorDraft = null;
     state.flavorEdit = false;
+    state.perCore = null;
+    state.perCoreAt = 0;
     render();
   });
 
