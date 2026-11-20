@@ -55,7 +55,12 @@ spec:
           metadata:
             type: object
           spec:
-            description: K8sWorkerPoolSpec defines the desired worker pool.
+            description: |-
+              K8sWorkerPoolSpec defines the desired worker pool.
+
+              The address window is a hard ceiling, unlike the capacity estimate: a worker
+              beyond it has no address to be given, and the controller can only fail trying.
+              The rule is here rather than in the UI so kubectl is held to it too.
             properties:
               bootstrap:
                 description: Bootstrap carries OS/cloud-init inputs used to render
@@ -772,6 +777,11 @@ spec:
             - namePrefix
             - replicas
             type: object
+            x-kubernetes-validations:
+            - message: 'spec.replicas cannot exceed spec.ipPlan.nodeCount: the pool''s
+                ip range has no address for the extra workers (raise nodeCount or
+                lower replicas)'
+              rule: self.replicas <= self.ipPlan.nodeCount
           status:
             description: K8sWorkerPoolStatus is the observed state.
             properties:

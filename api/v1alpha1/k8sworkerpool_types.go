@@ -78,6 +78,11 @@ const (
 )
 
 // K8sWorkerPoolSpec defines the desired worker pool.
+//
+// The address window is a hard ceiling, unlike the capacity estimate: a worker
+// beyond it has no address to be given, and the controller can only fail trying.
+// The rule is here rather than in the UI so kubectl is held to it too.
+// +kubebuilder:validation:XValidation:rule="self.replicas <= self.ipPlan.nodeCount",message="spec.replicas cannot exceed spec.ipPlan.nodeCount: the pool's ip range has no address for the extra workers (raise nodeCount or lower replicas)"
 type K8sWorkerPoolSpec struct {
 	// Replicas is the desired number of worker nodes.
 	// +kubebuilder:validation:Minimum=0
