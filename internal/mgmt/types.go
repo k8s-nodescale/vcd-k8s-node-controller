@@ -152,11 +152,17 @@ type DiskProgress struct {
 
 // Pool is everything the page needs about one pool.
 type Pool struct {
-	Name            string    `json:"name"`
-	Replicas        int32     `json:"replicas"`
-	Observed        int32     `json:"observedReplicas"`
-	Ready           int32     `json:"readyReplicas"`
-	Phase           string    `json:"phase,omitempty"`
+	Name     string `json:"name"`
+	Replicas int32  `json:"replicas"`
+	Observed int32  `json:"observedReplicas"`
+	Ready    int32  `json:"readyReplicas"`
+	// Phase is status.rollout.phase: the rolling replacement of workers, which
+	// stays Idle during a plain scale-out.
+	Phase string `json:"phase,omitempty"`
+	// Activity is what the pool is doing right now, in one word: the rollout
+	// phase when a replacement is running, otherwise the step the newest
+	// worker is at (Provisioning, Joining, Draining ...). See activity().
+	Activity        string    `json:"activity,omitempty"`
 	Message         string    `json:"message,omitempty"`
 	MinReplicas     int32     `json:"minReplicas"`
 	AllowLastWorker bool      `json:"allowLastWorker"`

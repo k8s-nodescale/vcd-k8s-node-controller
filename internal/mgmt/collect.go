@@ -348,6 +348,7 @@ func (c *Collector) poolView(ctx context.Context, p *infrav1.K8sWorkerPool, byNo
 		Observed:        p.Status.ObservedReplicas,
 		Ready:           readyCount(p.Status.Nodes),
 		Phase:           p.Status.Rollout.Phase,
+		Activity:        activity(p),
 		MinReplicas:     p.Spec.ScaleDown.MinReplicas,
 		AllowLastWorker: p.Spec.ScaleDown.AllowLastWorker,
 		DeleteWorkers:   append([]string(nil), p.Spec.ScaleDown.DeleteWorkers...),

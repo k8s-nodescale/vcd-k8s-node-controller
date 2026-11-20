@@ -173,6 +173,8 @@
   .capnum { font-size: 11px; color: var(--muted); white-space: nowrap; }
   .capnote { font-size: 11px; color: var(--muted); margin-top: 2px; }
   .capnote.warn { color: var(--warn); }
+  /* a note that explains a bar starts under the bar, not under its label */
+  .capnote.ind { margin-left: calc(var(--caplbl) + 8px); }
   /* the CIDR a note is about, in the colour the bars use for "room left" */
   .cidr { color: var(--ok); }
   /* the datastore list behind the storage bar: the button sits in the label,
@@ -186,6 +188,11 @@
   .dsrow { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 8px;
            align-items: baseline; padding: 3px 0; font-size: 11px; }
   .dsrow + .dsrow { border-top: 1px solid var(--line); }
+  /* the datastore the pool's workers are written to: the row a reader looks
+     for first, so it is tinted rather than only tagged */
+  .dsrow.own { background: var(--flagbg); border-radius: 4px; }
+  .dsrow.own + .dsrow { border-top-color: transparent; }
+  .dsrow.own .dsname { color: var(--fg); }
   .dsname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .dsname .pool-tag { margin-left: 4px; padding: 0 4px; border-radius: 3px;
                       font-size: 9px; text-transform: uppercase; letter-spacing: .03em;
@@ -198,10 +205,8 @@
   /* the pod network is counted in nodes, so its bar is a row of slots: one per
      node the range can carry, filled when a node holds one */
   .caprow.pod { margin-top: 2px; }
-  /* the heading row carries the whole CIDR, so its label is as wide as the
-     text; the bar row gets an empty label of the standard width instead, which
-     is what lines it up with the bars above */
-  .caprow.pod .caplbl { flex: 0 1 auto; width: auto; }
+  /* the heading row carries only the short term ("NODE IPS", "POD CIDR"), so
+     the value after it lands on the x every bar starts at */
   .caprow.podbar { margin-top: -3px; }
   .pslots { display: flex; gap: 3px; flex: 1 1 auto; min-width: 60px; height: 15px; }
   .pslots i { flex: 1 1 0; min-width: 2px; border-radius: 3px;
@@ -215,6 +220,9 @@
   .info { display: inline-flex; align-items: center; justify-content: center;
           width: 14px; height: 14px; border-radius: 50%; border: 1px solid var(--muted);
           color: var(--muted); font-size: 10px; line-height: 1; cursor: help; }
+  /* a "?" that sits inside a 11px note rather than beside a 13px value */
+  .info.sm { width: 12px; height: 12px; font-size: 9px; margin-left: 3px;
+             vertical-align: 1px; }
   .flag.dense { display: inline-flex; align-items: center; gap: 8px; margin: 0;
                 background: var(--flagbg); border: 1px solid var(--line);
                 border-radius: 999px; padding: 3px 10px; font-size: 11px;
@@ -231,7 +239,8 @@
   .flavor .fl b { font-weight: 600; font-variant-numeric: tabular-nums; }
   /* the disk editor: the same sheet as the flavour, with the current size and a
      "new value" input that stays dead until "change" is ticked */
-  .disks-title { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  /* a pane title with a control on its right: the "edit" lock of a section */
+  .pane-title.title-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
   /* the lock note wraps inside the pane instead of widening it */
   #busyNote { max-width: 340px; line-height: 1.45; }
   /* The block keeps its height in every state: the delta sits in the row of the
@@ -321,7 +330,12 @@
     <div class="split">
       <div class="col">
       <div class="pane" id="flavorPane">
-        <div class="pane-title">flavor &middot; scale-up / down</div>
+        <div class="pane-title title-row">
+          <span>flavor &middot; scale-up / down</span>
+          <label class="flag change" title="unlock the flavour fields">
+            <span>edit</span><input type="checkbox" id="flavorEdit">
+          </label>
+        </div>
         <div class="flavor">
           <div class="fl"><span>vCPU</span><b id="kCpus">&ndash;</b></div>
           <div class="fl"><span>RAM</span><b id="kMem">&ndash;</b></div>
@@ -339,7 +353,7 @@
       </div>
 
       <div class="pane" id="disksPane">
-        <div class="pane-title disks-title">
+        <div class="pane-title title-row">
           <span>disks &middot; resize</span>
           <label class="flag change" title="unlock the size fields">
             <span>edit</span><input type="checkbox" id="diskChange">
@@ -359,7 +373,7 @@
           <div><span class="small muted" title="spec.replicas: what you asked for">desired</span><b id="kReplicas">&ndash;</b></div>
           <div><span class="small muted" title="status.observedReplicas: what the controller sees in vCD">in vCD</span><b id="kObserved">&ndash;</b></div>
           <div><span class="small muted" title="status.readyReplicas: how many of them are Ready">ready</span><b id="kReady">&ndash;</b></div>
-          <div><span class="small muted" title="status.rollout.phase">rollout</span><b id="kPhase">&ndash;</b></div>
+          <div><span class="small muted" title="what the pool is doing now: a rollout (flavour or disk replacement) or the step the newest worker is at; Idle when every worker is Ready">activity</span><b id="kActivity">&ndash;</b></div>
         </div>
         <div class="row" id="scaleActions" style="margin-top:10px">
           <button class="ghost" id="minus" title="one fewer worker: changes the number only">&minus;1</button>
@@ -415,7 +429,8 @@
     }
   } catch (e) {}
   var state = { pools: [], current: null, stamp: "", stale: false, me: null, draft: null,
-                flavorDraft: null, pendingDelete: null, diskDraft: null, pendingDisks: null,
+                flavorDraft: null, flavorEdit: false, pendingDelete: null, diskDraft: null,
+                pendingDisks: null,
                 flags: { taints: false, volumes: false, sts: false, dense: false, ds: false } };
   var pick = document.getElementById("poolPick");
 
@@ -634,7 +649,7 @@
         perNode + " block" + (perNode > 1 ? "s" : "") + " per node, " + blockAddr + " addresses";
     }
 
-    return '<div class="caprow pod"><span class="caplbl">POD CIDR ' + esc(c.podCIDR) + "</span></div>" +
+    return '<div class="caprow pod"><span class="caplbl">POD CIDR</span><span>' + esc(c.podCIDR) + "</span></div>" +
       '<div class="caprow podbar" title="' + esc("blocks " + (c.podBlocksUsed || 0) + " of " + blocks + " used") + '">' +
         '<span class="caplbl"></span>' +
         '<span class="pslots">' + segs + "</span>" +
@@ -657,31 +672,32 @@
     if (!p.ipNetwork || size <= 0) { return ""; }
     var share = Math.min(100, used / size * 100);
     var lvl = share >= 90 ? "high" : share >= 80 ? "warn" : "ok";
-    // A window of one address is not a range: "a - a" reads like a typo.
+    // A range of one address is not a range: "a - a" reads like a typo.
     var range = p.ipWindowFrom === p.ipWindowTo
       ? p.ipWindowFrom : p.ipWindowFrom + " - " + p.ipWindowTo;
-    // The window is this pool's own reservation, not subnet occupancy: nodeCount
-    // addresses from wNodeOffset, while the dvm, the load balancers and the
-    // masters each keep their own offsets in the same CIDR. Naming them is what
-    // makes "3 / 17" readable next to a cluster that runs eight VMs.
-    var note = '<div class="capnote" title="' + esc("spec.ipPlan: " + size +
-      " worker addresses starting at wNodeOffset. The dvm, the load balancers and the masters keep their own offsets in " +
-      p.ipNetwork + ", so they are not part of this count.") + '">' +
-      "window <b>[" + esc(range) + "]</b> of " + cidrOf(p.ipNetwork) +
-      " belongs to this pool</div>";
+    var rangeTip = "spec.ipPlan reserves nodeCount addresses for the workers, " +
+      "starting at wNodeOffset (plus vmIPOffset). A worker is only ever given an " +
+      "address inside this range.";
+    var poolTip = "The K8sWorkerPool shown on this page: the workers the controller " +
+      "creates and the addresses it may give them. The dvm, the load balancers and the " +
+      "masters keep their own addresses in the same subnet and are not part of this range.";
+    var note = '<div class="capnote ind">ip range' + tip(rangeTip) +
+      " <b>[" + esc(range) + "]</b> of " + cidrOf(p.ipNetwork) +
+      " belongs to this node's pool" + tip(poolTip) + "</div>";
     if (p.ipSuggest) {
-      note += '<div class="capnote" title="' +
-        esc("free in " + p.ipNetwork + ": " + (p.ipFree || []).join(", ")) + '">next free window: ' +
+      note += '<div class="capnote ind" title="' +
+        esc("free in " + p.ipNetwork + ": " + (p.ipFree || []).join(", ")) + '">next free ip range: ' +
         esc(p.ipSuggest) + "</div>";
     } else if (p.ipNoGap) {
-      note += '<div class="capnote warn">no free addresses left in ' + cidrOf(p.ipNetwork) +
-        " for another pool</div>";
+      note += '<div class="capnote ind warn">no free addresses left in ' + cidrOf(p.ipNetwork) +
+        " for another node's pool</div>";
     } else if (p.ipFree && p.ipFree.length) {
-      note += '<div class="capnote" title="' + esc("the gaps between the pool windows; the " +
-        "addresses below the first window hold the plan's fixed offsets and are never offered to another pool") +
-        '">free for another pool in ' + cidrOf(p.ipNetwork) + ": " + esc(p.ipFree.join(", ")) + "</div>";
+      note += '<div class="capnote ind" title="' + esc("the gaps between the pools' ip ranges; " +
+        "the addresses below the first range hold the plan's fixed offsets and are never " +
+        "offered to another pool") + '">free for another node\u0027s pool in ' + cidrOf(p.ipNetwork) +
+        ": " + esc(p.ipFree.join(", ")) + "</div>";
     }
-    return '<div class="caprow pod"><span class="caplbl">NODE IPS ' + cidrOf(p.ipNetwork) + "</span></div>" +
+    return '<div class="caprow pod"><span class="caplbl">NODE IPS</span>' + cidrOf(p.ipNetwork) + "</div>" +
       '<div class="caprow podbar" title="' +
         esc(range + " - " + used + " of " + size + " worker addresses handed out") + '">' +
         '<span class="caplbl"></span>' +
@@ -690,7 +706,13 @@
       "</div>" + note;
   }
 
-  // cidrOf marks the subnet a note is about: in a window or a gap the address
+  // tip is the small "?" that explains a term where it stands: the address plan
+  // has a vocabulary of its own, and a reader should not have to ask for it.
+  function tip(text) {
+    return '<span class="info sm" title="' + esc(text) + '">?</span>';
+  }
+
+  // cidrOf marks the subnet a note is about: in a range or a gap the address
   // that matters most is the network they are carved out of.
   function cidrOf(cidr) {
     return '<span class="cidr" title="the subnet this pool plans its addresses in">' + esc(cidr) + "</span>";
@@ -940,9 +962,11 @@
     if (c.podCIDR) {
       rows.push(podRow(c));
     }
-    if (c.storageName) {
-      rows.push('<div class="capnote">' + (c.datastores && c.datastores.length ? "datastore" : "storage profile") +
-        " " + esc(c.storageName) + "</div>");
+    if (c.storageName && !(c.datastores && c.datastores.length)) {
+      // With a datastore inventory the datastore in use is the tinted row behind
+      // "...", so this note would only repeat it. A vCD storage profile has no
+      // inventory beside it and keeps the line.
+      rows.push('<div class="capnote">storage profile ' + esc(c.storageName) + "</div>");
     }
     if (c.at) {
       rows.push('<div class="capnote">snapshot ' + new Date(c.at).toLocaleTimeString() +
@@ -1001,9 +1025,9 @@
       totalUsed += (d.usedMB || 0) / 1024;
       var pct = d.share && d.share.percent != null ? Math.round(d.share.percent) : null;
       var cls = d.share && d.share.level === "high" ? "d-high" : d.share && d.share.level === "warn" ? "d-warn" : "";
-      return '<div class="dsrow">' +
+      return '<div class="dsrow' + (d.default ? " own" : "") + '">' +
         '<span class="dsname" title="' + esc(d.name) + '">' + esc(d.name) +
-          (d.default ? '<span class="pool-tag" title="the datastore this pool writes to">pool</span>' : "") + "</span>" +
+          (d.default ? '<span class="pool-tag" title="the datastore this pool\u0027s workers are written to">pool</span>' : "") + "</span>" +
         '<span class="dsnum">' + fmtGB((d.usedMB || 0) / 1024) + " / " + fmtGB(capGB) + "</span>" +
         '<span class="dsfree ' + cls + '">' + fmtGB(freeGB) + " free" +
           (pct != null ? " \u00b7 " + pct + "%" : "") + "</span>" +
@@ -1068,7 +1092,7 @@
     document.getElementById("kReplicas").textContent = p.replicas;
     document.getElementById("kObserved").textContent = p.observedReplicas;
     document.getElementById("kReady").textContent = p.readyReplicas;
-    document.getElementById("kPhase").textContent = p.phase || "Idle";
+    document.getElementById("kActivity").textContent = p.activity || p.phase || "Idle";
     document.getElementById("kCpus").textContent = p.flavor.cpus || "–";
     document.getElementById("kMem").textContent = p.flavor.memoryMB ? p.flavor.memoryMB + " MB" : "–";
     document.getElementById("kDisk").textContent = p.flavor.osDiskGB ? p.flavor.osDiskGB + " GB" : "–";
@@ -1115,7 +1139,7 @@
   function applyBusy(p, admin) {
     var busy = !!(p && p.busy);
     var disabled = !admin || busy;
-    ["setFlavor", "setReplicas", "minus", "plus", "applyDisks"].forEach(function (id) {
+    ["setReplicas", "minus", "plus", "applyDisks"].forEach(function (id) {
       var el = document.getElementById(id);
       if (!el) { return; }
       if (id === "applyDisks") {
@@ -1124,9 +1148,20 @@
         el.disabled = disabled;
       }
     });
-    ["fCpus", "fMem", "fDisk", "replicasInput"].forEach(function (id) {
-      document.getElementById(id).disabled = disabled;
+    document.getElementById("replicasInput").disabled = disabled;
+
+    // The flavour sheet is locked the way the disk sheet is: reading the page is
+    // the common case, and a stray keystroke must not become a rewrite of every
+    // worker. Ticking "edit" unlocks the three fields; apply still asks.
+    var edit = document.getElementById("flavorEdit");
+    var unlocked = !!state.flavorEdit && !disabled;
+    edit.disabled = disabled;
+    edit.checked = unlocked;
+    ["fCpus", "fMem", "fDisk"].forEach(function (id) {
+      document.getElementById(id).disabled = !unlocked;
     });
+    document.getElementById("setFlavor").disabled = !unlocked;
+
     var note = document.getElementById("busyNote");
     if (!note) { return; }
     note.style.display = busy ? "" : "none";
@@ -1378,6 +1413,14 @@
     render();
   });
 
+  document.getElementById("flavorEdit").addEventListener("change", function (ev) {
+    state.flavorEdit = ev.target.checked;
+    // A cancelled edit drops its draft with it: the fields are refilled from
+    // the pool by render(), so nothing typed can survive the lock.
+    if (!state.flavorEdit) { state.flavorDraft = null; }
+    render();
+  });
+
   document.getElementById("diskChange").addEventListener("change", function (ev) {
     state.diskDraft = ev.target.checked ? {} : null;
     state.pendingDisks = null;
@@ -1490,6 +1533,7 @@
     state.current = findPool(pick.value);
     state.draft = null;
     state.flavorDraft = null;
+    state.flavorEdit = false;
     render();
   });
 
