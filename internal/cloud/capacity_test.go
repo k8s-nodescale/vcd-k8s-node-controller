@@ -78,3 +78,19 @@ func TestPlatformCapacityStorageProfile(t *testing.T) {
 		t.Fatalf("a single profile is the default even without the flag: %#v %v", sp, ok)
 	}
 }
+
+// A batch must not read as one absurd worker: "24 vCPU" is four workers of six.
+func TestFitsReportsTheBatchAsWorkers(t *testing.T) {
+	c := PlatformCapacity{
+		Physical: true,
+		CPU:      ResourceCapacity{Limit: 10_000, Used: 0},
+	}
+	req := CapacityRequest{CPUs: 24, MemoryMB: 16384, Workers: 4}
+	ok, short := c.Fits(req, 2600)
+	if ok {
+		t.Fatal("the request cannot fit")
+	}
+	if len(short) == 0 || !strings.Contains(short[0], "4 workers x 6 vCPU = 24 vCPU") {
+		t.Fatalf("shortfall = %v, want it read as four workers of six vCPU", short)
+	}
+}

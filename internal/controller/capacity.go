@@ -251,6 +251,7 @@ func batchRequest(one cloud.CapacityRequest, n int32) cloud.CapacityRequest {
 	for i := int32(1); i < n; i++ {
 		out = addCapacityRequest(out, one)
 	}
+	out.Workers = n
 	return out
 }
 

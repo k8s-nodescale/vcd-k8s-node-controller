@@ -166,6 +166,11 @@ type PlatformCapacity struct {
 
 // CapacityRequest is the capacity one worker would add.
 type CapacityRequest struct {
+	// Workers is how many workers the request covers. The quantities below are
+	// the total for all of them, so a shortfall can be reported as "4 workers x
+	// 6 vCPU" instead of "24 vCPU", which reads like one very large worker.
+	// Zero means one.
+	Workers  int32
 	CPUs     int32
 	MemoryMB int32
 	// StorageMB is the disk capacity per storage profile name. The empty name
@@ -186,14 +191,26 @@ func (c PlatformCapacity) Fits(req CapacityRequest, mhzPerCore int64) (bool, []s
 	if mhzPerCore > 0 && c.CPU.Limit > 0 {
 		need := int64(req.CPUs) * mhzPerCore
 		if free := c.CPU.Limit - c.CPU.Used; need > free {
-			short = append(short, fmt.Sprintf("CPU: %d vCPU at %d MHz need %d MHz, %d MHz free",
-				req.CPUs, mhzPerCore, need, max(free, 0)))
+			per := req.CPUs
+			if req.Workers > 1 {
+				per = req.CPUs / req.Workers
+				short = append(short, fmt.Sprintf("CPU: %d workers x %d vCPU = %d vCPU at %d MHz need %d MHz, %d MHz free",
+					req.Workers, per, req.CPUs, mhzPerCore, need, max(free, 0)))
+			} else {
+				short = append(short, fmt.Sprintf("CPU: %d vCPU at %d MHz need %d MHz, %d MHz free",
+					per, mhzPerCore, need, max(free, 0)))
+			}
 		}
 	}
 	if c.MemoryMB.Limit > 0 {
 		need := int64(req.MemoryMB)
 		if free := c.MemoryMB.Limit - c.MemoryMB.Used; need > free {
-			short = append(short, fmt.Sprintf("memory: need %d MB, %d MB free", need, max(free, 0)))
+			if req.Workers > 1 {
+				short = append(short, fmt.Sprintf("memory: %d workers x %d MB need %d MB, %d MB free",
+					req.Workers, req.MemoryMB/req.Workers, need, max(free, 0)))
+			} else {
+				short = append(short, fmt.Sprintf("memory: need %d MB, %d MB free", need, max(free, 0)))
+			}
 		}
 	}
 	names := make([]string, 0, len(req.StorageMB))
