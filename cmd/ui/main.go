@@ -27,11 +27,14 @@ import (
 )
 
 func main() {
-	var addr, prefix, exporterLabels string
+	var addr, prefix, exporterLabels, release string
 	var exporterPort int
 	var refresh time.Duration
 	flag.StringVar(&addr, "addr", ":8090", "address the UI listens on")
 	flag.StringVar(&prefix, "path-prefix", "/nodescale-ui", "path the ingress mounts the page at")
+	// The release the page shows in its header. The chart passes its appVersion;
+	// a local run shows "dev", which is honest.
+	flag.StringVar(&release, "release", "dev", "release string shown in the page header")
 	flag.StringVar(&exporterLabels, "node-exporter-labels", mgmt.DefaultExporterLabels, "label selector of the node-exporter pods")
 	flag.IntVar(&exporterPort, "node-exporter-port", mgmt.DefaultExporterPort, "node-exporter port")
 	flag.DurationVar(&refresh, "refresh-interval", 15*time.Second, "how often the snapshot is rebuilt")
@@ -94,7 +97,7 @@ func main() {
 		go auth.Run(ctx)
 	}
 
-	srv := &mgmt.Server{Client: c, Collector: collector, Auth: auth, PathPrefix: prefix}
+	srv := &mgmt.Server{Client: c, Collector: collector, Auth: auth, PathPrefix: prefix, Release: release}
 	httpSrv := &http.Server{
 		Addr:              addr,
 		Handler:           srv.Handler(),

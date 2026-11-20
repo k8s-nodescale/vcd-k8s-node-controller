@@ -35,6 +35,9 @@ type Server struct {
 	// default. Everything the server answers lives under it, so the ingress
 	// needs no rewrite.
 	PathPrefix string
+	// Release is the version the page prints in its header, injected into the
+	// HTML at serve time. Empty means "dev".
+	Release string
 
 	// cluster is the kubeadm cluster name, read once.
 	clusterOnce sync.Once
@@ -105,7 +108,12 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	out := strings.Replace(string(page), "__PREFIX__", s.prefix(), 1)
+	out := strings.ReplaceAll(string(page), "__PREFIX__", s.prefix())
+	release := s.Release
+	if release == "" {
+		release = "dev"
+	}
+	out = strings.ReplaceAll(out, "__VERSION__", html.EscapeString(release))
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Content-Type-Options", "nosniff")

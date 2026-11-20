@@ -181,6 +181,8 @@ spec:
             - --auth-secret-key={{ .Values.ui.auth.key }}
             - --auth-refresh={{ .Values.ui.auth.refreshInterval }}
             - --auth-session-ttl={{ .Values.ui.auth.sessionTTL }}
+            # What the page prints in its header: the release this chart is.
+            - --release={{ .Chart.AppVersion }}
             {{- if not .Values.ui.auth.enabled }}
             - --auth-disabled=true
             {{- end }}
