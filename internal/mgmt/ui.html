@@ -201,6 +201,9 @@
         background: var(--flagbg); border: 1px solid var(--line); border-radius: 999px;
         padding: 3px 10px; font-size: 11px; color: var(--fg); cursor: pointer; }
   .sw input { accent-color: var(--accent); margin: 0; }
+  .sw.off { opacity: .45; cursor: default; }
+  /* the planner sits above the assumption it governs, both in the right corner */
+  .fitctl { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
   .info.qbtn { padding: 0; background: none; font-family: inherit; }
   .fitbox { margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--line); }
   .fitbox table { width: 100%; border-collapse: collapse; font-size: 11px; }
@@ -463,7 +466,7 @@
   var state = { pools: [], current: null, stamp: "", stale: false, me: null, draft: null,
                 flavorDraft: null, flavorEdit: false, pendingDelete: null, diskDraft: null,
                 pendingDisks: null, fitOpen: false, perCore: null, perCoreAt: 0,
-                pendingReplicas: null,
+                pendingReplicas: null, planner: null, plannerAt: 0,
                 flags: { taints: false, volumes: false, sts: false, dense: false, ds: false } };
   var pick = document.getElementById("poolPick");
 
@@ -1019,10 +1022,19 @@
       state.perCoreAt = Date.now();
     }
     var perCore = state.perCore;
+    // Same for the planner switch: spec.capacity.preflight is read through the
+    // collection, which each sidecar replica caches for its own refresh interval,
+    // so repainting from it alone made the switch - and the greying of the
+    // assumption under it - lag or flip back. The clicked value holds briefly.
+    if (state.planner == null || Date.now() - state.plannerAt > 20000) {
+      state.planner = p.preflight !== false;
+      state.plannerAt = Date.now();
+    }
+    var plannerOn = state.planner;
 
     // Per-dimension answers first, then the smallest one: that number, and the
     // dimension it came from, is what the pane is read for.
-    var dims = fitDims(p, c, perCore);
+    var dims = fitDims(p, c, perCore, plannerOn);
     var fit = dims.length ? dims[0].n : null;
     var bind = dims.length ? dims[0] : null;
     var cpuFit = null;
@@ -1047,7 +1059,7 @@
     if (c.podCIDR) {
       rows.push(podRow(c, dims, bind));
     }
-    rows.push(fitLine(p, c, dims, fit, bind));
+    rows.push(fitLine(p, c, dims, fit, bind, plannerOn));
     if (c.storageName && !(c.datastores && c.datastores.length)) {
       // With a datastore inventory the datastore in use is the tinted row behind
       // "...", so this note would only repeat it. A vCD storage profile has no
@@ -1087,8 +1099,13 @@
     if (pfs) {
       pfs.disabled = !isAdmin();
       pfs.onchange = function () {
+        // Paint first, then write: the greying of the assumption under it is part
+        // of the answer, and it must not wait for a cached collection.
+        state.planner = pfs.checked;
+        state.plannerAt = Date.now();
         pfs.disabled = true;
-        post("preflight", { enabled: pfs.checked });
+        renderCapacity(p);
+        post("preflight", { enabled: state.planner });
       };
     }
     var assum = document.getElementById("cpuAssum");
@@ -1161,9 +1178,9 @@
   // plus the two the page already counts - pod blocks and addresses in the ip
   // range. A dimension that cannot be measured is left out, because a missing
   // number must not become the reason the pool stops.
-  function fitDims(p, c, perCore) {
+  function fitDims(p, c, perCore, plannerOn) {
     var out = [];
-    if (p && p.preflight === false) { return out; }
+    if (!plannerOn) { return out; }
     var f = c.fit || {};
     var res = reservedOf(p, c);
     // CPU is charged here rather than read from the snapshot, so the switch shows
@@ -1256,21 +1273,16 @@
   // fitLine is the one sentence the pane exists to answer, plus the assumption
   // behind the CPU half of it. The assumption is offered only where the platform
   // reports physical capacity: a quota cannot be overcommitted.
-  function fitLine(p, c, dims, fit, bind) {
-    if (p && p.preflight === false) {
+  function fitLine(p, c, dims, fit, bind, plannerOn) {
+    if (!plannerOn) {
       return '<div class="fitline"><span>capacity planner off - the controller reads no capacity and creates ' +
-        'workers as asked</span>' + preflightSwitch(false) + "</div>";
+        'workers as asked</span>' + fitControls(c, false) + "</div>";
     }
     if (fit == null) { return ""; }
     var s = '<div class="fitline"><span>FITS <b>' + fit + "</b> MORE WORKER" + (fit === 1 ? "" : "S") +
       " \u00b7 limited by <span class=\"bind\">" + esc(bind.key) + "</span> " +
       '<button class="info sm qbtn" type="button" id="fitq" title="how the number is computed">?</button></span>';
-    s += preflightSwitch(true);
-    if (c.physical) {
-      s += '<label class="sw" title="how many vCPUs the pre-flight lets one physical core carry: 1 charges a worker its whole vCPU count in core speed, 2 charges half of it">' +
-        "<span>Assume 2 vCPU : 1 core</span>" +
-        '<input type="checkbox" id="cpuAssum"' + ((state.perCore || 1) >= 2 ? " checked" : "") + "></label>";
-    }
+    s += fitControls(c, true);
     s += "</div>";
     if (state.fitOpen) { s += fitBox(dims, fit, c); }
     return s;
@@ -1284,6 +1296,26 @@
       'off leaves the planning to you">' +
       "<span>capacity planner</span>" +
       '<input type="checkbox" id="preflightSw"' + (on ? " checked" : "") + "></label>";
+  }
+
+  // cpuAssumSwitch is the overcommit assumption. It is only meaningful while the
+  // planner is on: with no admission check there is nothing to assume, so it is
+  // shown greyed and disabled rather than hidden - the setting still exists.
+  function cpuAssumSwitch(c, enabled) {
+    if (!c || !c.physical) { return ""; }
+    return '<label class="sw' + (enabled ? "" : " off") + '" title="' +
+      (enabled
+        ? "how many vCPUs the pre-flight lets one physical core carry: 1 charges a worker its whole vCPU count in core speed, 2 charges half of it"
+        : "inactive while the capacity planner is off: nothing is being admitted against an assumption") + '">' +
+      "<span>Assume 2 vCPU : 1 core</span>" +
+      '<input type="checkbox" id="cpuAssum"' + ((state.perCore || 1) >= 2 ? " checked" : "") +
+      (enabled ? "" : " disabled") + "></label>";
+  }
+
+  // fitControls stacks the two switches in the right-hand corner: the planner on
+  // top, the assumption it governs underneath.
+  function fitControls(c, plannerOn) {
+    return '<div class="fitctl">' + preflightSwitch(plannerOn) + cpuAssumSwitch(c, plannerOn) + "</div>";
   }
 
   function fitBox(dims, fit, c) {
@@ -1925,6 +1957,8 @@
     state.flavorEdit = false;
     state.perCore = null;
     state.perCoreAt = 0;
+    state.planner = null;
+    state.plannerAt = 0;
     render();
   });
 

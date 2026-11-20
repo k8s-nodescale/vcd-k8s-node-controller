@@ -1222,7 +1222,11 @@ honours on its next pass.
 `capacity planner` beside the fit line is `spec.capacity.preflight`. Turning it off
 is a deliberate choice to plan the resources yourself: the controller stops reading
 the platform's capacity, stops parking workers that do not fit, and takes no
-snapshot - the page then says so instead of showing numbers nobody refreshes.
+snapshot - the page then says so instead of showing numbers nobody refreshes. The
+switch sits above `Assume 2 vCPU : 1 core` in the right corner, and turning the
+planner off greys that one out: with no admission check there is nothing for an
+overcommit assumption to apply to. The value is kept, so switching the planner back
+on restores it.
 
 #### When a worker never registers
 
