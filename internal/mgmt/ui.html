@@ -230,6 +230,8 @@
   .flag.dense input { accent-color: var(--accent); margin: 0; }
   .pane-title { margin-bottom: 10px; font-size: 11px; text-transform: uppercase;
                 letter-spacing: .04em; color: var(--muted); font-weight: 600; }
+  /* the names a scope is written with keep their case inside an uppercase title */
+  .pane-title .scope { text-transform: none; color: var(--fg); }
   /* the flavour, one value per line so it reads as a spec sheet */
   .flavor { display: flex; flex-direction: column; gap: 2px; min-width: 220px;
             border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
@@ -385,7 +387,7 @@
         <div class="small muted" id="gates" style="margin-top:4px"></div>
       </div>
       <div class="pane capacity">
-        <div class="pane-title" id="capTitle">DATACENTER COMPUTE CAPACITY:</div>
+        <div class="pane-title" id="capTitle">COMPUTE CAPACITY</div>
         <div class="caprows" id="capRows"><span class="small muted">no snapshot yet</span></div>
       </div>
     </div>
@@ -991,12 +993,14 @@
     var el = document.getElementById("capTitle");
     if (!el) { return; }
     if (c && c.datacenter && c.cluster) {
-      el.textContent = "vSphere DC " + c.datacenter + "\\Cluster: " + c.cluster + " COMPUTE CAPACITY:";
-      el.title = "the scope is this compute cluster: its hosts and its datastores, not the whole datacenter";
+      // The scope sits in brackets as the object's own name, so it keeps its
+      // case; the "?" names what the bracket is (vSphere: DC\Cluster).
+      el.innerHTML = "COMPUTE CAPACITY [<span class=\"scope\">" + esc(c.datacenter) + "\\" +
+        esc(c.cluster) + "</span>]" +
+        '<span class="info sm" title="vSphere: DC\\Cluster">?</span>';
       return;
     }
-    el.textContent = "DATACENTER COMPUTE CAPACITY:";
-    el.removeAttribute("title");
+    el.textContent = "COMPUTE CAPACITY";
   }
 
   // storageRow is capRow with the datastore inventory behind it: the bar can

@@ -1969,22 +1969,14 @@ is not inherited, because a flat key set is easier to create, rotate and review.
   encryption-at-rest only if the cluster enables it. There is no second layer
   here - treat the Secret as the credential itself. The UI account hashes are
   different: they are bcrypt (one-way), and the plaintext of those passwords
-  exists only where it was generated (the `initial-passwords` key until it is
-  deleted, or the control host's `.credentials` file).
-- **What protects them.** A Kubernetes Secret is base64, not encryption: it is
-  protected by the API server's RBAC (only the controller's ServiceAccount and
-  whoever may read Secrets in that namespace), by etcd access control, and by
-  encryption-at-rest only if the cluster enables it. There is no second layer
-  here - treat the Secret as the credential itself. The UI account hashes are
-  different: they are bcrypt (one-way), and the plaintext of those passwords
-  exists only where it was generated (the `initial-passwords` key until it is
-  deleted, or the control host's `.credentials` file).
+  exists only where it was generated (the `initial-passwords` key until the
+  cluster owner chooses to drop it, or the control host's `.credentials` file).
 
 ```bash
 # read the platform credential when you actually need it
 kubectl -n nodescale-system get secret vsphere-credentials \
   -o jsonpath='{.data.url}' | base64 -d; echo
-# and remove the generated UI passwords after the first sign-in
+# and, if the cluster owner decides so, drop the generated UI passwords
 kubectl -n nodescale-system patch secret nodescale-ui-auth \
   --type=json -p '[{"op":"remove","path":"/data/initial-passwords"}]'
 ```
@@ -2065,8 +2057,15 @@ kubectl -n nodescale-system get secret nodescale-ui-auth \
 ```
 
 `users.yaml` holds only bcrypt hashes, so a password that was never read from
-that key cannot be recovered, only reset (see above). Once both are stored
-somewhere safe, remove the plaintext so it stops existing:
+that key cannot be recovered, only reset (see above).
+
+**Removing `initial-passwords` is the cluster owner's decision, not part of the
+upgrade procedure.** Nothing reads the key at runtime - only `users.yaml` signs
+people in - and no upgrade brings it back: the Secret is written on install only
+(the template is guarded by a `lookup`, and the Secret carries
+`helm.sh/resource-policy: keep`). So the choice is made once, by whoever owns the
+cluster, and it neither blocks nor changes a release. Where the plaintext should
+stop existing, drop the key:
 
 ```
 kubectl -n nodescale-system patch secret nodescale-ui-auth \
