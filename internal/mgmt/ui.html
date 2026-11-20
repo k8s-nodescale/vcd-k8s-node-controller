@@ -413,7 +413,7 @@
         <div class="pane-title">replicas &middot; scale-in / out</div>
         <div class="kpi">
           <div><span class="small muted" title="spec.replicas: what you asked for">desired</span><b id="kReplicas">&ndash;</b></div>
-          <div><span class="small muted" title="status.observedReplicas: what the controller sees in vCD">in vCD</span><b id="kObserved">&ndash;</b></div>
+          <div><span class="small muted" title="workers the controller has actually created: a queued slot has no VM yet, so it is not counted here">observed</span><b id="kObserved">&ndash;</b><span class="small muted" id="kQueued"></span></div>
           <div><span class="small muted" title="status.readyReplicas: how many of them are Ready">ready</span><b id="kReady">&ndash;</b></div>
           <div><span class="small muted" title="what the pool is doing now: a rollout (flavour or disk replacement) or the step the newest worker is at; Idle when every worker is Ready">activity</span><b id="kActivity">&ndash;</b></div>
         </div>
@@ -1475,7 +1475,18 @@
     stamp.textContent = (state.stale ? "stale · " : "") + (state.stamp ? new Date(state.stamp).toLocaleTimeString() : "");
 
     document.getElementById("kReplicas").textContent = p.replicas;
-    document.getElementById("kObserved").textContent = p.observedReplicas;
+    // observedReplicas counts slots; a queued slot has no VM, so the pane says
+    // "observed" for the ones that exist and names the queue beside it.
+    var queued = 0, missing = 0;
+    (p.nodes || []).forEach(function (n) {
+      if (n.phase === "Queued") { queued++; }
+      if (n.phase === "Missing") { missing++; }
+    });
+    document.getElementById("kObserved").textContent = workersWithVM(p);
+    var qEl = document.getElementById("kQueued");
+    var tail = queued > 0 ? " \u00b7 " + queued + " queued" : "";
+    if (missing > 0) { tail += " \u00b7 " + missing + " missing"; }
+    qEl.textContent = tail;
     document.getElementById("kReady").textContent = p.readyReplicas;
     document.getElementById("kActivity").textContent = p.activity || p.phase || "Idle";
     document.getElementById("kCpus").textContent = p.flavor.cpus || "–";

@@ -2102,6 +2102,10 @@ It exists so the layout can be reviewed before a second pool exists.
 | apply flavor | `spec.flavor.cpus`, `.memoryMB`, `.osDiskGB` (only the fields you fill in) |
 | delete a worker | appends the name to `spec.scaleDown.deleteWorkers` |
 
+The replicas pane counts what exists: `observed` is the workers that have a VM, and
+a slot waiting for capacity is named beside it (`· 1 queued`), because a queued
+slot has nothing in the platform to be counted as.
+
 Every gate still applies: `scaleDown.minReplicas`, `allowLastWorker`, the drain,
 the last-worker guard and the node-local-volume refusal. A request the pool
 refuses shows up as the pool's `Ready` condition message, which the page
