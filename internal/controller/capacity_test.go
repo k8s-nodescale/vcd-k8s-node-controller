@@ -444,3 +444,44 @@ func TestEntitlementChargesOurWorkersAgainstTheNeighboursLoad(t *testing.T) {
 		t.Fatalf("created %d VMs, want none: the cluster is already spoken for", len(fc.created))
 	}
 }
+
+// Seen live on 2026-11-20: the entitlement said no room, and a third worker was
+// created anyway. The check charged the new worker plus the ones still *starting*,
+// so an already-Ready worker cost nothing - exactly the case that mattered.
+func TestEntitlementChargesTheWorkersThatAreAlreadyReady(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(3)
+	pool.Spec.Flavor.CPUs = 2
+	pool.Status.Nodes = []infrav1.WorkerNodeStatus{
+		{Name: "pool-wrk-01", IP: "192.168.100.7", Phase: infrav1.NodePhaseReady, ProviderID: "vm-1", K8sReady: true},
+		{Name: "pool-wrk-02", IP: "192.168.100.8", Phase: infrav1.NodePhaseReady, ProviderID: "vm-2", K8sReady: true},
+	}
+	pool.Status.ObservedReplicas = 2
+	fc := &fakeCloud{
+		vms: []cloud.VM{
+			{ID: "vm-1", Name: "pool-wrk-01", IP: "192.168.100.7", CPU: 2, MemoryMB: 4096, PoweredOn: true, UsedCPUMHz: 500, UsedMemoryMB: 512},
+			{ID: "vm-2", Name: "pool-wrk-02", IP: "192.168.100.8", CPU: 2, MemoryMB: 4096, PoweredOn: true, UsedCPUMHz: 500, UsedMemoryMB: 512},
+		},
+		capacity: cloud.PlatformCapacity{
+			Physical: true, Measured: true, PerVMUsage: true, CPUMHzPerCore: 2600,
+			// Neighbours hold 10.4 GHz, ours measure 1 GHz: room for one more
+			// charge (15.6) but not for a third worker's (twice that).
+			CPU:      cloud.ResourceCapacity{Limit: 3 * 2 * 2600, Used: 11400},
+			MemoryMB: cloud.ResourceCapacity{Limit: 1 << 20, Used: 1 << 19},
+		},
+	}
+	r := newTestReconciler(t, fc, &fakeKube{nodes: readyNodes("pool-wrk-01", "pool-wrk-02")}, pool)
+
+	if _, err := r.Reconcile(ctx, requestFor(pool)); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	got := getPool(t, r, pool)
+	for _, n := range got.Status.Nodes {
+		if n.Name == "pool-wrk-03" && n.Phase != infrav1.NodePhaseQueued {
+			t.Fatalf("pool-wrk-03 = %s, want Queued: two Ready workers already hold two charges", n.Phase)
+		}
+	}
+	if len(fc.created) != 0 {
+		t.Fatalf("created %d VMs, want none", len(fc.created))
+	}
+}

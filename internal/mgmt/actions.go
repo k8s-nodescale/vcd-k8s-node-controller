@@ -202,6 +202,14 @@ func (s *Server) updateUnlessBusy(ctx context.Context, name, action string, exem
 		if err := mutate(p); err != nil {
 			return err
 		}
+		// Any action asks for fresh numbers: the snapshot the page shows is up to
+		// capacityStatusTTL old, and what the operator just changed is exactly what
+		// they want to see reflected. It also means "set replicas" cannot leave the
+		// pane a TTL behind the decision the controller just made.
+		if p.Annotations == nil {
+			p.Annotations = map[string]string{}
+		}
+		p.Annotations[infrav1.CapacityRefreshAnnotation] = time.Now().UTC().Format(time.RFC3339)
 		if actor, ok := actorFrom(ctx); ok && actor.Username != "" {
 			if p.Annotations == nil {
 				p.Annotations = map[string]string{}

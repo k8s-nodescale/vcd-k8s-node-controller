@@ -89,6 +89,20 @@ func (r *WorkerPoolReconciler) capacityAllows(ctx context.Context, pool *infrav1
 	return r.capacityAllowsBatch(ctx, pool, req, 1, 0, 0)
 }
 
+// workersWithVM counts the slots the pool has actually spent: queued slots have no
+// VM, missing ones have none any more.
+func workersWithVM(nodes []infrav1.WorkerNodeStatus) int32 {
+	var n int32
+	for i := range nodes {
+		switch nodes[i].Phase {
+		case infrav1.NodePhaseQueued, infrav1.NodePhaseMissing:
+		default:
+			n++
+		}
+	}
+	return n
+}
+
 // capacityAllowsBatch is capacityAllows for a scale-out that admits several
 // workers in one pass. Where the platform's Used is measured (vSphere) the
 // workers admitted earlier in the pass are charged too, because their usage is
@@ -127,7 +141,21 @@ func (r *WorkerPoolReconciler) capacityAllowsBatch(ctx context.Context, pool *in
 		capacity.MemoryMB.Used = othersMem
 	}
 
-	if capacity.Measured && admitted > 1 {
+	// How many charges to apply depends on what the platform's used figure means,
+	// and getting it wrong is how a third worker was admitted while the pane said
+	// none fit (2026-11-20):
+	//
+	//   - per-VM usage (vSphere entitlement): every worker the pool has is charged,
+	//     because "ours" was just subtracted from used;
+	//   - measured but not per-VM: only this pass's admissions, since the ones
+	//     already created are not in the figure yet either;
+	//   - a quota (vCD): one worker, the platform has already booked the rest.
+	if capacity.PerVMUsage {
+		admitted = workersWithVM(pool.Status.Nodes) + 1
+	} else if !capacity.Measured {
+		admitted = 1
+	}
+	if admitted > 1 {
 		req = batchRequest(req, admitted)
 	}
 	ok, short := capacity.Fits(req, cpuChargeMHz(pool, capacity))
