@@ -1103,18 +1103,39 @@
   // load the platform has not measured yet: a worker in Provisioning or Joining
   // consumes almost nothing, so the free figure does not move when it is created.
   // Without this the pane promises room that the previous click already spent.
-  function reservedOf(p, c) {
+  // workersWithVM counts the slots the pool has actually spent: a queued slot has
+  // no VM, a missing one has none any more. Those are the ones whose entitlement
+  // the cluster has to back.
+  function workersWithVM(p) {
     var n = 0;
     (p && p.nodes ? p.nodes : []).forEach(function (w) {
-      if (w.phase === "Provisioning" || w.phase === "Joining") { n++; }
+      if (w.phase === "Queued" || w.phase === "Missing") { return; }
+      n++;
     });
+    return n;
+  }
+
+  function reservedOf(p, c) {
+    var n = workersWithVM(p);
     var out = { workers: n, cpuMHz: 0, memMB: 0 };
     if (!n || !c || !p.flavor) { return out; }
     var cpus = p.flavor.cpus || 0;
-    if (c.cpuMHzPerCore > 0 && cpus > 0) {
-      out.cpuMHz = n * cpus * Math.ceil(c.cpuMHzPerCore / (c.cpuPerCore || 1));
+    var perCPU = c.cpuMHzPerCore > 0 && cpus > 0
+      ? cpus * Math.ceil(c.cpuMHzPerCore / (c.cpuPerCore || 1)) : 0;
+    if (c.perVMUsage) {
+      // The claim is the whole standing charge of the workers; what is already
+      // burning is measured, so the bar only needs the part above it.
+      out.cpuMHz = Math.max(0, n * perCPU - (c.ourCPU_MHz || 0));
+      out.memMB = Math.max(0, n * (p.flavor.memoryMB || 0) - (c.ourMemoryMB || 0));
+      return out;
     }
-    if (p.flavor.memoryMB > 0) { out.memMB = n * p.flavor.memoryMB; }
+    // No per-VM data: only the workers that have not started drawing at all.
+    var starting = 0;
+    (p.nodes || []).forEach(function (w) {
+      if (w.phase === "Provisioning" || w.phase === "Joining") { starting++; }
+    });
+    out.cpuMHz = starting * perCPU;
+    out.memMB = starting * (p.flavor.memoryMB || 0);
     return out;
   }
 
@@ -1133,22 +1154,47 @@
     if (c.cpuMHzPerCore > 0 && c.cpuLimitMHz > 0 && p && p.flavor && p.flavor.cpus > 0) {
       var ratio = perCore || 1;
       var per = p.flavor.cpus * Math.ceil(c.cpuMHzPerCore / ratio);
-      var free = c.cpuLimitMHz - c.cpuMHz - res.cpuMHz;
-      out.push({ key: "vCPU", n: free >= 0 ? Math.floor(free / per) : 0,
-        basis: cpuCharge(c, perCore, p.flavor.cpus) + "; free " +
-          (Math.max(0, free) / 1000).toFixed(1) + " GHz of " + (c.cpuLimitMHz / 1000).toFixed(1) +
-          (res.cpuMHz > 0 ? " after " + res.workers + " starting worker" +
-            (res.workers === 1 ? "" : "s") + " charge " + (res.cpuMHz / 1000).toFixed(1) + " GHz" : "") });
+      if (c.perVMUsage) {
+        // Entitlement: our workers are charged in full, everyone else is measured.
+        var ours = c.ourCPU_MHz || 0;
+        var others = Math.max(0, c.cpuMHz - ours);
+        var n = workersWithVM(p);
+        var committed = others + n * per;
+        var room = c.cpuLimitMHz - committed;
+        out.push({ key: "vCPU", n: room > 0 ? Math.floor(room / per) : 0,
+          basis: cpuCharge(c, perCore, p.flavor.cpus) + "; others " + (others / 1000).toFixed(1) +
+            " GHz + " + n + " worker" + (n === 1 ? "" : "s") + " charged " +
+            ((n * per) / 1000).toFixed(1) + " = " + (committed / 1000).toFixed(1) +
+            " of " + (c.cpuLimitMHz / 1000).toFixed(1) });
+      } else {
+        var free = c.cpuLimitMHz - c.cpuMHz - res.cpuMHz;
+        out.push({ key: "vCPU", n: free >= 0 ? Math.floor(free / per) : 0,
+          basis: cpuCharge(c, perCore, p.flavor.cpus) + "; free " +
+            (Math.max(0, free) / 1000).toFixed(1) + " GHz of " + (c.cpuLimitMHz / 1000).toFixed(1) +
+            (res.cpuMHz > 0 ? " after " + res.workers + " starting worker" +
+              (res.workers === 1 ? "" : "s") + " charge " + (res.cpuMHz / 1000).toFixed(1) + " GHz" : "") });
+      }
     } else if (f.cpu != null) {
       // An old snapshot that carries no core speed: the controller's number is
       // better than nothing, it just cannot follow the switch.
       out.push({ key: "vCPU", n: f.cpu, basis: cpuCharge(c, perCore, p && p.flavor ? p.flavor.cpus : 0) });
     }
     if (f.memory != null && f.memoryPerWorkerMB > 0) {
-      var freeMem = c.memoryLimitMB - c.memoryMB - res.memMB;
+      var freeMem, memBasis;
+      if (c.perVMUsage) {
+        var othersMem = Math.max(0, c.memoryMB - (c.ourMemoryMB || 0));
+        var committedMem = othersMem + workersWithVM(p) * f.memoryPerWorkerMB;
+        freeMem = c.memoryLimitMB - committedMem;
+        memBasis = (f.memoryPerWorkerMB / 1024).toFixed(0) + " GB per worker, the flavour's allocation; others " +
+          fmtGB(othersMem / 1024) + " + charge " + fmtGB((workersWithVM(p) * f.memoryPerWorkerMB) / 1024) +
+          " = " + fmtGB(committedMem / 1024) + " of " + fmtGB(c.memoryLimitMB / 1024);
+      } else {
+        freeMem = c.memoryLimitMB - c.memoryMB - res.memMB;
+        memBasis = (f.memoryPerWorkerMB / 1024).toFixed(0) + " GB per worker, the flavour's allocation; free " +
+          fmtGB(Math.max(0, freeMem) / 1024) + " of " + fmtGB(c.memoryLimitMB / 1024);
+      }
       out.push({ key: "RAM", n: freeMem >= 0 ? Math.floor(freeMem / f.memoryPerWorkerMB) : 0,
-        basis: (f.memoryPerWorkerMB / 1024).toFixed(0) + " GB per worker, the flavour's allocation; free " +
-          fmtGB(Math.max(0, freeMem) / 1024) + " of " + fmtGB(c.memoryLimitMB / 1024) });
+        basis: memBasis });
     }
     if (f.storage != null) {
       out.push({ key: "storage", n: f.storage,

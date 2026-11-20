@@ -94,6 +94,9 @@ func (p *Provider) Capacity(ctx context.Context) (cloud.PlatformCapacity, error)
 	// Host usage is measured, not allocated: a worker created seconds ago is not
 	// in the figure yet, so the pre-flight has to charge its own batch.
 	out.Measured = true
+	// And it can say what each VM consumes, so the pool can subtract its own draw
+	// from the total and charge its workers their entitlement on top of the rest.
+	out.PerVMUsage = true
 	usable := 0
 	for i := range mhs {
 		m := &mhs[i]

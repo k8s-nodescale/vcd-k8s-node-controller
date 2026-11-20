@@ -348,7 +348,8 @@ func (r *WorkerPoolReconciler) reconcile(ctx context.Context, before, pool *infr
 	desired := pool.Spec.Replicas
 	switch {
 	case desired > pool.Status.ObservedReplicas:
-		if err := r.scaleUp(ctx, before, pool, alloc, desired-pool.Status.ObservedReplicas); err != nil {
+		ourCPU, ourMem := poolMeasured(actual)
+		if err := r.scaleUp(ctx, before, pool, alloc, desired-pool.Status.ObservedReplicas, ourCPU, ourMem); err != nil {
 			logger.Error(err, "scale up failed", "pool", pool.Name)
 			r.setCondition(pool, metav1.ConditionFalse, "ScaleUpFailed", err.Error())
 			return ctrl.Result{}, err
@@ -1012,7 +1013,7 @@ func mergeNodes(pool *infrav1.K8sWorkerPool, vms []cloud.VM, alloc *ipam.Allocat
 // harmless because the next pass adopts the VMs that exist in vCD again. If a
 // create fails, the address is kept reserved only when the VM still exists in
 // vCD; otherwise it is released for reuse.
-func (r *WorkerPoolReconciler) scaleUp(ctx context.Context, before, pool *infrav1.K8sWorkerPool, alloc *ipam.Allocator, n int32) error {
+func (r *WorkerPoolReconciler) scaleUp(ctx context.Context, before, pool *infrav1.K8sWorkerPool, alloc *ipam.Allocator, n int32, ourCPUMHz, ourMemoryMB int64) error {
 	logger := log.FromContext(ctx)
 
 	for i := int32(0); i < n; i++ {
@@ -1032,7 +1033,7 @@ func (r *WorkerPoolReconciler) scaleUp(ctx context.Context, before, pool *infrav
 		// The workers admitted before this pass are still Provisioning and their
 		// usage is not in the platform's figure, so they are charged here too.
 		if ok, why := r.capacityAllowsBatch(ctx, pool, workerCapacityRequest(pool, pool.Status.Nodes),
-			1+inFlight(pool.Status.Nodes)); !ok {
+			1+inFlight(pool.Status.Nodes), ourCPUMHz, ourMemoryMB); !ok {
 			if err := r.queueSlots(ctx, pool, alloc, n-i, why); err != nil {
 				return err
 			}

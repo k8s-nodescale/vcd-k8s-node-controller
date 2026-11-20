@@ -718,6 +718,20 @@ type CapacityStatus struct {
 	CPUPerCore int32 `json:"cpuPerCore,omitempty"`
 	// +optional
 	CPUMHzPerCore int64 `json:"cpuMHzPerCore,omitempty"`
+	// PerVMUsage says OurCPUMHz and OurMemoryMB were reported, so a reader can
+	// separate this pool's draw from the neighbours' load instead of treating the
+	// whole total as somebody else's.
+	// +optional
+	PerVMUsage bool `json:"perVMUsage,omitempty"`
+	// OurCPUMHz and OurMemoryMB are what this pool's own workers are measured to
+	// consume, split out of the totals above. Together with the totals they give
+	// the neighbours' load (total - ours), which is what the pool's entitlement is
+	// measured against: a pool may only grow while its workers' standing charge
+	// plus the neighbours' measured draw still fit the platform.
+	// +optional
+	OurCPUMHz int64 `json:"ourCPU_MHz,omitempty"`
+	// +optional
+	OurMemoryMB int64 `json:"ourMemoryMB,omitempty"`
 	// Physical says the CPU and memory numbers above are the physical capacity
 	// of the hosts (vSphere), not a quota the platform enforces (vCD). Only a
 	// physical number may be overcommitted; the page offers the assumption only

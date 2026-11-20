@@ -59,6 +59,12 @@ func (r *WorkerPoolReconciler) refreshCapacityStatus(ctx context.Context, pool *
 			// The assumption the pre-flight is applying, published so the page
 			// explains the same arithmetic instead of guessing it.
 			snap.Physical = capacity.Physical
+			// What our own workers draw, so the story the page tells about the
+			// remaining room can separate us from the neighbours.
+			if vms, lerr := prov.ListWorkerVMs(ctx, nil); lerr == nil {
+				snap.OurCPUMHz, snap.OurMemoryMB = poolMeasured(ownedWorkerVMs(pool, vms))
+				snap.PerVMUsage = capacity.PerVMUsage
+			}
 			snap.CPUMHzPerCore = cpuMHzPerCore(pool, capacity)
 			snap.CPUPerCore = int32(cpuPerCore(pool, capacity))
 			snap.CPUMHz = capacity.CPU.Used

@@ -141,6 +141,11 @@ type PlatformCapacity struct {
 	// assumption may only be applied to a physical number: dividing a quota
 	// would admit a request the platform then refuses.
 	Physical bool
+	// PerVMUsage says the platform can report what a single VM consumes, which is
+	// what lets a pool separate its own measured draw from the neighbours' load.
+	// Without it the pool can only charge entitlement against total usage, which
+	// would count its own running workers twice.
+	PerVMUsage bool
 	// Measured says Used is what the platform observes on the hosts, so a VM
 	// created a moment ago has not moved it yet. A pre-flight that admits a
 	// batch must then charge its own admissions, or every one-worker check in
@@ -246,6 +251,11 @@ type VM struct {
 	MemoryMB  int32
 	// DiskGB is the total capacity of all disks on the VM.
 	DiskGB int32
+	// UsedCPUMHz and UsedMemoryMB are what the platform measures this VM
+	// consuming right now. Zero when the platform does not report per-VM usage;
+	// PlatformCapacity.PerVMUsage says whether it does.
+	UsedCPUMHz   int64
+	UsedMemoryMB int64
 	// OSDiskGB is the system disk (bus 0/unit 0) alone, which is what
 	// spec.flavor.osDiskGB describes.
 	OSDiskGB int32

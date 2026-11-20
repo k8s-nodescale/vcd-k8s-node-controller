@@ -67,6 +67,18 @@ func cpuChargeMHz(pool *infrav1.K8sWorkerPool, capacity cloud.PlatformCapacity) 
 	return (mhz + ratio - 1) / ratio
 }
 
+// poolMeasured sums what the pool's own VMs are measured to consume. It is the
+// part of the platform's used figure that belongs to this pool, and subtracting it
+// is what lets the pre-flight charge the pool's workers their entitlement without
+// also counting their measured draw as a neighbour's.
+func poolMeasured(vms []cloud.VM) (cpuMHz, memMB int64) {
+	for i := range vms {
+		cpuMHz += vms[i].UsedCPUMHz
+		memMB += vms[i].UsedMemoryMB
+	}
+	return cpuMHz, memMB
+}
+
 // capacityAllows runs the pre-flight for one request and returns why it does not
 // fit when it does not.
 //
@@ -74,7 +86,7 @@ func cpuChargeMHz(pool *infrav1.K8sWorkerPool, capacity cloud.PlatformCapacity) 
 // and attempting the create (the behaviour before the pre-flight existed) is
 // better than a pool that cannot scale because a read broke.
 func (r *WorkerPoolReconciler) capacityAllows(ctx context.Context, pool *infrav1.K8sWorkerPool, req cloud.CapacityRequest) (bool, string) {
-	return r.capacityAllowsBatch(ctx, pool, req, 1)
+	return r.capacityAllowsBatch(ctx, pool, req, 1, 0, 0)
 }
 
 // capacityAllowsBatch is capacityAllows for a scale-out that admits several
@@ -82,7 +94,7 @@ func (r *WorkerPoolReconciler) capacityAllows(ctx context.Context, pool *infrav1
 // workers admitted earlier in the pass are charged too, because their usage is
 // not in the figure yet; where it is allocated (vCD) they are already counted and
 // charging them again would halve the batch.
-func (r *WorkerPoolReconciler) capacityAllowsBatch(ctx context.Context, pool *infrav1.K8sWorkerPool, req cloud.CapacityRequest, admitted int32) (bool, string) {
+func (r *WorkerPoolReconciler) capacityAllowsBatch(ctx context.Context, pool *infrav1.K8sWorkerPool, req cloud.CapacityRequest, admitted int32, ourCPUMHz, ourMemoryMB int64) (bool, string) {
 	if !capacityPreflightEnabled(pool) {
 		return true, ""
 	}
@@ -98,6 +110,23 @@ func (r *WorkerPoolReconciler) capacityAllowsBatch(ctx context.Context, pool *in
 			"pool", pool.Name, "error", err)
 		return true, ""
 	}
+	// The neighbours' load is what the cluster has to back our entitlement
+	// against: the total minus our own measured draw. Where the platform reports
+	// per-VM usage this turns the check from "is the host idle now" into "can the
+	// cluster still back the workers this pool has committed to".
+	if capacity.PerVMUsage {
+		others := capacity.CPU.Used - ourCPUMHz
+		if others < 0 {
+			others = 0
+		}
+		capacity.CPU.Used = others
+		othersMem := capacity.MemoryMB.Used - ourMemoryMB
+		if othersMem < 0 {
+			othersMem = 0
+		}
+		capacity.MemoryMB.Used = othersMem
+	}
+
 	if capacity.Measured && admitted > 1 {
 		req = batchRequest(req, admitted)
 	}

@@ -339,7 +339,7 @@ func (p *Provider) network(ctx context.Context, f *find.Finder) (object.NetworkR
 
 // vmProperties is what the controller reads about a VM: identity, shape, the
 // annotation it wrote, the power state and the address the guest reports.
-var vmProperties = []string{"name", "config", "runtime", "guest"}
+var vmProperties = []string{"name", "config", "runtime", "guest", "summary"}
 
 // ListWorkerVMs returns the VMs below the pool folder. The folder is the scope
 // of a pool, the way a vApp is for vCD: the controller filters by name prefix
@@ -466,6 +466,10 @@ func vmInfoFromMO(m *mo.VirtualMachine) cloud.VM {
 			out.Metadata = metadata
 		}
 	}
+	// What this VM is measured to consume. summary.quickStats is the same figure
+	// vCenter shows on the VM's own performance tab.
+	out.UsedCPUMHz = int64(m.Summary.QuickStats.OverallCpuUsage)
+	out.UsedMemoryMB = int64(m.Summary.QuickStats.HostMemoryUsage)
 	out.PowerState = string(m.Runtime.PowerState)
 	out.PoweredOn = m.Runtime.PowerState == types.VirtualMachinePowerStatePoweredOn
 	if out.IP == "" && m.Guest != nil {

@@ -403,3 +403,44 @@ func TestScaleUpChargesTheWorkersAlreadyStarting(t *testing.T) {
 		t.Fatalf("%d provisioning, %d queued, want 2 and 1", provisioning, queued)
 	}
 }
+
+// The entitlement rule: our workers are charged in full (their 1:1 entitlement),
+// everyone else is measured. Here the neighbours already hold two charges' worth
+// of the cluster and our one worker holds the third, so a second worker must be
+// queued even though the cluster looks half idle.
+func TestEntitlementChargesOurWorkersAgainstTheNeighboursLoad(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(2)
+	pool.Status.Nodes = []infrav1.WorkerNodeStatus{{
+		Name: "pool-wrk-01", IP: "192.168.100.7", Phase: infrav1.NodePhaseReady,
+		ProviderID: "vm-1", K8sReady: true,
+	}}
+	pool.Status.ObservedReplicas = 1
+	fc := &fakeCloud{
+		vms: []cloud.VM{{
+			ID: "vm-1", Name: "pool-wrk-01", IP: "192.168.100.7",
+			CPU: 2, MemoryMB: 4096, PoweredOn: true,
+			UsedCPUMHz: 1000, UsedMemoryMB: 1024,
+		}},
+		capacity: cloud.PlatformCapacity{
+			Physical: true, Measured: true, PerVMUsage: true, CPUMHzPerCore: 2600,
+			// 10.4 GHz of neighbours + 1 GHz of ours measured = 11.4 GHz used.
+			CPU:      cloud.ResourceCapacity{Limit: 3 * 2 * 2600, Used: 11400},
+			MemoryMB: cloud.ResourceCapacity{Limit: 1 << 20, Used: 1<<20 - 1},
+		},
+	}
+	r := newTestReconciler(t, fc, &fakeKube{nodes: readyNodes("pool-wrk-01")}, pool)
+
+	if _, err := r.Reconcile(ctx, requestFor(pool)); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	got := getPool(t, r, pool)
+	for _, n := range got.Status.Nodes {
+		if n.Name == "pool-wrk-02" && n.Phase != infrav1.NodePhaseQueued {
+			t.Fatalf("pool-wrk-02 = %s, want Queued: others 10.4 GHz + 2 charges > 15.6 GHz", n.Phase)
+		}
+	}
+	if len(fc.created) != 0 {
+		t.Fatalf("created %d VMs, want none: the cluster is already spoken for", len(fc.created))
+	}
+}

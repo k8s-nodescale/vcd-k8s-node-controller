@@ -49,10 +49,20 @@ func poolFit(p *infrav1.K8sWorkerPool) *Fit {
 		per := int64(p.Spec.Flavor.CPUs) * perCore
 		if per > 0 {
 			out.CPUPerWorkerMHz = per
-			if free := c.CPULimitMHz - c.CPUMHz - starting*per; free >= 0 {
-				n := int32(free / per)
-				out.CPU = &n
+			free := c.CPULimitMHz - c.CPUMHz - starting*per
+			if c.PerVMUsage {
+				// Entitlement: our workers charged in full, the neighbours measured.
+				others := c.CPUMHz - c.OurCPUMHz
+				if others < 0 {
+					others = 0
+				}
+				free = c.CPULimitMHz - others - workersWithVM(p)*per
 			}
+			if free < 0 {
+				free = 0 // over the entitlement reads as no room, not as unknown
+			}
+			n := int32(free / per)
+			out.CPU = &n
 		}
 	}
 
@@ -60,10 +70,19 @@ func poolFit(p *infrav1.K8sWorkerPool) *Fit {
 	if c.MemoryLimitMB > 0 && p.Spec.Flavor.MemoryMB > 0 {
 		per := int64(p.Spec.Flavor.MemoryMB)
 		out.MemoryPerWorkerMB = per
-		if free := c.MemoryLimitMB - c.MemoryMB - starting*per; free >= 0 {
-			n := int32(free / per)
-			out.Memory = &n
+		free := c.MemoryLimitMB - c.MemoryMB - starting*per
+		if c.PerVMUsage {
+			others := c.MemoryMB - c.OurMemoryMB
+			if others < 0 {
+				others = 0
+			}
+			free = c.MemoryLimitMB - others - workersWithVM(p)*per
 		}
+		if free < 0 {
+			free = 0
+		}
+		n := int32(free / per)
+		out.Memory = &n
 	}
 
 	// Storage: what a clone writes, worst case.
@@ -100,4 +119,18 @@ func perCoreFor(p *infrav1.K8sWorkerPool, c *infrav1.CapacityStatus) int32 {
 		return *n
 	}
 	return 1
+}
+
+// workersWithVM counts the slots the pool has actually spent: a queued slot has
+// no VM, a missing one has none any more.
+func workersWithVM(p *infrav1.K8sWorkerPool) int64 {
+	var n int64
+	for i := range p.Status.Nodes {
+		switch p.Status.Nodes[i].Phase {
+		case infrav1.NodePhaseQueued, infrav1.NodePhaseMissing:
+		default:
+			n++
+		}
+	}
+	return n
 }

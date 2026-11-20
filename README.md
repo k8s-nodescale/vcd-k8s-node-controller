@@ -1185,6 +1185,31 @@ Memory and disk are never overcommitted here: their charge is the flavour's
 allocation in full, because a VM that cannot get its pages stalls and a thin disk
 that fills stops the datastore - neither is a recoverable scheduling choice.
 
+#### Entitlement: our workers charged, the neighbours measured
+
+Where the platform reports per-VM usage (vSphere: `summary.quickStats`), the
+pre-flight turns "is the host idle now" into "can the cluster back what this pool
+has committed to":
+
+    ours   = sum of the measured CPU of the pool's own worker VMs
+    others = total used - ours
+    admit  = (N + 1) x charge + others <= capacity      // N = workers with a VM
+
+The charge is the same 1:1 (or overcommitted) figure as above, and `N` counts a
+worker from the moment it is created - a starting VM consumes almost nothing, so
+counting only what is measured would let a scale-out add one worker per pass until
+the hosts were oversubscribed. With this rule an idle worker still holds its
+entitlement, which is what stops a pool from growing to a number of nodes the
+cluster could never back once payload lands.
+
+`status.capacity` publishes `ourCPU_MHz`, `ourMemoryMB` and `perVMUsage`, and the
+page draws the pool's claim as the light segment after the measured fill, so
+"92 GHz used" can read as "9 of it yours, 83 somebody else's, and your eight
+workers already claim the machine".
+
+A platform whose figure is a quota (vCD) has no such split: its limit is already
+the pool's, so the measured rule applies there unchanged.
+
 The page offers the same setting as `Assume 2 vCPU : 1 core` beside its fit line
 and writes this field, so the number it shows and the number that admits a worker
 cannot disagree.

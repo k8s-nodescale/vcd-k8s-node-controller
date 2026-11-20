@@ -235,6 +235,14 @@ type Capacity struct {
 	// needs it to charge a worker itself, so the assumption switch shows its
 	// effect before any collection answers.
 	CPUMHzPerCore int64 `json:"cpuMHzPerCore,omitempty"`
+	// OurCPUMHz and OurMemoryMB are what this pool's workers are measured to
+	// consume; the rest of the totals is everyone else's. The page subtracts it to
+	// get the neighbours' load, which is what our entitlement is measured against.
+	// PerVMUsage says the platform reported those two, so the pane can separate
+	// our draw from the neighbours' load and charge our entitlement on top.
+	PerVMUsage  bool  `json:"perVMUsage,omitempty"`
+	OurCPUMHz   int64 `json:"ourCPU_MHz,omitempty"`
+	OurMemoryMB int64 `json:"ourMemoryMB,omitempty"`
 	// Physical says the CPU and memory numbers are the hosts' own capacity
 	// (vSphere) rather than a quota (vCD); the assumption above applies only
 	// here, and the page offers to change it only here.

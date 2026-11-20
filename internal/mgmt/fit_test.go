@@ -2,6 +2,7 @@ package mgmt
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -155,3 +156,29 @@ func TestFitChargesWorkersThatAreStillStarting(t *testing.T) {
 		t.Fatalf("memory = %v, want 201 after the two reservations", f.Memory)
 	}
 }
+
+// With per-VM usage the fit is an entitlement: our workers charged in full, the
+// neighbours measured. 92.8 GHz total, 10 of them ours, 8 workers at 15.6 GHz is
+// over the cluster, so nothing more fits.
+func TestFitUsesTheEntitlementWhenUsageIsPerVM(t *testing.T) {
+	p := fitPool(1)
+	p.Spec.Flavor.CPUs = 6
+	p.Status.Nodes = nil
+	for i := 0; i < 8; i++ {
+		p.Status.Nodes = append(p.Status.Nodes, infrav1.WorkerNodeStatus{
+			Name: "w-" + itoa(i), Phase: infrav1.NodePhaseReady,
+		})
+	}
+	p.Status.Capacity.OurCPUMHz = 10000
+	p.Status.Capacity.OurMemoryMB = 200000
+	p.Status.Capacity.PerVMUsage = true
+	p.Status.Capacity.CPUMHz = 92800 // 92.8 GHz measured in total
+
+	f := poolFit(p)
+	if f.CPU == nil || *f.CPU != 0 {
+		t.Fatalf("cpu = %v, want 0: 8 workers at 1:1 already exceed the cluster", f.CPU)
+	}
+}
+
+// itoa keeps the test free of a strconv import for one call.
+func itoa(i int) string { return fmt.Sprintf("%d", i) }
