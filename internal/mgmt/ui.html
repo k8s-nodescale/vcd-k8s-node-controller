@@ -1099,7 +1099,8 @@
       var per = p.flavor.cpus * Math.ceil(c.cpuMHzPerCore / ratio);
       var free = c.cpuLimitMHz - c.cpuMHz;
       out.push({ key: "vCPU", n: free >= 0 ? Math.floor(free / per) : 0,
-        basis: cpuCharge(c, perCore, p.flavor.cpus) });
+        basis: cpuCharge(c, perCore, p.flavor.cpus) + "; free " +
+          (Math.max(0, free) / 1000).toFixed(1) + " GHz of " + (c.cpuLimitMHz / 1000).toFixed(1) });
     } else if (f.cpu != null) {
       // An old snapshot that carries no core speed: the controller's number is
       // better than nothing, it just cannot follow the switch.
@@ -1107,11 +1108,13 @@
     }
     if (f.memory != null) {
       out.push({ key: "RAM", n: f.memory,
-        basis: (f.memoryPerWorkerMB / 1024).toFixed(0) + " GB per worker, the flavour's allocation" });
+        basis: (f.memoryPerWorkerMB / 1024).toFixed(0) + " GB per worker, the flavour's allocation; free " +
+          fmtGB(Math.max(0, c.memoryLimitMB - c.memoryMB) / 1024) + " of " + fmtGB(c.memoryLimitMB / 1024) });
     }
     if (f.storage != null) {
       out.push({ key: "storage", n: f.storage,
-        basis: (f.diskPerWorkerMB / 1024).toFixed(0) + " GB provisioned per worker" });
+        basis: (f.diskPerWorkerMB / 1024).toFixed(0) + " GB provisioned per worker; free " +
+          fmtGB(Math.max(0, c.storageLimitMB - c.storageMB) / 1024) + " of " + fmtGB(c.storageLimitMB / 1024) });
     }
     if (c.podCIDR) {
       var pc = podCalc(c);
@@ -1172,7 +1175,7 @@
     });
     return '<div class="fitbox"><table>' + rows.join("") +
       "<tr><td><b>fits</b> - the smallest of the five</td><td><b>+" + fit + "</b></td></tr></table>" +
-      '<div class="capnote">The compute numbers are the hosts\u2019 free capacity, shared with every other VM on them: what the cluster can still absorb, not a quota for this pool.' +
+      '<div class="capnote">Each number is what still fits in the free part of that dimension - not how many workers in total the hardware could run. The hosts are shared, so the free part also belongs to every other VM on them; a worker charges far more than it burns, which is why shrinking the pool does not enlarge this by much.' +
       ((c.cpuPerCore || 1) > 2 ? " spec.capacity.cpuPerCore is " + c.cpuPerCore + "; this page toggles 1 and 2." : "") +
       "</div></div>";
   }

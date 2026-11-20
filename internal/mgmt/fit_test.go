@@ -1,6 +1,7 @@
 package mgmt
 
 import (
+	"context"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -104,4 +105,30 @@ func TestFitNeedsAFlavour(t *testing.T) {
 		t.Fatalf("cpu = %d with no vCPU count", *f.CPU)
 	}
 	_ = metav1.Now
+}
+
+// The page charges a worker itself so the assumption switch reacts before any
+// collection answers. That needs the core speed in the DTO - it was missing once
+// and the local charge silently fell back to the snapshot, which is how the
+// breakdown lost its "free ... of ..." half.
+func TestCapacityViewCarriesTheChargeBasis(t *testing.T) {
+	p := fitPool(1)
+	col := &Collector{Client: testClient(t, p)}
+	pools, err := col.CollectOnce(context.Background())
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	if len(pools) != 1 || pools[0].Capacity == nil {
+		t.Fatalf("no capacity in the view: %#v", pools)
+	}
+	c := pools[0].Capacity
+	if c.CPUMHzPerCore != 2600 {
+		t.Fatalf("cpuMHzPerCore = %d in the view, want 2600", c.CPUMHzPerCore)
+	}
+	if c.Fit == nil || c.Fit.CPU == nil {
+		t.Fatalf("no cpu fit in the view: %#v", c.Fit)
+	}
+	if !c.Physical {
+		t.Fatal("physical was dropped from the view")
+	}
 }

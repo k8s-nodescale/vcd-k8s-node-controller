@@ -231,6 +231,10 @@ type Capacity struct {
 	// CPUPerCore is the overcommit assumption the pre-flight is using: how many
 	// vCPUs it lets one physical core carry. 1 is a vCPU per core.
 	CPUPerCore int32 `json:"cpuPerCore,omitempty"`
+	// CPUMHzPerCore is the core speed the pre-flight charges a vCPU at. The page
+	// needs it to charge a worker itself, so the assumption switch shows its
+	// effect before any collection answers.
+	CPUMHzPerCore int64 `json:"cpuMHzPerCore,omitempty"`
 	// Physical says the CPU and memory numbers are the hosts' own capacity
 	// (vSphere) rather than a quota (vCD); the assumption above applies only
 	// here, and the page offers to change it only here.

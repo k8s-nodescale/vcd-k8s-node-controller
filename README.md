@@ -2046,6 +2046,16 @@ the last-worker guard and the node-local-volume refusal. A request the pool
 refuses shows up as the pool's `Ready` condition message, which the page
 displays under the summary.
 
+The capacity pane answers "how many more workers fit": each bar carries `+N`, the
+binding dimension is highlighted, and `FITS n MORE WORKERS - limited by <dim>`
+names it. `?` opens the five dimensions with their charge and the free slice each
+was divided out of. The numbers are slices, not totals - the hosts are shared, and
+a worker charges more than it burns, so shrinking the pool does not enlarge them
+much. Where the platform reports physical capacity, `Assume 2 vCPU : 1 core`
+writes `spec.capacity.cpuPerCore` (see [Overcommitting
+CPU](#overcommitting-cpu-where-the-limit-is-physical-vsphere)); the write is
+disabled while the pool has an operation in flight, like every other action.
+
 The table is one row per slot: CPU and memory, each in three columns - requests,
 limits and real utilisation. Each column is coloured on its own: green below
 80%, orange from 80% to 90%, red at 90% and above. A node that is green on

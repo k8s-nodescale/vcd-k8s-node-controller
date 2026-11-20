@@ -399,6 +399,7 @@ func (c *Collector) poolView(ctx context.Context, p *infrav1.K8sWorkerPool, byNo
 			PodMaxPerNode:     cap.PodMaxPerNode,
 			At:                cap.At.UTC().Format(time.RFC3339),
 			CPUPerCore:        perCoreFor(p, cap),
+			CPUMHzPerCore:     cap.CPUMHzPerCore,
 			Physical:          cap.Physical,
 			Fit:               poolFit(p),
 			CPU:               shareOf(cap.CPUMHz, cap.CPULimitMHz),
