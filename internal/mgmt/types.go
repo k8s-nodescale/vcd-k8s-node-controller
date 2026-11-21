@@ -152,17 +152,27 @@ type DiskProgress struct {
 
 // Pool is everything the page needs about one pool.
 type Pool struct {
-	Name            string    `json:"name"`
-	Replicas        int32     `json:"replicas"`
-	Observed        int32     `json:"observedReplicas"`
-	Ready           int32     `json:"readyReplicas"`
-	Phase           string    `json:"phase,omitempty"`
-	Message         string    `json:"message,omitempty"`
-	MinReplicas     int32     `json:"minReplicas"`
-	AllowLastWorker bool      `json:"allowLastWorker"`
-	DeleteWorkers   []string  `json:"deleteWorkers,omitempty"`
-	Flavor          Flavor    `json:"flavor"`
-	Capacity        *Capacity `json:"capacity,omitempty"`
+	Name     string `json:"name"`
+	Replicas int32  `json:"replicas"`
+	Observed int32  `json:"observedReplicas"`
+	Ready    int32  `json:"readyReplicas"`
+	// Phase is status.rollout.phase: the rolling replacement of workers, which
+	// stays Idle during a plain scale-out.
+	Phase string `json:"phase,omitempty"`
+	// Activity is what the pool is doing right now, in one word: the rollout
+	// phase when a replacement is running, otherwise the step the newest
+	// worker is at (Provisioning, Joining, Draining ...). See activity().
+	Activity        string   `json:"activity,omitempty"`
+	Message         string   `json:"message,omitempty"`
+	MinReplicas     int32    `json:"minReplicas"`
+	AllowLastWorker bool     `json:"allowLastWorker"`
+	DeleteWorkers   []string `json:"deleteWorkers,omitempty"`
+	Flavor          Flavor   `json:"flavor"`
+	// Preflight is spec.capacity.preflight: whether the controller reads the
+	// platform's capacity at all. Off means the owner plans the resources, and
+	// the page says so instead of showing numbers nobody refreshes.
+	Preflight bool      `json:"preflight"`
+	Capacity  *Capacity `json:"capacity,omitempty"`
 	// The address window the pool owns inside its CIDR. Two pools can share a
 	// CIDR only if their windows do not overlap, so the page has to show where
 	// this one starts and ends, not just the network.
@@ -203,6 +213,8 @@ type Disk struct {
 // percentages are computed here like every other share, so the page only paints.
 type Capacity struct {
 	Model             string `json:"model,omitempty"`
+	Datacenter        string `json:"datacenter,omitempty"`
+	Cluster           string `json:"cluster,omitempty"`
 	CPUMHz            int64  `json:"cpuMHz,omitempty"`
 	CPULimitMHz       int64  `json:"cpuLimitMHz,omitempty"`
 	MemoryMB          int64  `json:"memoryMB,omitempty"`
@@ -220,8 +232,63 @@ type Capacity struct {
 	PodUsablePerBlock int32  `json:"podUsablePerBlock,omitempty"`
 	PodMaxPerNode     int32  `json:"podMaxPerNode,omitempty"`
 	At                string `json:"at,omitempty"`
+	// CPUPerCore is the overcommit assumption the pre-flight is using: how many
+	// vCPUs it lets one physical core carry. 1 is a vCPU per core.
+	CPUPerCore int32 `json:"cpuPerCore,omitempty"`
+	// CPUMHzPerCore is the core speed the pre-flight charges a vCPU at. The page
+	// needs it to charge a worker itself, so the assumption switch shows its
+	// effect before any collection answers.
+	CPUMHzPerCore int64 `json:"cpuMHzPerCore,omitempty"`
+	// OurCPUMHz and OurMemoryMB are what this pool's workers are measured to
+	// consume; the rest of the totals is everyone else's. The page subtracts it to
+	// get the neighbours' load, which is what our entitlement is measured against.
+	// PerVMUsage says the platform reported those two, so the pane can separate
+	// our draw from the neighbours' load and charge our entitlement on top.
+	PerVMUsage  bool  `json:"perVMUsage,omitempty"`
+	OurCPUMHz   int64 `json:"ourCPU_MHz,omitempty"`
+	OurMemoryMB int64 `json:"ourMemoryMB,omitempty"`
+	// Physical says the CPU and memory numbers are the hosts' own capacity
+	// (vSphere) rather than a quota (vCD); the assumption above applies only
+	// here, and the page offers to change it only here.
+	Physical bool `json:"physical,omitempty"`
+	// Fit is how many more workers of this pool's flavour still fit, per
+	// dimension. The page shows the smallest and names the dimension.
+	Fit *Fit `json:"fit,omitempty"`
 
 	CPU     *Share `json:"cpu,omitempty"`
 	Memory  *Share `json:"memory,omitempty"`
 	Storage *Share `json:"storage,omitempty"`
+	// Datastores is the storage inventory of the scope, shown next to the
+	// single storage bar; empty where the platform has no such list.
+	Datastores []Datastore `json:"datastores,omitempty"`
+}
+
+// Fit is how many more workers of one flavour the platform has room for, in the
+// terms each dimension is actually limited by. A nil number means the dimension
+// is not limited (or not measurable), which the page shows as unknown rather
+// than as zero.
+//
+// The three numbers are not the same kind of promise: CPU can be oversubscribed
+// by the assumption in Capacity.CPUPerCore, while memory and disk are the
+// flavour's allocation in full, because overcommitting those is not a policy
+// but a failure mode.
+type Fit struct {
+	CPU     *int32 `json:"cpu,omitempty"`
+	Memory  *int32 `json:"memory,omitempty"`
+	Storage *int32 `json:"storage,omitempty"`
+	// The charge behind each number, so the page can explain it: MHz of CPU,
+	// MB of memory and MB of provisioned disk one worker costs.
+	CPUPerWorkerMHz   int64 `json:"cpuPerWorkerMHz,omitempty"`
+	MemoryPerWorkerMB int64 `json:"memoryPerWorkerMB,omitempty"`
+	DiskPerWorkerMB   int64 `json:"diskPerWorkerMB,omitempty"`
+}
+
+// Datastore is one datastore the pool's cluster offers: what it holds, what is
+// written to it, and its own share, so the page only paints.
+type Datastore struct {
+	Name       string `json:"name"`
+	Default    bool   `json:"default,omitempty"`
+	CapacityMB int64  `json:"capacityMB,omitempty"`
+	UsedMB     int64  `json:"usedMB,omitempty"`
+	Share      *Share `json:"share,omitempty"`
 }

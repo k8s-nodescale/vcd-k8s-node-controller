@@ -16,6 +16,16 @@ verified on a dev cluster (vCD, NSX-V): adding a replica to a `K8sWorkerPool`
 creates a VM, lays out and grows its disks, boots the guest, joins it to the
 cluster and reports it Ready - about five minutes per worker.
 
+**1.1.0** adds the vSphere provider, the one-platform-per-installation rule and
+the installation-wide guest policy (NTP, CA bundle, security sysctls, kernel
+modules and containerd), so a controller-made worker can boot the same way as a
+Terraform + cloud-init + Ansible one. See
+[Guest policy](#guest-policy-containerd-and-the-ca-bundle).
+
+**1.1.1** adds `vsphere.host`: a pool can pin its workers to the host the
+Terraform tfvars names (`vsphere.esxi_host_name`), for a cluster whose hosts each
+have their own switch and publish the worker port group on one of them.
+
 ### How work lands from here
 
 One branch per feature, cut from `main`, named for what it delivers
@@ -105,7 +115,9 @@ Not implemented yet:
 
 - NSX-T ingress pools (`ingressPool.type: nsxt` is rejected with a clear event;
   the node is still drained and deleted, but its pool member must be removed by
-  hand).
+  hand). On vSphere the field is ignored entirely, silently - the planned
+  optional HAProxy workflow is not written yet, so a pool that sets
+  `ingressPool` there is a declaration, not a promise.
 - Automatic repair of a worker that is `Failed`: it is reported and kept, and
   a `Failed` drain is not retried for you. A VM that boots but never joins is
   parked by `spec.provisioning.timeout` with the VM kept.
@@ -129,23 +141,36 @@ One `K8sWorkerPool` describes the worker set of a single cluster. You own
 | `bootstrap.osUser` | no | Guest account created by vCD guest customization. |
 | `bootstrap.osPasswordHash` | no | `/etc/shadow` hash, not a plain password. |
 | `bootstrap.sshAuthorizedKey` | no | Public key installed for `osUser`. |
+| `bootstrap.sshAuthorizedKeysRef` | no | `kind` (`ConfigMap`/`Secret`), `name`, `key`, `namespace` (defaults to the controller's) - a store holding public keys, one per line; added to `sshAuthorizedKey`, duplicates dropped, blank and `#` lines ignored. Rotate a key in the store without editing the pool. The keys still travel in the guest user-data (that is how cloud-init installs them), so this keeps them out of a widely readable CR, not off the VM. A missing object or key fails the create, naming this field. |
 | `bootstrap.nicName` | no | Guest NIC name (`ens192` on the Ubuntu template). |
+| `bootstrap.sshAllowedSources[]` | no | Extra sshd `AllowUsers` patterns for the workers, e.g. `*@10.99.96.64/26`. The image ships a restrictive `AllowUsers` line; these are appended to it exactly like the Terraform baseline appends `allowed_ssh_ips`. |
 | `bootstrap.dns` | no | Resolvers written into the guest. |
 | `bootstrap.k8sVersion` | no | Full apt version pinned in the guest, e.g. `1.35.9-1.1`. |
 | `bootstrap.k8sMinorRepo` | no | `pkgs.k8s.io` minor repo, e.g. `v1.35`. |
+| `bootstrap.ntpServers[]` | no | chrony sources, each written as `server <host> iburst` in a marked block of `/etc/chrony/chrony.conf`. Empty keeps the image's sources; the installation default applies when the chart sets one. |
+| `bootstrap.caBundleRef` | no | `{kind, name, namespace, key}` of a ConfigMap (default) or Secret holding the PEM bundle to trust in the guest. Usually inherited from the installation, see [Guest policy](#guest-policy-containerd-and-the-ca-bundle). |
+| `bootstrap.sysctls` | no | Extra kernel parameters, written to `/etc/sysctl.d/99-zzz-nodescale.conf` (last in name order, so they win) and applied with `sysctl --system`. The Kubernetes-required ones are always written. The guest reads every configured key back afterwards and logs a warning when one is not live, which is what a parameter of an unloaded module looks like. |
+| `bootstrap.kernelModules[]` | no | Modules loaded and persisted in `/etc/modules-load.d/nodescale.conf` before the sysctls apply. A parameter whose module is missing is skipped by `sysctl --system` without an error, so a `nf_conntrack` key needs its module here; the guest warns when a configured key is not live. A failed `modprobe` is logged, never fatal. |
+| `bootstrap.containerd` | no | Site part of the runtime config: `sandboxImage`, `mirrors` (`{host: [endpoint,...]}`), `insecureSkipVerify`, and `configRef` as a full-file escape hatch. See [Guest policy](#guest-policy-containerd-and-the-ca-bundle). |
 | `flavor.cpus` / `flavor.memoryMB` | yes | VM shape. |
 | `flavor.osDiskGB` | no | Grows the cloned template's system disk (bus 0/unit 0) before the first power-on. Terraform nodes use `disks_config.osdisk.sizegb`; a clone without this keeps the template size (10 GB on the current Ubuntu template). A smaller value replaces the worker (see [Rolling compute-spec changes](#rolling-compute-spec-changes)). |
-| `flavor.template` | no | vCD catalog template (must expose `disk.EnableUUID`). Another value replaces the worker: a different image is a different VM. |
-| `flavor.disks[]` | no | Data disks: `sizeGB`, `mount` (`/var`, `/var/lib`), `busType`, `busNumber`, `unitNumber`, `storageProfile`. Mirrors Terraform `diskw1` / `diskw2`. |
-| `provider` | no | Platform that runs the workers: `vcd` (default) or `vsphere`. The block for the selected platform is required. `vsphere` is a stub: a pool that names it is rejected as `InvalidSpec` instead of half-working. See [Platform providers](#platform-providers). |
+| `flavor.template` | no | Image to clone: a vCD catalog item, or on vSphere a VM name or inventory path (e.g. `noble-template_1.1.0_k8s`). Must expose `disk.EnableUUID`. Another value replaces the worker: a different image is a different VM. |
+| `flavor.disks[]` | no | Data disks: `sizeGB`, `mount` (`/var`, `/var/lib`), `busType`, `busNumber`, `unitNumber`, `storageProfile`. Mirrors Terraform `diskw1` / `diskw2`, but `busNumber`/`unitNumber` must match the controllers the image actually has, not the Terraform variable: `govc device.info -vm <worker>` shows the controller's `BusNumber` and each disk's `UnitNumber` (the reference image has one paravirtual SCSI controller on bus 0, so its data disks are bus 0, units 1 and 2). A mismatch is read as drift and starts a resize. |
+| `provider` | no | Platform that runs the workers: `vcd` or `vsphere`. Empty means the platform this installation serves, which is the normal case because one installation serves one platform; a value naming the other platform is refused with `InvalidSpec`. See [Platform providers](#platform-providers). |
 | `vcd.org` / `vcd.vdc` / `vcd.vapp` / `vcd.orgNetwork` | yes* | Placement of the VM. Required when `provider` is `vcd`. |
 | `vcd.catalog` / `vcd.catalogOrg` | no | Catalog holding the template (defaults to the controller org). |
-| `vcd.dvmOffset` | no | Address offset of the deployment VM in Terraform's `ip_plan`; the controller reserves it so no worker gets that address. Only the vCD bootstrap has a DVM. |
-| `ipPlan` | yes | Mirrors Terraform's `ip_plan`: `cidr`, `mNodeOffset`, `wNodeOffset`, `kubeapiLB`, `ingressLB`, `masterCount`, `reserved[]`. Workers are allocated from `wNodeOffset` upwards. |
+| `vsphere.cluster` | yes* | Compute cluster the pool runs in (e.g. `mskdev`). Its hosts are the pool's capacity: a worker is never placed on a host of another cluster. Required on a vsphere installation. |
+| `vsphere.datastore` | yes* | Datastore holding the worker disks; also the storage the capacity pre-flight reads. |
+| `vsphere.folder` | yes* | VM folder the workers are cloned into. It must be at or below the installation's `vsphere.folderRoot` when one is configured. |
+| `vsphere.network` | yes* | Port group the worker NIC is attached to. |
+| `vsphere.host` | no | Pins every worker of the pool to one ESXi host of `vsphere.cluster`. Empty (the normal case) lets vCenter place each clone. Set it where the port group exists on one host only - a lab whose hosts each have their own switch; the same host the Terraform `vsphere.esxi_host_name` names. A host outside the cluster is refused. |
+| `vsphere.datacenter` | yes* | vCenter datacenter, e.g. `MSK_Dev_DC`. Required: it is part of where the pool lives, like the cluster and the datastore, and there is no process-wide default to disagree with. |
+| `vsphere.resourcePool` | no | Resource pool inside the cluster. Empty means the root pool of the cluster. |
+| `ipPlan` | yes | Mirrors Terraform's `ip_plan`: `cidr`, `vmIPOffset`, `dvmOffset`, `kubeapiLB`, `ingressLB`, `lbNodeOffset`/`lbNodeCount`, `mNodeOffset`/`masterCount`, `wNodeOffset`, `nodeCount`, `reserved[]`. Every offset is relative to `vmIPOffset`: `address = prefix + vmIPOffset + offset`. Workers are allocated from `vmIPOffset+wNodeOffset` upwards. |
 | `join.endpoint` | no | Control-plane address, `host:port` of the API VIP. |
 | `join.tokenTTL` | no | Lifetime of the per-VM bootstrap token (default `1h`). |
 | `join.labels` / `join.taints` | no | Pool-wide, applied to every Ready worker (`taints` in `key[=value]:Effect` form). |
-| `ingressPool` | no | `type` (`nsxv`/`nsxt`), `name`, `port`, `edge`. `port` is the **node port** the pool forwards to, not the virtual-server port; `edge` is the NSX-V edge that owns the pool. Workers are added on Ready and removed before a drain. |
+| `ingressPool` | no | `type` (`nsxv`/`nsxt`), `name`, `port`, `edge`. One pool per pool object. `port` is the **node port** the pool forwards to, not the virtual-server port; `edge` is the NSX-V edge gateway that owns the pool. Workers are added when they turn Ready and removed before a drain; see [Ingress pool membership](#ingress-pool-membership). |
 | `scaleDown.minReplicas` | no | Floor for the workers that can serve traffic (default `1`). A removal that would leave fewer is refused. Writing off a `Missing` slot takes nothing out of service, so the floor never blocks that cleanup. `0` disables the floor. |
 | `scaleDown.drainTimeout` | no | Budget for cordon+drain of one worker (default `10m`), and for the drain a rollout performs. When it expires the removal escalates past a blocking PodDisruptionBudget: the pods left on the node are deleted, the budget is named in `status`, and the removal continues with a fresh budget. |
 | `scaleDown.waitForPDB` | no | Refuse to bypass a PodDisruptionBudget (default `false`). With `true` a drain that cannot finish within `drainTimeout` parks the worker `Failed` and keeps its VM for a human instead of escalating. A rollout drain honours the same switch: the roll pauses with a `RolloutBlocked` warning and the worker untouched. |
@@ -163,6 +188,7 @@ One `K8sWorkerPool` describes the worker set of a single cluster. You own
 | `provisioning.timeout` | no | How long a VM may run without its Kubernetes Node before the worker is parked as `Failed` (default `15m`). The VM is kept for inspection and the pool reports `Ready=False`/`WorkerFailed`; a registration that arrives later still promotes the worker to `Ready`. |
 | `capacity.preflight` | no | Read the vDC's free capacity before a create or a resize and park work that cannot fit (default `true`). See [When the vDC is full](#when-the-vdc-is-full). |
 | `capacity.cpuMhzPerCore` | no | MHz per vCPU used for the CPU estimate when the vDC does not report its own speed to the controller account (default `2000`). The admin view of the vDC is read once; a tenant account that cannot read it falls back to this number. |
+| `capacity.cpuPerCore` | no | How many vCPUs the pre-flight lets one **physical** core carry, where the platform reports physical capacity (vSphere). `1` (default) charges a worker its whole vCPU count in core speed, `2` charges half of it. Ignored where the limit is a quota (vCD). See [Overcommitting CPU](#overcommitting-cpu-where-the-limit-is-physical-vsphere). |
 
 #### Platform providers
 
@@ -172,18 +198,61 @@ The controller talks to a platform through a narrow contract (`internal/cloud`):
 provider to one pool's `Placement`, so no call carries a vApp or network name
 and the platform is a property of the pool, not of the process.
 
-`spec.provider` picks the implementation. `vcd` (the default) is the
-complete one: `internal/cloud/vcd` authenticates once and hands out a provider
-per pool, bound to `spec.vcd`. `vsphere` is a stub in
-`internal/cloud/vsphere`: it satisfies the same contract and refuses every
-call with `cloud.ErrNotImplemented`, so a pool that names it is rejected as
-`InvalidSpec` before anything is created.
+The installation picks the implementation: `platform` is a mandatory chart
+value, exactly one factory is registered in the process, and `spec.provider`
+may only agree with it (or stay empty). One installation serves one platform.
 
-vSphere has no load-balancer pool, which is why membership is a separate
-optional interface rather than part of the main contract: a provider that
-cannot edit a pool simply does not implement it, and the controller leaves
-membership to the operator. The vCD provider implements it for NSX-V and
-reports `ErrPoolNotConfigured` for a pool it cannot address (NSX-T today).
+**`vcd`** - `internal/cloud/vcd` authenticates lazily, once, on the first vcd
+pool, and hands out a provider per pool, bound to `spec.vcd`. The vApp is the scope of the pool;
+the template comes from a catalog and the guest is customised by vCD (network,
+hostname, credentials) with this controller's initscript running in its two
+customization phases.
+
+**`vsphere`** - `internal/cloud/vsphere` clones `spec.flavor.template` into
+`spec.vsphere.folder`, in the named compute cluster, with the disks on the
+named datastore. The controller account is not granted guest customization
+(`VirtualMachine.Provisioning.Customize`), so the guest is configured the way
+the Terraform module does it: the rendered cloud-config goes into
+`guestinfo.userdata` and a network document into `guestinfo.metadata`, both
+recursively base64 with the matching `.encoding` key, which is what cloud-init's
+VMware datasource reads on the first boot. Nothing is uploaded to a datastore
+and no agent runs inside the guest - the user-data itself writes netplan,
+grows the disks and joins the cluster. A clone gets a regenerated MAC address;
+a copied one would collide on the port group.
+
+What the controller knows about a worker it created is recorded in the VM
+annotation as JSON (`{"apiVersion":"nodescale.k8s/v1","metadata":{...},
+"ip":"...","template":"..."}`) - the identity it was created with, the image it
+was cloned from and the address it was given, because a guest that never boots
+never reports an address either. Any other annotation (a human note, a VM
+Terraform created) is not ours and is left alone, which is what lets a
+Terraform-created worker be adopted by name without being rewritten. The VM id
+is the vSphere managed object id, so `status.nodes[].providerID` is a bare
+moRef value, not a URN.
+
+The scope of a vSphere pool is its folder, the way a vApp is for vCD: VMs are
+listed recursively below it and filtered by `namePrefix`, so the shared lab
+folder that also holds the control plane and the deployment VM is not a
+problem. The installation's `vsphere.folderRoot` is the boundary: a pool that
+names a folder outside it is rejected before the first API call.
+`spec.vsphere.datacenter` is required, because the datacenter is part of the
+pool's placement rather than of the controller configuration.
+
+Capacity is read in the terms of the same block the create uses: compute is the
+named **compute cluster** - its hosts only, with the hosts in maintenance mode
+or disconnected left out - and storage is the named **datastore**, reported as
+the default profile. A host of another cluster is not a candidate for a worker,
+so counting it would report room the pool cannot use. `spec.capacity.cpuMhzPerCore`
+falls back to the host clock speed vCenter reports instead of the 2 GHz vCD
+assumption.
+
+Ingress-pool membership is a separate optional interface rather than part of the
+main compute contract, because not every platform has a pool the controller can
+reach. The vCD provider implements it for NSX-V; NSX-T is refused with
+`ErrPoolNotConfigured`. On vSphere nothing implements it today, and the field is
+therefore ignored - see [Ingress pool membership](#ingress-pool-membership) for
+what the field promises and `docs/ingress-pool-contract.md` for the planned
+optional HAProxy workflow.
 
 `status`:
 
@@ -191,9 +260,9 @@ reports `ErrPoolNotConfigured` for a pool it cannot address (NSX-T today).
 | --- | --- |
 | `observedReplicas` | Worker **slots** the controller knows about: VMs that exist, slots whose VM disappeared and stay reserved (`Missing` / parked `Failed`), and slots waiting for capacity (`Queued`). |
 | `ledger.nextIndex` / `used[]` / `free[]` | Address book. `used` holds every allocated worker IP; addresses of deleted VMs are never released automatically. |
-| `nodes[]` | Per worker: `name` (the vCD VM name), `nodeName` (the Kubernetes Node object name, lower case - the only name the controller passes to the Kubernetes API), `ip`, `providerID` (the VM id in the platform, today `urn:vcloud:vm:...`), `phase`, `cpu`, `memoryMB`, `diskGB`, `k8sReady`, `kubeletVersion`, `message`, `deleteStartedAt`, `flavor` (what the VM actually runs with, template included, read back from the platform), `healAttempts` / `healLastAttempt` (the AutoHeal budget), `resize` (the per-worker rollout step: `phase`, `recreate`, `drainStartedAt`, `message`), `provisioningStartedAt` (when the watchdog clock started for a VM that has no Node yet), `bootstrapTokenID` (the token kept alive until the join, then revoked; never the secret half). `message` is where a blocked removal explains itself (the PDB, the attached volume, the local PV). |
+| `nodes[]` | Per worker: `name` (the VM name in the platform), `nodeName` (the Kubernetes Node object name, lower case - the only name the controller passes to the Kubernetes API), `ip`, `providerID` (the VM id in the platform: `urn:vcloud:vm:...` on vCD, the managed object id on vSphere), `phase`, `cpu`, `memoryMB`, `diskGB`, `k8sReady`, `kubeletVersion`, `message`, `deleteStartedAt`, `flavor` (what the VM actually runs with, template included, read back from the platform), `healAttempts` / `healLastAttempt` (the AutoHeal budget), `resize` (the per-worker rollout step: `phase`, `recreate`, `drainStartedAt`, `message`), `provisioningStartedAt` (when the watchdog clock started for a VM that has no Node yet), `bootstrapTokenID` (the token kept alive until the join, then revoked; never the secret half). `message` is where a blocked removal explains itself (the PDB, the attached volume, the local PV). |
 | `rollout` | `phase` (`Idle`, `Progressing`, `Paused`, `Queued`), `message` (why a roll is waiting, e.g. the capacity it needs), `targetFlavor`, `workersTotal`, `workersDone`, `currentWorker`, `lastError`, `startedAt`. |
-| `conditions[]` | `Ready`, with reason `Converged` (`3/3 workers Ready`), `Progressing` while a worker is not Ready yet, `WorkerMissing` when a slot lost its VM, `WorkerFailed` when a worker is parked (drain timeout, exhausted AutoHeal, or no Node within `provisioning.timeout`), `LastWorkerProtected` / `WorkerHostsController` on a refused emptying, `RolloutInProgress` while a roll holds the pool, `NoResourceAvailable` when workers are queued for vDC capacity, plus `ScaleUpFailed`, `ScaleDownFailed`, `RolloutFailed` and `InvalidSpec` on errors. |
+| `conditions[]` | `Ready`, with reason `Converged` (`3/3 workers Ready`), `Progressing` while a worker is not Ready yet, `WorkerMissing` when a slot lost its VM, `WorkerFailed` when a worker is parked (drain timeout, exhausted AutoHeal, or no Node within `provisioning.timeout`), `LastWorkerProtected` / `WorkerHostsController` on a refused emptying, `RolloutInProgress` while a roll holds the pool, `RollingOut` while a worker is being replaced or resized (`2/3 workers Ready, rollout in progress (pool-wrk-03)`), `NoResourceAvailable` when workers are queued for vDC capacity, plus `ScaleUpFailed`, `ScaleDownFailed`, `RolloutFailed` and `InvalidSpec` on errors. |
 
 Phases: `Provisioning` (VM created, Node not registered yet) -> `Joining` (Node
 registered, not Ready) -> `Ready`. Removal uses `Draining` (cordon, pool
@@ -205,76 +274,124 @@ reserved; `Failed` means the drain hit `drainTimeout` (VM kept), AutoHeal
 exhausted its attempts, or no Node appeared within `provisioning.timeout` (VM
 kept).
 
-Example (placeholder org, network and template; nothing cluster-specific).
-The pool is **cluster-scoped**: no metadata.namespace, and k8sworkerpool
-commands take no -n:
+Two complete objects, one per platform, with every value traced back to
+where it can be read, live in
+[Writing a K8sWorkerPool for an existing cluster](#writing-a-k8sworkerpool-for-an-existing-cluster).
+In short: `spec.vcd` and `spec.vsphere` are alternatives, `spec.ipPlan` mirrors
+Terraform's `ip_plan`, and `spec.provider` is optional because one installation
+serves one platform.
+
+## Ingress pool membership
+
+A cluster's ingress traffic normally enters through a load balancer that forwards
+to a **server pool**: a list of `node address : node port` entries. `spec.ingressPool`
+is how nodescale keeps that list in step with the workers it manages. A worker
+joins the pool when its Node turns Ready, and leaves the pool before anything is
+drained.
+
+What the controller does **not** do:
+
+- it does not create the edge gateway, the server pool, its virtual server, its
+  monitors or its TLS material - they must already exist;
+- it does not discover pools, and it does not look for pools that already
+  contain this cluster's addresses;
+- it does not rewrite the pool it did not create: an NSX-V update starts from
+  the pool as the edge reports it, so members added by Terraform or by hand
+  survive the update untouched.
+
+### The field and the members are written by different things
+
+| | Written by | When |
+| --- | --- | --- |
+| `spec.ingressPool` (`type`, `name`, `edge`, `port`) | the installer (Terraform/Ansible) or a person applying the CR | once, when the pool object is created or changed |
+| the pool's member list | the controller | continuously, following node state |
+
+An empty `spec.ingressPool` means "no pool": no call is made on either
+platform. A field that names a pool the provider cannot address is a different
+case - see the table below.
+
+### Configuration
 
 ```yaml
-apiVersion: k8s-nodescale.github.io/v1alpha1
-kind: K8sWorkerPool
-metadata:
-  name: demo-cluster
 spec:
-  replicas: 2
-  namePrefix: demo-cluster
-  bootstrap:
-    osUser: ubuntu
-    osPasswordHash: "$6$REPLACE_WITH_HASH"
-    sshAuthorizedKey: "ssh-ed25519 AAAA... ops@example.com"
-    nicName: ens192
-    dns: ["8.8.8.8", "1.1.1.1"]
-    k8sVersion: "1.35.9-1.1"
-    k8sMinorRepo: "v1.35"
-  flavor:
-    cpus: 4
-    memoryMB: 8192
-    osDiskGB: 20
-    template: ubuntu-24.04-k8s
-    disks:
-      - sizeGB: 10
-        mount: /var
-        busType: paravirtual
-        busNumber: 1
-        unitNumber: 0
-      - sizeGB: 30
-        mount: /var/lib
-        busType: paravirtual
-        busNumber: 1
-        unitNumber: 1
-  provider: vcd
-  vcd:
-    org: example-org
-    vdc: example-vdc
-    vapp: demo-cluster
-    orgNetwork: demo-cluster-net
-    catalog: Templates
-    dvmOffset: -3
-  ipPlan:
-    cidr: 10.10.0.0/24
-    mNodeOffset: 4
-    wNodeOffset: 7
-    kubeapiLB: 2
-    ingressLB: 3
-    masterCount: 3
-    reserved:
-      - 10.10.0.1
-      - 10.10.0.2
-      - 10.10.0.3
-  join:
-    endpoint: 10.10.0.2:6443
-    tokenTTL: 1h
-    labels:
-      node-role.kubernetes.io/worker: ""
   ingressPool:
-    type: nsxv
-    name: demo-cluster-ingress-pool
-    edge: demo-edge-gateway
-    port: 30080        # ingress controller NodePort, not 443
-  scaleDown:
-    minReplicas: 2
-    drainTimeout: 10m
-    deleteWorkers: []  # e.g. [demo-cluster-wrk-02]
+    type: nsxv                          # nsxv today; nsxt is refused
+    edge: demo-edge-gateway             # edge gateway that owns the pool
+    name: demo-cluster-ingress-pool     # LB server pool on that edge
+    port: 30080                         # ingress-nginx NodePort, not the VIP port
 ```
+
+- `edge` and `name` are the lookup: the controller finds the edge by name in the
+  pool's VDC, then the server pool by name on that edge. A typo in either means
+  the pool is never edited.
+- `port` is the **node port** each member is created with, and the monitor port.
+  It is not the port the client connects to.
+- one `K8sWorkerPool` maps to **one** pool. Two node groups in two pools are two
+  pool objects.
+- the addresses of the load-balancer VMs themselves are reserved in the address
+  plan (`ipPlan.kubeAPILB`, `ingressLB`, `lbNodeOffset`, `lbNodeCount`), so a
+  worker is never handed a VIP address.
+
+### What happens on each step
+
+| Step | Pool call |
+| --- | --- |
+| worker cloned | none - a VM without a kubelet is not a member |
+| Node turns Ready | `AddPoolMember` (event `IngressPoolMember`) |
+| drain starts (scale-down, `deleteWorkers`) | `RemovePoolMember` before the first eviction (`WorkerDeletionStarted` / `IngressPoolMemberNotRemoved`) |
+| rollout / recreate | removed before the drain, added back when the worker is Ready again |
+| worker deleted | nothing further - the member is already gone and is not re-added |
+| adopted (Terraform-created) worker | same as a created one: added on Ready |
+
+Membership is **removal, not "pause"**: NSX-V has an enabled/disabled member
+condition, but the controller splices the member out of the list and, for a
+worker that comes back, adds a fresh enabled entry. The member it creates is
+named `node-10-99-96-109` (NSX-V rejects a bare address as a member name), with
+the node address, `port`, `monitorPort: port`, `condition: enabled`, weight 1 and
+`maxConn: 100`.
+
+### When it is skipped or fails
+
+| Situation | What happens |
+| --- | --- |
+| `spec.ingressPool` empty | no call at all, on any platform |
+| `edge` empty, pool not found on the edge, `port` not set | `ErrPoolNotConfigured`: the add is skipped **silently** |
+| `type: nsxt` | refused with a named event; the worker is still drained and deleted, and its member has to be removed by hand |
+| add fails, any other reason | `IngressPoolFailed` warning naming the worker; the worker stays Ready |
+| removal fails during a scale-down | `IngressPoolMemberNotRemoved` warning, and the drain continues: the edge's health monitor takes the address out once the node stops answering |
+| removal fails during a rollout | the rollout step fails and the pass retries |
+| vSphere, no workflow configured | nothing, and no event - this is the honesty gap the planned workflow closes |
+
+The asymmetry in that table is worth knowing before it bites: the same
+misconfiguration is **silent when a worker joins** and only shows up as a warning
+when a worker is removed. Nothing in `status` reports membership, so today the
+events are the only trace (a dedicated status block is part of the planned
+workflow).
+
+### Checking it
+
+```bash
+kubectl -n nodescale-system get events \
+  --field-selector involvedObject.name=<pool-name> \
+  --sort-by=.lastTimestamp | grep IngressPool
+```
+
+And on the edge itself: the pool must list one member per Ready worker,
+addressed `node-ip:30080`. Because the controller does not read the pool back,
+a member removed by hand is not re-added until that worker leaves Ready and
+returns.
+
+### Limits
+
+- NSX-V only. There is no NSX-T path, and no LB outside vCD.
+- one pool per pool object; a worker cannot be in several pools through this
+  field.
+- members that are not slots of this pool object are preserved but never
+  checked, repaired or reported.
+- the update is a whole-pool `PUT` of the state read a moment earlier, so two
+  writers on the same pool (two installations, or an operator editing it while a
+  worker changes) can drop each other's change: the last writer wins.
+- no read-back into `status`; membership is not part of `Ready`.
 
 ## Layout
 
@@ -285,13 +402,14 @@ internal/controller/     WorkerPool reconciler (+ Node watch)
 internal/cloud/          platform contract: WorkerCompute, CapacityReader,
                          optional PoolMembership, Factory + Placement
 internal/cloud/vcd/      vCloud Director factory + per-pool provider
-internal/cloud/vsphere/  vSphere stub (same contract, ErrNotImplemented)
+internal/cloud/vsphere/  vSphere factory + per-pool provider: clone, guestinfo,
+                         annotation record, cluster/datastore capacity
 internal/kube/           kube.Provider interface + client-go implementation
 internal/ipam/           ip_plan-aware IP ledger/allocator (+ tests)
 internal/cloudinit/      renderer + embedded templates
 config/                  kustomize: crd, rbac, manager, samples
 charts/vcd-nodescale/    published Helm chart (CRDs in crds/)
-docs/                    design doc
+docs/                    design doc, ingress-pool contract (proposal)
 test/                    test strategy / e2e notes
 ```
 
@@ -301,7 +419,9 @@ test/                    test strategy / e2e notes
 go build ./...
 go test ./...
 go vet ./...
-helm lint charts/vcd-nodescale
+helm lint charts/vcd-nodescale --set platform=vcd
+helm lint charts/vcd-nodescale --set platform=vsphere
+./hack/chart-matrix.sh
 ```
 
 Regenerate deepcopy/CRD (requires `controller-gen`):
@@ -313,26 +433,86 @@ make manifests
 
 ## Install
 
-1. Create the vCD credentials secret in the target namespace (keys: `url`,
-   `user`, `password`, `org`, `vdc`, optional `insecure`).
+One installation serves **one platform**. `platform` is a mandatory chart value
+(`vcd` or `vsphere`) and has no default: the chart renders only that platform's
+credentials, so a vSphere installation carries no vcd secret reference at all -
+and the other way round. An installation never changes its platform; a second
+platform needs a second installation.
+
+1. Create the platform credentials Secret in the release namespace. The keys
+   are discrete (no INI, no CSI format):
+
+   vCD (`platform: vcd`):
+
+   ```
+   kubectl -n nodescale-system create secret generic vcd-credentials \
+     --from-literal=url=https://vcd.example.com/api \
+     --from-literal=user=svc-node-controller \
+     --from-literal=password='***' \
+     --from-literal=org=myorg \
+     --from-literal=vdc=My-VDC-Name \
+     --from-literal=insecure=false
+   ```
+
+   vSphere (`platform: vsphere`):
+
+   ```
+   kubectl -n nodescale-system create secret generic vsphere-credentials \
+     --from-literal=url=https://vcenter.example.com \
+     --from-literal=user=terraform@example.local \
+     --from-literal=password='***' \
+     --from-literal=insecure=true
+   ```
+
+   Only the connection lives in the vSphere Secret. The datacenter, cluster,
+   resource pool, folder, datastore and network of a pool are in its
+   `spec.vsphere`, and the folder root is a chart value (see step 2). Where the
+   cluster already has a CSI `vsphere-config-secret`, copy its `server`, `user`
+   and `password` out once - option A duplicates the values into our namespace
+   in the discrete-key format; the controller is not granted read access to
+   another namespace.
+
 2. Install the chart from the published repository:
 
 ```
 helm repo add vcd-nodescale https://k8s-nodescale.github.io/vcd-k8s-node-controller
 helm repo update
 helm install vcd-nodescale vcd-nodescale/vcd-nodescale \
-  --namespace vcd-nodescale-system --create-namespace
+  --namespace nodescale-system --create-namespace \
+  --set platform=vsphere \
+  --set vsphere.folderRoot="/HUB Infrastructure/dev/k8s-test-lab"
 ```
 
 Or from a checkout:
 
 ```
 helm install vcd-nodescale charts/vcd-nodescale \
-  --namespace vcd-nodescale-system --create-namespace
+  --namespace nodescale-system --create-namespace \
+  --set platform=vcd
 ```
+
+`vsphere.folderRoot` is the tenant boundary: every pool folder must be at or
+below it. It is a policy of the installation rather than a credential, so it is
+a plain chart value and not a Secret key.
+
+The release also renders `nodescale-bootstrap`, the installation-wide guest
+policy (NTP, CA bundle, sysctls, containerd mirrors) that every new worker
+inherits; add `--set-file bootstrap.caBundle=...` and
+`bootstrap.defaults` when they apply. See
+[Guest policy](#guest-policy-containerd-and-the-ca-bundle).
+
+The Pod starts even while the credentials Secret is missing or incomplete:
+`/readyz` stays NotReady (so `helm --wait` fails) and every affected pool
+reports `CloudError` naming the missing key. The controller never enters a
+restart loop over credentials, and a wrong account is a condition on the pool
+rather than a crash of the whole process.
 
 The chart installs the CRD, the controller and the RBAC it needs, including
 `configmaps` `get`/`update` in `kube-public` for the JWS publication.
+
+3. Write the pools. This is a separate step, done when the existing worker set
+   is handed to the controller; see
+   [Writing a K8sWorkerPool for an existing cluster](#writing-a-k8sworkerpool-for-an-existing-cluster).
 
 **Upgrading.** Helm applies `crds/` on install only: `helm upgrade` never touches a
 CRD. An older CRD prunes the newer `status` fields and drops new subresources
@@ -348,7 +528,7 @@ Upgrading by hand:
 
 ```
 kubectl apply -f charts/vcd-nodescale/crds/k8s-nodescale.github.io_k8sworkerpools.yaml
-helm upgrade vcd-nodescale charts/vcd-nodescale -n vcd-nodescale-system \
+helm upgrade vcd-nodescale charts/vcd-nodescale -n nodescale-system \
   --reuse-values --set image.tag=<version>
 ```
 
@@ -371,7 +551,7 @@ kubectl get k8sworkerpool -A -o yaml > pools-backup.yaml
 
 # 2. stop the controller: with it running, deleting the CRs runs the cleanup
 #    finalizer and the controller deletes the workers
-kubectl -n vcd-nodescale-system scale deploy/vcd-nodescale --replicas=0
+kubectl -n nodescale-system scale deploy/vcd-nodescale --replicas=0
 
 # 3. replace the CRD, which drops every K8sWorkerPool
 kubectl delete crd k8sworkerpools.k8s-nodescale.github.io
@@ -383,12 +563,487 @@ kubectl patch k8sworkerpool <name> --subresource=status --type=merge \
   -p '{"status":{...}}'                  # the status from the backup
 
 # 5. upgrade the release (the chart ships the cluster-scoped CRD)
-helm upgrade vcd-nodescale charts/vcd-nodescale -n vcd-nodescale-system \
-  --set image.tag=0.12.0
+helm upgrade vcd-nodescale charts/vcd-nodescale -n nodescale-system \
+  --set platform=vcd --set image.tag=0.12.0
 ```
 
-3. Apply a `K8sWorkerPool` (see `config/samples/` and the resource reference
-   above), then use it as described in **How to use**.
+**Moving the namespace from `vcd-nodescale-system` to `nodescale-system`.** The
+pools are cluster-scoped and their IP ledger lives in `status`, so only the
+release moves: install the new namespace, recreate the platform Secret there,
+and remove the old release. Do not keep both releases running side by side -
+leader election is per namespace, so two controllers would both be leaders and
+reconcile the same pools.
+
+```
+helm -n nodescale-system install vcd-nodescale charts/vcd-nodescale \
+  --create-namespace --set platform=<vcd|vsphere>
+kubectl -n vcd-nodescale-system get secret <platform>-credentials -o yaml \
+  | sed 's/namespace: vcd-nodescale-system/namespace: nodescale-system/' \
+  | kubectl apply -f -
+helm -n vcd-nodescale-system uninstall vcd-nodescale
+```
+
+Then write the pools as described in the next section (a release installed by an
+older chart needs its CRD applied first, as above).
+
+### Guest policy: containerd, the CA bundle, apt and the base OS
+
+A worker is created from a **plain image**: nothing about the site is baked into
+the template, and the controller assumes no prepared `/etc/containerd/config.toml`
+either. The files that used to be copied into an image - the runtime
+configuration, the trust bundle, the package source and the resolver - are
+produced at boot from two inputs:
+
+- the **installation** policy, one ConfigMap the chart renders, and
+- the **pool** `spec.bootstrap`, which overrides it field by field.
+
+```
+nodescale-system/nodescale-bootstrap        (chart: values.bootstrap)
+  bootstrap.yaml    same shape as spec.bootstrap: ntpServers, sysctls,
+                    kernelModules, containerd, apt, caBundleRef
+  ca-bundle.pem     the PEM bundle, when --set-file bootstrap.caBundle was used
+```
+
+The controller reads that ConfigMap once per reconcile and embeds the result
+into the new worker's user-data; the guest never talks to the Kubernetes API,
+and a pool that names nothing inherits everything. A pool reference
+(`bootstrap.caBundleRef`, `bootstrap.containerd.configRef`,
+`bootstrap.sshAuthorizedKeysRef`) resolves in the namespace it names, then in
+the pool's namespace, then in the controller's own: a `K8sWorkerPool` is
+cluster-scoped, so in practice the controller's namespace is where a reference
+without one lands - that is where the chart puts the objects an installation
+shares. A reference that comes from the installation ConfigMap always resolves
+in the controller's namespace.
+
+**containerd `config.toml`.** It is generated in the guest, not shipped whole:
+the prerequisites script runs `containerd config default > /etc/containerd/config.toml`
+only when the image has no file (the `containerd` package does not own that
+path), writes `imports = ["/etc/containerd/conf.d/*.toml"]` once, and the
+script generates `/etc/containerd/conf.d/10-nodescale.toml` with only the site
+values:
+
+```toml
+# containerd 1.x layout
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+  SystemdCgroup = true
+[plugins."io.containerd.grpc.v1.cri"]
+  sandbox_image = "registry.example.com/pause:3.9"
+[plugins."io.containerd.grpc.v1.cri".registry.mirrors."docker.io"]
+  endpoint = ["http://mirror.example.com"]
+```
+
+The base therefore matches the binary that is actually installed, and the
+fragment stays readable and version-free: containerd takes `version` from the
+base file. The plugin layout does **not** come from a constant: containerd 2.x
+renamed the CRI plugin (`io.containerd.cri.v1.runtime` for the runtime,
+`io.containerd.cri.v1.images` for the sandbox image and the registry), and a
+key written in the wrong layout is ignored with a warning while `SystemdCgroup`
+silently stays `false`. The script therefore reads the layout from the
+generated base and writes the matching keys - on 2.x the pause image becomes
+`pinned_images.sandbox` and `insecureSkipVerify` becomes a per-registry
+`/etc/containerd/certs.d/<host>/hosts.toml`, which is where 2.x keeps TLS
+settings. The script then checks the effective result with
+`containerd config dump` and logs a warning when `SystemdCgroup` did not take
+effect (a 1.x-style drop-in against a 2.x binary, or the reverse).
+
+A site whose runtime cannot be expressed this way sets
+`bootstrap.containerd.configRef` to a full `config.toml` in a ConfigMap or
+Secret; the controller then writes that file verbatim and generates no drop-in,
+at the cost of coupling the pool to a containerd major version.
+
+**CA bundle.** Never a literal in the CR and never in the chart source: install it
+from a file, per installation, and every pool trusts it.
+
+```
+helm upgrade vcd-nodescale vcd-nodescale/vcd-nodescale \
+  --namespace nodescale-system --reuse-values \
+  --set-file bootstrap.caBundle=./environment-roots.pem
+```
+
+The chart stores it as `ca-bundle.pem` and points `bootstrap.caBundleRef` at its
+own ConfigMap. The controller splits the bundle into one file per certificate
+under `/usr/local/share/ca-certificates/nodescale-NN.crt` and runs
+`update-ca-certificates` before anything reaches the network - apt, the
+Kubernetes repository and the registry all use it. A pool overrides the bundle
+with its own `caBundleRef` (for example a cluster that trusts one extra root),
+or the installation sets `bootstrap.create=false` and something else owns the
+ConfigMap.
+
+**apt: the mirror comes before the first apt call.** An image built for the
+public archive cannot install anything on a network without internet access,
+and the first `apt-get` in the prerequisites script is the one that fails - on a
+guest that has no way to report it. `bootstrap.apt.mirror` replaces the image's
+sources with one deb822 file, exactly as `apt.sources_list` does in the
+Terraform baseline:
+
+```yaml
+spec:
+  bootstrap:
+    apt:
+      mirror: https://nexus.example.com/repository/ubuntu-noble   # required
+      suites: [noble, noble-updates, noble-backports, noble-security]  # optional
+      components: [main, universe, restricted, multiverse]             # optional
+```
+
+The suites default to the guest's own `VERSION_CODENAME` plus updates,
+backports and security; the components default to
+`main universe restricted multiverse`. The file is written as
+`/etc/apt/sources.list.d/nodescale.sources`, every other `*.sources` and
+`*.list` is renamed to `*.disabled-by-nodescale` (the Kubernetes repository
+added later is exempt), and `deb` lines in `/etc/apt/sources.list` are commented
+out - two active sources mean apt fetches every index twice and, worse, keeps a
+URI this network cannot reach. The mirror is used as given: the path that
+carries the release name is not guessed, because a Nexus repository path is a
+site convention, not a distribution one. Without `mirror` the image's sources
+are left untouched.
+
+**Resolver: one global DNS set.** netplan is enough until a second source (a
+DHCP lease on another NIC, a package that ships its own drop-in) takes the
+default route. The controller writes the pool's `bootstrap.dns` into a second
+place as well, the way the Ansible baseline does:
+`/etc/systemd/resolved.conf.d/nodescale.conf` with `DNS=<servers>` and
+`Domains=~.`, then restarts `systemd-resolved`. `Domains=~.` is what pins the
+global resolver set instead of letting a per-link domain win.
+
+**The `runc` apparmor profile is unloaded, defensively.** On kernels where
+Ubuntu's `runc` profile denies a mount, a pod fails at start with no useful
+message. Like the Ansible baseline, the prerequisites script links the profile
+into `/etc/apparmor.d/disable` and runs `apparmor_parser -R`; both are guarded
+by `command -v apparmor_parser` and by the profile existing, so an image that
+ships no apparmor is not an error.
+
+The two install scenarios differ only in who fills that ConfigMap:
+
+- **Terraform + Ansible** (a cluster being promoted, the baseline these fields
+  mirror). The same values already exist in that path: `ntp_srv1`/`ntp_srv2`,
+  `containerd_mirror`, the CA files `templates/userdata_w.yaml` writes into
+  `ca_certs.trusted`, the sysctls of `add_custom_kernel_params` and the
+  `ubuntu_mirror_baseurl` of `apt.sources_list`. They have to reach the
+  ConfigMap once, at install time:
+
+  ```
+  kubectl -n nodescale-system create configmap nodescale-bootstrap \
+    --from-file=bootstrap.yaml=bootstrap.yaml \
+    --from-file=ca-bundle.pem=environment-roots.pem
+  ```
+
+  `bootstrap.yaml` has the shape shown under `bootstrap.defaults` in the chart
+  values (`ntpServers`, `sysctls`, `kernelModules`, `containerd`, `apt`, and the
+  `caBundleRef` the chart adds when it renders a bundle). Set
+  `bootstrap.create=false` in the release values when Ansible owns the object, so
+  the chart does not overwrite it on upgrade. Wiring the
+  `k8s_addons_node_controller` role to build the file from the variables it
+  already carries is the remaining step on that side; the controller side is
+  identical in both scenarios, and until the wiring lands the ConfigMap is
+  applied once by hand (or by the playbook's own template task). A worker the
+  controller creates afterwards then boots with the same NTP, trust bundle,
+  mirror and runtime settings as the Terraform/Ansible ones next to it.
+- **Helm + `kubectl apply -f pool.yaml`** (an existing cluster). There is no
+  playbook, so the ConfigMap is chart values: `bootstrap.defaults` for NTP,
+  sysctls, modules, the apt mirror and containerd; `--set-file
+  bootstrap.caBundle` for trust. A single pool can still carry its own values in
+  `spec.bootstrap`.
+
+Both boxes must produce the same thing, and the fields are the same names, so
+the two scenarios can be compared line by line:
+
+| Guest change | Terraform + Ansible source | Chart / pool source |
+| --- | --- | --- |
+| chrony sources | `ntp_srv1`/`ntp_srv2` in `cluster_vars_content` | `bootstrap.defaults.ntpServers` |
+| trusted roots | PEM files in `templates/userdata_w.yaml` (`ca_certs.trusted`) | `--set-file bootstrap.caBundle` |
+| sysctls | site sysctl file on the DVM | `bootstrap.defaults.sysctls` |
+| containerd mirrors | `containerd_mirror` (the private `config.toml` template) | `bootstrap.defaults.containerd.mirrors` |
+| pause image | `sandbox_image` in that template | `bootstrap.defaults.containerd.sandboxImage` |
+| cgroup driver | `SystemdCgroup = true` in that template | generated drop-in, always |
+| apt mirror | `ubuntu_mirror_baseurl` (`apt.sources_list`) | `bootstrap.defaults.apt.mirror` (suites/components optional) |
+| resolvers | Ansible `resolved.conf.d` drop-in | `bootstrap.dns`, always written to netplan and the drop-in |
+| `runc` apparmor profile | Ansible `disable ubuntu's default apparmor runc profile` | unloaded in the prerequisites script, always |
+
+Values apply to workers created after the change: an existing worker keeps the
+bootstrap it was born with, exactly like a Terraform node keeps the user-data it
+was cloned with. Replacing a worker is a rollout (see
+[Rolling compute-spec changes](#rolling-compute-spec-changes)).
+
+## Writing a K8sWorkerPool for an existing cluster
+
+The chart installs the controller; it never creates a pool. A `K8sWorkerPool`
+describes a worker set that **already exists**, so it is written at the moment
+that set is handed over to the controller - possibly by someone who did not
+install the controller and has no access to the Terraform files that built the
+cluster.
+
+Everything the object needs is observable from the running cluster and from the
+platform. Read it, do not guess:
+
+- a wrong `namePrefix` or `folder` means the existing VMs are not recognised and
+  the controller creates new ones next to them;
+- a wrong `ipPlan` means the next worker is handed an address the cluster
+  already uses;
+- a wrong `flavor` looks like drift and turns the next rollout into a resize of
+  healthy nodes.
+
+The object is cluster-scoped: no `metadata.namespace`, and `kubectl get
+k8sworkerpool` takes no `-n`.
+
+### 1. Read the placement (vSphere installation)
+
+The example commands use `govc`; the vCenter inventory tree gives the same
+answers. `$DC` is the datacenter, for example `MSK_Dev_DC`.
+
+| Field | Where to read it |
+| --- | --- |
+| `vsphere.datacenter` | `govc datacenter.info` |
+| `vsphere.cluster` | `govc find /$DC -type c` - the compute cluster, not a folder |
+| `vsphere.folder` | the folder holding the existing workers: `govc find /$DC/vm -type m -name '<worker-prefix>-*'` prints the VM path, the folder is its parent |
+| `vsphere.datastore` | `govc device.info -vm <worker>`: the hard-disk backing is `[datastore] ...` |
+| `vsphere.network` | `govc device.info -vm <worker>`: the network adapter summary names the port group |
+| `vsphere.host` | only when the pool must stay on one host: the `vsphere.esxi_host_name` of the tfvars that built the cluster, or `govc host.info` for the cluster's hosts |
+| `flavor.template` | `govc vm.info -r <worker>`, or the image the cluster owner names; a VM built by hand has no template and any image that carries the same k8s packages will do |
+| `flavor.cpus` / `memoryMB` / `osDiskGB` | `govc vm.info <worker>` |
+| `flavor.disks[]` | `govc device.info -vm <worker>`: the SCSI controller's `BusNumber` and each data disk's `UnitNumber`/size |
+| `bootstrap.nicName` | `ip -br link` inside a worker (`ens192` on the reference image) |
+| `bootstrap.dns` | `cat /etc/resolv.conf` inside a worker |
+
+`vsphere.datacenter` is required. There is deliberately no process-wide default:
+the datacenter is part of where the pool lives, like the cluster and the
+datastore, and two places to name it would be two places to disagree.
+
+### 2. Read the cluster facts
+
+| Field | Where to read it |
+| --- | --- |
+| `namePrefix` | the workers' names: `kubectl get nodes -o name` and strip the whole `-wrk-NN` suffix, so `nscl-test-avntg-wrk-01` gives `nscl-test-avntg`. The controller appends `-wrk-NN` itself, and `NN` is the **address ordinal** inside the pool window - not a counter. A prefix that keeps `-wrk` produces `...-wrk-wrk-01`, which matches no existing VM and starts a duplicate; if the names and the addresses disagree, stop and ask instead of renaming. |
+| `replicas` | the number of worker Nodes **now**. The first apply describes the current size; scaling comes afterwards. |
+| `join.endpoint` | `kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}'`, or the `kubernetes` Service in `default`; the API VIP and port. The controller mints join tokens itself and reads the CA hash from the cluster, so no token or certificate goes into the object. |
+| `join.tokenTTL` | `1h` is a good default: long enough for a clone plus first boot, short enough that a leaked token is useless. |
+| `masterCount` | `kubectl get nodes -l node-role.kubernetes.io/control-plane` |
+| `bootstrap.k8sVersion` / `k8sMinorRepo` | `kubectl version`; the version must be one the configured apt repository really carries, `k8sMinorRepo` is `v1.<minor>` |
+| `join.labels` / `join.taints` | what the existing workers carry: `kubectl get node <worker> -o jsonpath='{.metadata.labels}'`, `kubectl get node <worker> -o jsonpath='{.spec.taints}'` |
+
+### 3. Derive `ipPlan` from the addresses already in use
+
+`ipPlan` mirrors Terraform's `ip_plan`, so a cluster built by Terraform can be
+copied from its tfvars. Without that file the plan is derived from the running
+cluster:
+
+1. `cidr` - from a node: `ip -4 -o addr show` gives the address and prefix;
+   the network address is the pool base (`10.99.96.64/26` → base `.64`).
+2. `vmIPOffset` - pick it so the cluster's own numbering reappears. Take the
+   first worker address, the base and the worker offset the naming implies
+   (`-wrk-01` → `wNodeOffset: 10`):
+
+   `vmIPOffset = firstWorker - base - wNodeOffset`
+
+   For the lab: `109 - 64 - 10 = 35`.
+3. Check every other address with that same offset. Each named offset is
+   `address - base - vmIPOffset`:
+
+   | Observed | Offset | Field |
+   | --- | --- | --- |
+   | `.65` | 1 | the gateway - fixed, never shifted |
+   | `.101` | 2 | `dvmOffset` |
+   | `.102` | 3 | `kubeapiLB` |
+   | `.104`, `.105` | 5, 6 | `lbNodeOffset: 5`, `lbNodeCount: 2` |
+   | `.106`-`.108` | 7-9 | `mNodeOffset: 7`, `masterCount: 3` |
+   | `.109`-`.111` | 10-12 | `wNodeOffset: 10` |
+   | `.112`-`.125` | 13-26 | the rest of the worker window, `nodeCount: 17` |
+
+4. Anything that does not land on a nameable offset goes into `reserved[]` with
+   a comment saying what it is. Do not widen a window over it.
+
+If one number cannot be made to fit - an address that no offset reproduces -
+the cluster was built from a different plan. Ask the owner for it; a guessed
+plan is how two machines end up with one address.
+
+### 4. The object
+
+vSphere installation: `platform: vsphere`, credentials in
+`vsphere-credentials` (see [Install](#install)).
+
+```yaml
+apiVersion: k8s-nodescale.github.io/v1alpha1
+kind: K8sWorkerPool
+metadata:
+  name: lab-cluster                  # any DNS-safe name; not the VM prefix
+spec:
+  replicas: 3                        # the worker count that exists NOW
+  namePrefix: lab-cluster            # VMs are <prefix>-wrk-01, -02, ...
+  provider: vsphere                  # optional; may be omitted on a vsphere install
+  vsphere:
+    datacenter: MSK_Dev_DC           # required; no process-wide fallback
+    cluster: mskdev                  # the compute cluster: its hosts are the capacity
+    folder: /HUB Infrastructure/dev/k8s-test-lab   # must stay below vsphere.folderRoot
+    datastore: 99DOR13_DEV_NFS_L11   # where the worker disks live
+    network: Avantage_VL_DEV_MGMT_CNO-330          # the port group of the NIC
+    # host: esxi-01.example.local    # only when the port group exists on one
+    #                                # host: it pins every worker of the pool
+    # resourcePool: ""               # empty means the cluster's root pool
+  bootstrap:
+    osUser: ubuntu                   # an account the image already has
+    nicName: ens192                  # the guest interface to configure
+    dns: ["10.74.64.91", "10.73.1.45"]
+    k8sVersion: 1.28.15-1.1          # a version the apt repository carries
+    k8sMinorRepo: v1.28
+    # Guest policy is normally installation-wide (the nodescale-bootstrap
+    # ConfigMap, see "Guest policy"); a pool names a field only to differ:
+    # ntpServers: [ntp1.example.com, ntp2.example.com]
+    # caBundleRef: {name: environment-roots, key: ca.pem}
+    # sysctls: {net.netfilter.nf_conntrack_max: "2621440"}
+    # kernelModules: [nf_conntrack]
+    # containerd:
+    #   sandboxImage: registry.example.com/pause:3.9
+    #   mirrors:
+    #     docker.io: ["http://mirror.example.com"]
+  flavor:
+    template: noble-template_1.1.0_k8s
+    cpus: 8
+    memoryMB: 4096
+    osDiskGB: 40
+    disks:                           # omit for no data disks
+      # bus/unit must be where the disk really is: `govc device.info -vm <worker>`
+      # prints the controller's BusNumber and each disk's UnitNumber. A mismatched
+      # bus/unit is drift, and drift starts a resize that power-cycles live nodes.
+      - sizeGB: 60
+        mount: /var/lib
+        busType: paravirtual
+        busNumber: 0
+        unitNumber: 1
+  ipPlan:
+    cidr: 10.99.96.64/26
+    vmIPOffset: 35                   # 10.99.96.64 + 35 = the VM range starts at .99
+    dvmOffset: 2                     # .101 - the Terraform bootstrap host
+    kubeapiLB: 3                     # .102 - the API VIP
+    lbNodeOffset: 5                  # .104
+    lbNodeCount: 2                   # .104-.105
+    mNodeOffset: 7                   # .106
+    masterCount: 3                   # .106-.108
+    wNodeOffset: 10                  # .109 - the first worker
+    nodeCount: 17                    # .109-.125
+    # reserved: ["10.99.96.126"]     # anything the block does not name
+  join:
+    endpoint: 10.99.96.102:6443      # the API VIP, same address as kubeapiLB
+    tokenTTL: 1h
+    labels:
+      node-role.kubernetes.io/worker: ""
+  scaleDown:
+    minReplicas: 1
+    drainTimeout: 10m
+```
+
+vCD installation: `platform: vcd`, credentials in `vcd-credentials`.
+
+```yaml
+apiVersion: k8s-nodescale.github.io/v1alpha1
+kind: K8sWorkerPool
+metadata:
+  name: demo-cluster
+spec:
+  replicas: 2
+  namePrefix: demo-cluster
+  provider: vcd                      # optional; may be omitted on a vcd install
+  vcd:
+    org: example-org                 # must match VCD_ORG of the installation
+    vdc: example-vdc                 # must match VCD_VDC
+    vapp: demo-cluster               # the vApp the workers live in
+    orgNetwork: demo-cluster-net
+    catalog: Templates               # where flavor.template is found
+    # catalogOrg: ""                 # empty means the controller org
+  bootstrap:
+    osUser: ubuntu
+    osPasswordHash: "$6$REPLACE_WITH_HASH"   # /etc/shadow hash, not a password
+    sshAuthorizedKey: "ssh-ed25519 AAAA... ops@example.com"
+    # Optional: more keys, one per line, kept outside the CR so they can be
+    # rotated without touching the pool object. The inline key above stays.
+    # sshAuthorizedKeysRef:
+    #   kind: Secret              # ConfigMap (default) or Secret
+    #   name: worker-ssh-keys
+    #   key: authorized_keys
+    nicName: ens192
+    dns: ["8.8.8.8", "1.1.1.1"]
+    k8sVersion: 1.35.9-1.1
+    k8sMinorRepo: v1.35
+  flavor:
+    template: ubuntu-24.04-k8s
+    cpus: 4
+    memoryMB: 8192
+    osDiskGB: 20
+    disks:
+      - sizeGB: 10
+        mount: /var
+        busType: paravirtual
+        busNumber: 1
+        unitNumber: 0
+      - sizeGB: 30
+        mount: /var/lib
+        busType: paravirtual
+        busNumber: 1
+        unitNumber: 1
+  ipPlan:
+    cidr: 10.10.0.0/24
+    dvmOffset: 2                     # .2
+    kubeapiLB: 3                     # .3
+    ingressLB: 4                     # .4
+    lbNodeOffset: 5                  # .5
+    lbNodeCount: 2                   # .5-.6
+    mNodeOffset: 7                   # .7
+    masterCount: 3                   # .7-.9
+    wNodeOffset: 10                  # .10
+    nodeCount: 10                    # .10-.19
+    reserved: ["10.10.0.200"]
+  join:
+    endpoint: 10.10.0.3:6443
+    tokenTTL: 1h
+    labels:
+      node-role.kubernetes.io/worker: ""
+  ingressPool:                       # vCD only; omit when the provider cannot address it
+    type: nsxv
+    name: demo-cluster-ingress-pool
+    edge: demo-edge-gateway
+    port: 30080
+  scaleDown:
+    minReplicas: 2
+    drainTimeout: 10m
+```
+
+`provider` is optional and empty means "the platform this installation serves".
+Naming the other platform is refused with `InvalidSpec`: one installation
+serves one platform, and a second one needs a second installation.
+
+### 5. Apply, then prove it adopted instead of creating
+
+```
+kubectl apply -f pool.yaml
+kubectl get k8sworkerpool lab-cluster -o yaml
+```
+
+Before scaling anything, check that:
+
+- `status.observedReplicas` equals `spec.replicas` - the pool found the VMs it
+  was told about;
+- `status.ledger.used` lists exactly the worker addresses that already existed
+  (`.109`, `.110`, `.111` in the example);
+- no new VM appeared in the folder (`govc ls <folder>`);
+- `Ready` has no `CloudError` condition.
+
+Only then change `spec.replicas`. If the ledger is empty and the VM count in the
+folder grew, the pool did not recognise the existing VMs: the `namePrefix` or
+the `folder` is wrong. Stop, lower `replicas` back, delete the VMs the pool
+created, and fix the object - do not delete the pool, because its finalizer
+would take the adopted VMs with it.
+
+### Checklist before applying
+
+- [ ] `platform` of the installation is the one this pool needs (`spec.provider`
+      is empty or equal to it)
+- [ ] `vsphere.folder` is at or below `vsphere.folderRoot` of the installation
+- [ ] `namePrefix` matches the existing VM names, and `replicas` matches their
+      number
+- [ ] `ipPlan.cidr`, `vmIPOffset` and every offset reproduce the addresses the
+      cluster already uses; the gateway is not in the window
+- [ ] `join.endpoint` is the API address with its port
+- [ ] `flavor` matches the existing workers, otherwise the first pass reports
+      drift and the next rollout resizes them
+- [ ] nothing outside the plan is left unlisted: put it in `reserved[]`
 
 ## How to use
 
@@ -470,6 +1125,13 @@ parked as `Queued`, its name and address stay reserved, and the pool reports
       "2 worker(s) queued for vDC capacity: demo-cluster-wrk-04 (10.10.0.10), ...
        (waiting for vDC capacity: memory: need 8192 MB, 4096 MB free)"
 
+A scale-out is checked as a batch, not one worker at a time. Where the platform's
+used capacity is *measured* (vSphere's host usage), a worker created a second ago
+has not moved the figure, so the pass charges its own admissions: asking for four
+workers when two fit creates two and queues two. Where the platform *books* a VM
+into its allocation as it is created (vCD), the figure already includes it and the
+check charges one worker at a time.
+
 `status.observedReplicas` counts the queued slots, so a scale-out is accepted and
 visible instead of being retried as a failing create. Every pass retries the
 queue: as soon as the vDC has room, the VM is created under the same name and
@@ -490,6 +1152,92 @@ The system disk of a new worker is `spec.flavor.osDiskGB`. When that is unset th
 clone keeps the template size, which the controller cannot read here, so it uses
 an existing worker's `status.nodes[].flavor.osDiskGB` as the estimate (0 until
 the pool has one).
+
+#### Overcommitting CPU where the limit is physical (vSphere)
+
+On vSphere the CPU limit is the real capacity of the pool's compute-cluster
+hosts, and vSphere will not stop you from putting more vCPUs on those hosts than
+they have cores. That is a decision the owner makes, and `capacity.cpuPerCore` is
+where it is recorded: `1` (the default) charges one worker its whole vCPU count in
+core speed - `6 vCPU x 2600 MHz = 15.6 GHz` - and `2` charges half of it, so the
+same free capacity admits twice as many workers.
+
+```
+spec:
+  capacity:
+    cpuPerCore: 2     # 2 vCPU per physical core; 1 is the default (no overcommit)
+```
+
+Three properties worth knowing:
+
+- It only changes the admission check. No worker is resized, none is removed, and
+  a slot parked as `Queued` starts on the next pass once the assumption makes it
+  fit. Lowering it never evicts anything: queued slots simply stay queued.
+- It is ignored where the limit is a quota rather than physical capacity (vCD).
+  Dividing a quota would admit a request the platform then refuses, which is the
+  failure the pre-flight exists to prevent.
+- The charge is the core speed divided by the assumption, rounded **up**, and the
+  shortfall message names it: `CPU: 6 vCPU at 1300 MHz need 7800 MHz, 34700 MHz
+  free (CPU charged at 2 vCPU : 1 core)`. Without the note, `1300 MHz` reads like
+  a core speed that does not exist.
+
+Memory and disk are never overcommitted here: their charge is the flavour's
+allocation in full, because a VM that cannot get its pages stalls and a thin disk
+that fills stops the datastore - neither is a recoverable scheduling choice.
+
+#### Entitlement: our workers charged, the neighbours measured
+
+Where the platform reports per-VM usage (vSphere: `summary.quickStats`), the
+pre-flight turns "is the host idle now" into "can the cluster back what this pool
+has committed to":
+
+    ours   = sum of the measured CPU of the pool's own worker VMs
+    others = total used - ours
+    admit  = (N + 1) x charge + others <= capacity      // N = workers with a VM
+
+The charge is the same 1:1 (or overcommitted) figure as above, and `N` counts a
+worker from the moment it is created - a starting VM consumes almost nothing, so
+counting only what is measured would let a scale-out add one worker per pass until
+the hosts were oversubscribed. With this rule an idle worker still holds its
+entitlement, which is what stops a pool from growing to a number of nodes the
+cluster could never back once payload lands.
+
+`status.capacity` publishes `ourCPU_MHz`, `ourMemoryMB` and `perVMUsage`, and the
+page draws the pool's claim as the light segment after the measured fill, so
+"92 GHz used" can read as "9 of it yours, 83 somebody else's, and your eight
+workers already claim the machine".
+
+When nothing fits, the `+0` chip is red and the breakdown replaces the one-line
+basis with the arithmetic itself, generated from the live numbers:
+
+    3 workers, 6 vCPU each, 1 vCPU : 1 core -> 15.6 GHz charge per worker
+    used 88.9 GHz = ours 1.7 + others 87.2
+    standing: others 87.2 + 3 x 15.6 = 134.0 of 124.8 -> already 9.2 GHz over
+    one more: 87.2 + 4 x 15.6 = 149.6 -> room -24.8 -> 0
+
+That is the answer to "the bar says 71 % used, why does nothing fit": the bar
+measures, the entitlement charges.
+
+A platform whose figure is a quota (vCD) has no such split: its limit is already
+the pool's, so the measured rule applies there unchanged.
+
+The page offers the same setting as `Assume 2 vCPU : 1 core` beside its fit line
+and writes this field, so the number it shows and the number that admits a worker
+cannot disagree.
+
+The snapshot it reads is ten minutes old by design (`capacityStatusTTL`); the
+`refresh` beside the snapshot time asks for a new one immediately, which the page
+does by writing `k8s-nodescale.github.io/capacity-refresh-at` and the controller
+honours on its next pass.
+
+`capacity planner` beside the fit line is `spec.capacity.preflight`. Turning it off
+is a deliberate choice to plan the resources yourself: the controller stops reading
+the platform's capacity, stops parking workers that do not fit, and takes no
+snapshot - the page then says so instead of showing numbers nobody refreshes. The
+switch sits above `Assume 2 vCPU : 1 core` in the right corner, and turning the
+planner off greys that one out: with no admission check there is nothing for an
+overcommit assumption to apply to. The value is kept, so switching the planner back
+on restores it.
 
 #### When a worker never registers
 
@@ -794,7 +1542,11 @@ middle of a roll resumes at the same worker instead of starting over - the same
 mechanism that makes a named removal resumable.
 
 While a roll runs, scale-in and `deleteWorkers` are refused with
-`RolloutInProgress`; scale-up is allowed and only adds capacity. A worker that
+`RolloutInProgress`; scale-up is allowed and only adds capacity. The pool itself
+reports `Ready=False` with reason `RollingOut` for the whole roll, so
+`status.conditions[]` and `status.rollout` never disagree - a worker keeps
+`Ready` in Kubernetes for most of its replacement (it is drained, then stopped),
+which used to make the pool look `Converged` in the middle of a roll. A worker that
 does not come back within `rollout.readyTimeout` (default `10m`) is parked as
 `Failed` with its VM intact, and with `rollout.pauseOnFailure: true` (the
 default) the whole roll pauses there: `status.rollout.phase: Paused` and
@@ -873,18 +1625,43 @@ object. There is deliberately no "whole network" mode - a pool that may take
 everything says so with a number, so the size is visible in `kubectl get -o yaml`
 and in review.
 
+`vmIPOffset` moves the whole VM range into the subnet. Terraform's `ip_plan`
+writes the named offsets relative to the start of that range, and `vm_ip_offset`
+says where the range begins, so the rule is
+`address = prefix + vmIPOffset + offset`. The gateway is the one address that
+does not move: it belongs to the subnet, not to the range. This is the
+acceptance case, the lab subnet `10.99.96.64/26` with offset 35:
+
+```yaml
+ipPlan:
+  cidr: 10.99.96.64/26
+  vmIPOffset: 35      # the range starts at .99
+  dvmOffset: 2        # .101
+  kubeapiLB: 3        # .102
+  lbNodeOffset: 5     # .104 (lbNodeCount: 2 covers .104-.105)
+  mNodeOffset: 7      # .106, three masters: .106-.108
+  wNodeOffset: 10     # .109, the first worker
+  nodeCount: 17       # .109-.125; the gateway .65 is untouched
+```
+
+A plan whose shifted window starts at or below the gateway, or ends past the last
+usable address, is refused as `InvalidSpec` - nothing is clamped and nothing is
+silently moved. The named offsets are checked the same way: a VIP or master range
+that falls outside the prefix would otherwise be a reservation that protects
+nothing.
+
 What the controller always keeps out of a window, whatever it is set to: the
 network and broadcast addresses, the gateway (offset 1), `kubeapiLB`,
-`ingressLB`, the masters (`mNodeOffset` for `masterCount`), `dvmOffset`, and
-everything listed in `reserved`. Ordinals in worker names are relative to
-`wNodeOffset`, so the first worker of a pool whose window starts at .40 is still
-`namePrefix-wrk-01`.
+`ingressLB`, `lbNodeOffset`/`lbNodeCount`, the masters (`mNodeOffset` for
+`masterCount`), `dvmOffset`, and everything listed in `reserved`. Ordinals in
+worker names are relative to the (shifted) `wNodeOffset`, so the first worker of
+a pool whose window starts at .40 is still `namePrefix-wrk-01`.
 
 ### The rules, including every edge
 
-1. **The window must fit.** `wNodeOffset + nodeCount - 1` may not pass the last
-   usable address (the broadcast, so `total - 2`). A pool that asks for more is
-   refused with `InvalidSpec` and nothing is created.
+1. **The window must fit.** `vmIPOffset + wNodeOffset + nodeCount - 1` may not
+   pass the last usable address (the broadcast, so `total - 2`). A pool that asks
+   for more is refused with `InvalidSpec` and nothing is created.
 2. **`nodeCount: 0` is not a mode.** The CRD minimum is 1 and the controller
    repeats the check, because a zero used to be read as "unbounded" and a typo
    would have handed a pool the entire subnet.
@@ -917,6 +1694,17 @@ everything listed in `reserved`. Ordinals in worker names are relative to
     the same address. Keep windows disjoint by hand; the admission webhook
     (roadmap 5) is what makes the API refuse the second one, and a
     controller-side guard reports the conflict until then.
+11. **`vmIPOffset` moves the range, not the subnet.** Every named offset is
+    applied on top of it; the gateway stays at `prefix+1`. `dvmOffset` used to
+    live in `spec.vcd` and is now part of `spec.ipPlan`, because it is an address,
+    not a platform detail: **move it when upgrading** - the CRD prunes the old
+    field, so a pool that keeps `spec.vcd.dvmOffset` would silently stop
+    reserving the deployment VM. `lbNodeOffset` with `lbNodeCount` covers the
+    load-balancer pair; anything the block does not name still goes in
+    `reserved[]`. The ledger stores addresses rather than offsets, so changing
+    only `vmIPOffset` never moves a worker that is already allocated - but it
+    does change which addresses are free, so check `status.ledger.used` before
+    changing it on a live pool.
 
 ### A worked example on a /24
 
@@ -1012,7 +1800,7 @@ affinity:
 ```
 
 ```
-helm upgrade vcd-nodescale vcd-nodescale -n vcd-nodescale-system \
+helm upgrade vcd-nodescale vcd-nodescale -n nodescale-system \
   --repo https://k8s-nodescale.github.io/vcd-k8s-node-controller \
   -f values-control-plane.yaml
 ```
@@ -1162,6 +1950,10 @@ https://<any-node-ip>:<ingress-https-node-port>/nodescale-ui/
 The ingress has no `host` by default (`ui.ingress.host`), so it answers on any
 name; set one where a real hostname exists.
 
+The header prints the release the page belongs to (the chart's `appVersion`,
+passed as `--release`) beside the product name, so a screenshot or a support call
+says which build is being looked at.
+
 HTTPS works on the ingress controller's HTTPS port with its own self-signed
 certificate, and the page is also served over plain HTTP. No redirect is set:
 behind NodePorts a redirect drops the port and points at `:443`, which is not
@@ -1191,7 +1983,7 @@ viewers:
 Generate a hash and patch the file in place:
 
 ```bash
-NS=vcd-nodescale-system
+NS=nodescale-system
 SECRET=nodescale-ui-auth
 USER=admin
 
@@ -1233,29 +2025,57 @@ Two consequences worth knowing before doing it:
 
 ### Where the platform credentials live
 
-- **vCD** - one Secret, `vcd.existingSecret` (default `vcd-credentials`) in the
-  release namespace, keys `url`, `user`, `password`, `org`, `vdc`, `insecure`.
-  The chart mounts it as `VCD_*` environment variables; the controller is the
-  only thing that reads them. The Ansible role creates the Secret from
-  `lookup('password')` on the control host when it is missing, so a manual
-  rotation survives a re-run.
-- **vSphere** - not implemented yet. When it is, the connection belongs in the
-  placement's Secret, so a pool references it instead of carrying credentials.
+Which Secret exists depends on `platform`, and only that one is rendered: a
+vSphere installation has no `VCD_*` in its Pod at all, and a vCD installation
+has no `VSPHERE_*`. The keys are discrete, one per setting - the CSI INI format
+is not inherited, because a flat key set is easier to create, rotate and review.
+
+- **vCD** (`platform: vcd`) - one Secret, `vcd.existingSecret` (default
+  `vcd-credentials`) in the release namespace, keys `url`, `user`, `password`,
+  `org`, `vdc`, `insecure`. The chart mounts it as `VCD_*`; the controller is the
+  only thing that reads them. `org`/`vdc` are also the installation's answer to
+  a pool that names a different org or vDC: the pool is refused rather than
+  silently ignored. The Ansible role creates the Secret when it is missing, so a
+  manual rotation survives a re-run.
+- **vSphere** (`platform: vsphere`) - one Secret, `vsphere.existingSecret`
+  (default `vsphere-credentials`) in the release namespace, keys `url`, `user`,
+  `password`, `insecure`. Only the connection is here: `datacenter`, `cluster`,
+  `resourcePool`, `folder`, `datastore` and `network` are in each pool's
+  `spec.vsphere`, because they say where one pool lives rather than who the
+  controller authenticates as. The connection is process-wide (one login,
+  lazily, shared by every pool).
+- **The folder boundary** is not a credential: `vsphere.folderRoot` is a chart
+  value rendered as `VSPHERE_FOLDER_ROOT`, and every pool folder is checked
+  against it. It is a property of the installation because a pool that names
+  its own root would be naming its own limit.
+- **Missing credentials do not restart the controller.** Every key is an
+  optional `secretKeyRef`, so the Pod starts even when the Secret is absent or
+  incomplete. `/readyz` then reports which variable is empty (Helm `--wait` sees
+  the install is not done), and every affected pool carries a `CloudError`
+  naming the key. Fix the Secret and restart the Deployment to pick it up: the
+  values are read once at startup, not hot-reloaded.
+- **Option A for a cluster that already has CSI credentials.** The cluster may
+  have `vmware-system-csi/vsphere-config-secret` for the vSphere CSI driver. A
+  Pod can only mount Secrets of its own namespace, and the chart cannot read
+  another namespace, so copy the three connection values once into our
+  namespace in the discrete-key format (see [Install](#install)). The
+  controller is not granted `get` on Secrets in another namespace, and no Hook
+  job sits between the two.
 - **What protects them.** A Kubernetes Secret is base64, not encryption: it is
   protected by the API server's RBAC (only the controller's ServiceAccount and
   whoever may read Secrets in that namespace), by etcd access control, and by
   encryption-at-rest only if the cluster enables it. There is no second layer
   here - treat the Secret as the credential itself. The UI account hashes are
   different: they are bcrypt (one-way), and the plaintext of those passwords
-  exists only where it was generated (the `initial-passwords` key until it is
-  deleted, or the control host's `.credentials` file).
+  exists only where it was generated (the `initial-passwords` key until the
+  cluster owner chooses to drop it, or the control host's `.credentials` file).
 
 ```bash
-# read the vCD credential when you actually need it
-kubectl -n vcd-nodescale-system get secret vcd-credentials \
-  -o jsonpath='{.data.user}' | base64 -d; echo
-# and remove the generated UI passwords after the first sign-in
-kubectl -n vcd-nodescale-system patch secret nodescale-ui-auth \
+# read the platform credential when you actually need it
+kubectl -n nodescale-system get secret vsphere-credentials \
+  -o jsonpath='{.data.url}' | base64 -d; echo
+# and, if the cluster owner decides so, drop the generated UI passwords
+kubectl -n nodescale-system patch secret nodescale-ui-auth \
   --type=json -p '[{"op":"remove","path":"/data/initial-passwords"}]'
 ```
 
@@ -1282,10 +2102,24 @@ It exists so the layout can be reviewed before a second pool exists.
 | apply flavor | `spec.flavor.cpus`, `.memoryMB`, `.osDiskGB` (only the fields you fill in) |
 | delete a worker | appends the name to `spec.scaleDown.deleteWorkers` |
 
+The replicas pane counts what exists: `observed` is the workers that have a VM, and
+a slot waiting for capacity is named beside it (`· 1 queued`), because a queued
+slot has nothing in the platform to be counted as.
+
 Every gate still applies: `scaleDown.minReplicas`, `allowLastWorker`, the drain,
 the last-worker guard and the node-local-volume refusal. A request the pool
 refuses shows up as the pool's `Ready` condition message, which the page
 displays under the summary.
+
+The capacity pane answers "how many more workers fit": each bar carries `+N`, the
+binding dimension is highlighted, and `FITS n MORE WORKERS - limited by <dim>`
+names it. `?` opens the five dimensions with their charge and the free slice each
+was divided out of. The numbers are slices, not totals - the hosts are shared, and
+a worker charges more than it burns, so shrinking the pool does not enlarge them
+much. Where the platform reports physical capacity, `Assume 2 vCPU : 1 core`
+writes `spec.capacity.cpuPerCore` (see [Overcommitting
+CPU](#overcommitting-cpu-where-the-limit-is-physical-vsphere)); the write is
+disabled while the pool has an operation in flight, like every other action.
 
 The table is one row per slot: CPU and memory, each in three columns - requests,
 limits and real utilisation. Each column is coloured on its own: green below
@@ -1330,16 +2164,23 @@ next to the hashes, under the key `initial-passwords`; `helm install` prints the
 same command in its notes:
 
 ```
-kubectl -n vcd-nodescale-system get secret nodescale-ui-auth \
+kubectl -n nodescale-system get secret nodescale-ui-auth \
   -o jsonpath='{.data.initial-passwords}' | base64 -d
 ```
 
 `users.yaml` holds only bcrypt hashes, so a password that was never read from
-that key cannot be recovered, only reset (see above). Once both are stored
-somewhere safe, remove the plaintext so it stops existing:
+that key cannot be recovered, only reset (see above).
+
+**Removing `initial-passwords` is the cluster owner's decision, not part of the
+upgrade procedure.** Nothing reads the key at runtime - only `users.yaml` signs
+people in - and no upgrade brings it back: the Secret is written on install only
+(the template is guarded by a `lookup`, and the Secret carries
+`helm.sh/resource-policy: keep`). So the choice is made once, by whoever owns the
+cluster, and it neither blocks nor changes a release. Where the plaintext should
+stop existing, drop the key:
 
 ```
-kubectl -n vcd-nodescale-system patch secret nodescale-ui-auth \
+kubectl -n nodescale-system patch secret nodescale-ui-auth \
   --type=json -p '[{"op":"remove","path":"/data/initial-passwords"}]'
 ```
 
@@ -1387,7 +2228,12 @@ Service, no Ingress, no Secret.
 ## Terraform integration contract
 
 - The Terraform module installs this chart behind a `node_controller.enabled`
-  toggle and pins `chart_version` / `image_tag` (currently `1.0.0`).
+  toggle and pins `chart_version` / `image_tag` (currently `1.1.1`).
+- The module also passes `platform` explicitly (`vcd` or `vsphere`), the
+  platform Secret name, the vSphere folder root, and the namespace
+  `nodescale-system`. The chart refuses to render without `platform`: the value
+  decides which credentials are mounted, and guessing it would either leak an
+  unused secret reference or leave the controller without the one it needs.
 - **Once the controller is enabled, do not use Terraform to manage worker count
   or worker LB pool membership.** Use the CRD instead. The Terraform module's
   README must state this explicitly.
@@ -1404,6 +2250,30 @@ Service, no Ingress, no Secret.
   disappears without a request is reported, not replaced. `AutoHeal` is an
   explicit opt-in.
 
+### Address plan: the Terraform block and the CRD field
+
+The controller reads the numbers the cluster was built with, so a manifest can be
+read next to the tfvars it mirrors. Names are kept where they differ only in
+spelling:
+
+| `ip_plan` (Terraform) | `spec.ipPlan` (CRD) | Meaning |
+| --- | --- | --- |
+| `cidr` | `cidr` | The node subnet; the gateway is `prefix+1`. |
+| `vm_ip_offset` | `vmIPOffset` | How many addresses are skipped before the VM range starts. |
+| `dvm` | `dvmOffset` | The deployment VM (bootstrap host). |
+| `kubeapi_lb` | `kubeapiLB` | The API VIP. |
+| `ingress_lb` | `ingressLB` | A dedicated ingress VIP, when there is one. |
+| `lb_node` | `lbNodeOffset` | The first load-balancer VM; `lbNodeCount` says how many follow (Terraform states only the first). |
+| `m_node` | `mNodeOffset` | The first master; `masterCount` says how many. |
+| `w_node` | `wNodeOffset` | The first worker. |
+| - | `nodeCount` | The size of the pool's window, default 10. Terraform does not state it: the pool owns that part of the range. |
+| - | `reserved[]` | Addresses the block does not name (a second ingress VIP, a jump host, ...). |
+
+`vmIPOffset` defaults to 0, which is exactly the older shape where the offsets are
+absolute inside the subnet. The vCloud project keeps that shape until it is
+updated to write `vm_ip_offset` like the vSphere one; a manifest does not change
+in that move except that the range start becomes explicit.
+
 ## Design
 
 See [`docs/conception.md`](docs/conception.md) for the full decision record,
@@ -1418,7 +2288,7 @@ Build locally (the Dockerfile uses `golang:1.27.1-alpine` and
 `gcr.io/distroless/static:nonroot`):
 
 ```
-docker build -t docker.io/werton13/vcd-k8s-node-controller:1.0.0 .
+docker build -t docker.io/werton13/vcd-k8s-node-controller:1.1.1 .
 ```
 
 Public module defaults are used inside the build. On a restricted network,
@@ -1428,14 +2298,14 @@ override them:
 docker build \
   --build-arg GOPROXY=https://nexus.example.com/repository/golang/ \
   --build-arg GOSUMDB=off \
-  -t docker.io/werton13/vcd-k8s-node-controller:1.0.0 .
+  -t docker.io/werton13/vcd-k8s-node-controller:1.1.1 .
 ```
 
 Push (or use `make image-push`):
 
 ```
 docker login docker.io
-docker push docker.io/werton13/vcd-k8s-node-controller:1.0.0
+docker push docker.io/werton13/vcd-k8s-node-controller:1.1.1
 docker push docker.io/werton13/vcd-k8s-node-controller:latest
 ```
 

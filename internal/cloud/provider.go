@@ -62,9 +62,9 @@ type VCDPlacement struct {
 	CatalogOrg string
 }
 
-// VSpherePlacement names the vSphere objects one pool lives in. It is declared
-// so the stub has a shape to fill in; the vSphere implementation is not
-// written yet.
+// VSpherePlacement names the vSphere objects one pool lives in. The cluster is
+// the unit of capacity: the hosts of other clusters are not candidates, so a
+// pool cannot be placed on a host that has room but belongs elsewhere.
 type VSpherePlacement struct {
 	Datacenter   string
 	Cluster      string
@@ -72,6 +72,20 @@ type VSpherePlacement struct {
 	Datastore    string
 	Network      string
 	Folder       string
+
+	// Host pins every worker of the pool to one ESXi host of Cluster. Empty
+	// means vCenter places each clone within the cluster. Some environments
+	// publish the worker port group on a single host's switch, so there the
+	// host is part of placement exactly like the cluster and the datastore:
+	// it is named by the pool, never by the process environment.
+	Host string
+
+	// Guest network: the subnet prefix comes from the pool ipPlan.cidr, so
+	// only the gateway, the interface name and the resolvers live here.
+	NICName    string
+	Gateway    string
+	DNSServers []string
+	PrefixLen  int
 }
 
 // DiskSpec describes an internal disk to attach to a worker VM.
@@ -95,7 +109,8 @@ type ResourceCapacity struct {
 	Used int64
 }
 
-// StorageProfileCapacity is one storage profile of the vDC.
+// StorageProfileCapacity is one storage profile of the vDC, or one datastore
+// when the platform has no profiles.
 type StorageProfileCapacity struct {
 	Name    string
 	Default bool
@@ -115,13 +130,47 @@ type PlatformCapacity struct {
 	// CPUMHzPerCore is the speed the vDC rates one vCPU at, as configured on
 	// the vDC. Zero means it was not readable for this account.
 	CPUMHzPerCore int64
-	CPU           ResourceCapacity // MHz
-	MemoryMB      ResourceCapacity // MB
-	Storage       []StorageProfileCapacity
+	// Datacenter and Cluster name the platform object the numbers are scoped
+	// to, when the platform has one. vSphere's unit is the compute cluster: a
+	// datacenter-wide total would advertise room no pool can reach. Both are
+	// empty on vCD, where the vDC is the whole scope.
+	Datacenter string
+	Cluster    string
+	// Physical says CPU and memory are the physical capacity of those hosts
+	// (vSphere), not a quota the platform enforces (vCD). An overcommit
+	// assumption may only be applied to a physical number: dividing a quota
+	// would admit a request the platform then refuses.
+	Physical bool
+	// PerVMUsage says the platform can report what a single VM consumes, which is
+	// what lets a pool separate its own measured draw from the neighbours' load.
+	// Without it the pool can only charge entitlement against total usage, which
+	// would count its own running workers twice.
+	PerVMUsage bool
+	// Measured says Used is what the platform observes on the hosts, so a VM
+	// created a moment ago has not moved it yet. A pre-flight that admits a
+	// batch must then charge its own admissions, or every one-worker check in
+	// the pass reads the same free number (vSphere). Where Used is allocated
+	// (vCD books the VM as it is created) that would charge it twice, so the
+	// flag stays false and only one worker is charged at a time.
+	Measured bool
+	CPU      ResourceCapacity // MHz
+	MemoryMB ResourceCapacity // MB
+	Storage  []StorageProfileCapacity
+	// Datastores are the datastores the scope makes available to a clone,
+	// one entry per datastore, the pool's own marked Default. It is the list
+	// behind the storage bar: the bar shows the datastore a worker is written
+	// to, this shows what else the cluster offers. Empty where the platform
+	// has no such inventory (vCD profiles already are the inventory).
+	Datastores []StorageProfileCapacity
 }
 
 // CapacityRequest is the capacity one worker would add.
 type CapacityRequest struct {
+	// Workers is how many workers the request covers. The quantities below are
+	// the total for all of them, so a shortfall can be reported as "4 workers x
+	// 6 vCPU" instead of "24 vCPU", which reads like one very large worker.
+	// Zero means one.
+	Workers  int32
 	CPUs     int32
 	MemoryMB int32
 	// StorageMB is the disk capacity per storage profile name. The empty name
@@ -142,14 +191,26 @@ func (c PlatformCapacity) Fits(req CapacityRequest, mhzPerCore int64) (bool, []s
 	if mhzPerCore > 0 && c.CPU.Limit > 0 {
 		need := int64(req.CPUs) * mhzPerCore
 		if free := c.CPU.Limit - c.CPU.Used; need > free {
-			short = append(short, fmt.Sprintf("CPU: %d vCPU at %d MHz need %d MHz, %d MHz free",
-				req.CPUs, mhzPerCore, need, max(free, 0)))
+			per := req.CPUs
+			if req.Workers > 1 {
+				per = req.CPUs / req.Workers
+				short = append(short, fmt.Sprintf("CPU: %d workers x %d vCPU = %d vCPU at %d MHz need %d MHz, %d MHz free",
+					req.Workers, per, req.CPUs, mhzPerCore, need, max(free, 0)))
+			} else {
+				short = append(short, fmt.Sprintf("CPU: %d vCPU at %d MHz need %d MHz, %d MHz free",
+					per, mhzPerCore, need, max(free, 0)))
+			}
 		}
 	}
 	if c.MemoryMB.Limit > 0 {
 		need := int64(req.MemoryMB)
 		if free := c.MemoryMB.Limit - c.MemoryMB.Used; need > free {
-			short = append(short, fmt.Sprintf("memory: need %d MB, %d MB free", need, max(free, 0)))
+			if req.Workers > 1 {
+				short = append(short, fmt.Sprintf("memory: %d workers x %d MB need %d MB, %d MB free",
+					req.Workers, req.MemoryMB/req.Workers, need, max(free, 0)))
+			} else {
+				short = append(short, fmt.Sprintf("memory: need %d MB, %d MB free", need, max(free, 0)))
+			}
 		}
 	}
 	names := make([]string, 0, len(req.StorageMB))
@@ -207,6 +268,11 @@ type VM struct {
 	MemoryMB  int32
 	// DiskGB is the total capacity of all disks on the VM.
 	DiskGB int32
+	// UsedCPUMHz and UsedMemoryMB are what the platform measures this VM
+	// consuming right now. Zero when the platform does not report per-VM usage;
+	// PlatformCapacity.PerVMUsage says whether it does.
+	UsedCPUMHz   int64
+	UsedMemoryMB int64
 	// OSDiskGB is the system disk (bus 0/unit 0) alone, which is what
 	// spec.flavor.osDiskGB describes.
 	OSDiskGB int32

@@ -77,7 +77,7 @@ func main() {
 		DNSServersJSON:   string(dns),
 		OSUser:           s.OSUser,
 		OSPasswordHash:   s.OSPasswordHash,
-		SSHAuthorizedKey: s.SSHAuthorizedKey,
+		SSHAuthorizedKeys: cloudinit.SSHKeyLines(s.SSHAuthorizedKey, ""),
 		K8sVersion:       s.K8sVersion,
 		K8sMinorRepo:     s.K8sMinorRepo,
 		JoinEndpoint:     s.JoinEndpoint,

@@ -29,6 +29,35 @@ func TestValidateIPWindow(t *testing.T) {
 			plan: infrav1.IPPlan{CIDR: "192.168.100.0/24", WNodeOffset: 250, NodeCount: 4},
 		},
 		{
+			// The lab tfvars' shape: vm_ip_offset 35 on 10.99.96.64/26.
+			name: "the lab plan with vm_ip_offset",
+			plan: infrav1.IPPlan{
+				CIDR: "10.99.96.64/26", VMIPOffset: 35,
+				DVMOffset: 2, KubeAPILB: 3, LBNodeOffset: 5, LBNodeCount: 2,
+				MNodeOffset: 7, MasterCount: 3, WNodeOffset: 10, NodeCount: 17,
+			},
+		},
+		{
+			name:    "a window pushed past the end by vm_ip_offset",
+			plan:    infrav1.IPPlan{CIDR: "192.168.100.0/24", VMIPOffset: 240, WNodeOffset: 7, NodeCount: 10},
+			wantErr: "does not fit",
+		},
+		{
+			name:    "a window that starts at the gateway",
+			plan:    infrav1.IPPlan{CIDR: "192.168.100.0/24", WNodeOffset: 1, NodeCount: 10},
+			wantErr: "gateway",
+		},
+		{
+			name:    "a named offset outside the prefix",
+			plan:    infrav1.IPPlan{CIDR: "192.168.100.0/24", WNodeOffset: 7, NodeCount: 10, KubeAPILB: 300},
+			wantErr: "outside",
+		},
+		{
+			name:    "a negative vm_ip_offset",
+			plan:    infrav1.IPPlan{CIDR: "192.168.100.0/24", VMIPOffset: -1, WNodeOffset: 7, NodeCount: 10},
+			wantErr: "must not be negative",
+		},
+		{
 			name:    "a window that runs past the last usable address",
 			plan:    infrav1.IPPlan{CIDR: "192.168.100.0/24", WNodeOffset: 250, NodeCount: 6},
 			wantErr: "does not fit",

@@ -10,7 +10,7 @@
 set -euo pipefail
 
 MARKER=/etc/vcd-data-disks.done
-LOG=/var/log/vcd-data-disks.log
+LOG=/root/vcd-data-disks.log
 exec >>"$LOG" 2>&1
 
 log() {
@@ -100,12 +100,17 @@ sync_data() {
   shift 2
   local excludes=() e
 
-  if mountpoint -q "$src"; then
-    log "$src is already a mountpoint; skipping data copy"
-    return 0
-  fi
   if [[ ! -d "$src" ]]; then
     log "source $src does not exist; skipping copy"
+    return 0
+  fi
+  # Skip only when the target volume already carries the data. The source being
+  # a mount point is not enough: on a controller-made worker /var or /var/lib
+  # can be mounted when this runs, and skipping there left the new volume empty
+  # (no /var/lib/dpkg, apt then failed with "Unable to acquire the dpkg frontend
+  # lock").
+  if [[ -n "$(ls -A "$dst" 2>/dev/null | grep -v '^lost+found$')" ]]; then
+    log "$dst already contains data; skipping copy of $src"
     return 0
   fi
   if [[ -z "$(ls -A "$src" 2>/dev/null)" ]]; then

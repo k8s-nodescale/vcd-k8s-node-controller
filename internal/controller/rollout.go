@@ -373,9 +373,14 @@ func (r *WorkerPoolReconciler) reconcileRollout(ctx context.Context, pool *infra
 		deltas[i] = d
 	}
 
+	// condSet records that this pass wrote a Ready reason more specific than
+	// "a roll is running", so the end of the pass does not overwrite it.
+	condSet := false
+
 	if len(guarded) > 0 {
 		msg := diskGuardMessage(pool, guarded, target)
 		r.setCondition(pool, metav1.ConditionFalse, "DiskLargerThanSpec", msg)
+		condSet = true
 		r.eventf(pool, corev1.EventTypeWarning, "DiskLargerThanSpec", msg)
 		if len(pending) == 0 && inFlight == 0 {
 			if pool.Status.Rollout.Phase != infrav1.RolloutPhaseIdle && pool.Status.Rollout.Phase != "" {
@@ -393,6 +398,11 @@ func (r *WorkerPoolReconciler) reconcileRollout(ctx context.Context, pool *infra
 		if pool.Status.Rollout.Phase != "" && pool.Status.Rollout.Phase != infrav1.RolloutPhaseIdle {
 			pool.Status.Rollout = infrav1.RolloutStatus{Phase: infrav1.RolloutPhaseIdle}
 			r.eventf(pool, corev1.EventTypeNormal, "RolloutComplete", "every worker matches spec.flavor")
+			// The roll is over and this pass returns before the readiness
+			// evaluation, so it owns the condition: without this the pool
+			// would keep saying "rollout in progress" until the next pass.
+			status, reason, msg := evaluatePoolCondition(pool)
+			r.setCondition(pool, status, reason, msg)
 			return true, ctrl.Result{RequeueAfter: requeueConverged}, nil
 		}
 		return false, ctrl.Result{}, nil
@@ -576,9 +586,21 @@ func (r *WorkerPoolReconciler) reconcileRollout(ctx context.Context, pool *infra
 	if phase == infrav1.RolloutPhaseQueued {
 		msg := fmt.Sprintf("%d worker(s) still need the target shape; %s", len(pending), message)
 		r.setCondition(pool, metav1.ConditionFalse, "NoResourceAvailable", msg)
+		condSet = true
 		if wasPhase != infrav1.RolloutPhaseQueued {
 			r.eventf(pool, corev1.EventTypeWarning, "RolloutQueued", msg)
 		}
+	}
+
+	// The rollout owns the pass and returns before the readiness evaluation, so
+	// the condition has to be written here. Without it the pool kept the
+	// message from the pass before the roll - live on vSphere it read
+	// "Converged 3/3" for a whole replacement while status.rollout said
+	// Progressing (I-33). status.rollout is written above, so the evaluation
+	// below sees the roll and reports RollingOut.
+	if !condSet {
+		status, reason, msg := evaluatePoolCondition(pool)
+		r.setCondition(pool, status, reason, msg)
 	}
 	return true, ctrl.Result{RequeueAfter: requeueProgressing}, nil
 }

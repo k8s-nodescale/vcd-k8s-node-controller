@@ -1,5 +1,5 @@
 #cloud-config
-# render=0.4.1 hash=e46f7a26d589
+# render=0.7.0 hash=eeae8634f9f6
 preserve_hostname: false
 hostname: pool-wrk-01
 fqdn: pool-wrk-01
@@ -38,6 +38,13 @@ package_upgrade: false
 # customization-phases.md §4.2 - work that can fail slowly or needs a retry
 # belongs in a systemd unit, not here.
 bootcmd:
+  # The image ships /etc/security/access.conf ending in "-:ALL:ALL" with
+  # pam_access enabled for login and sshd, so an account without an allow line
+  # cannot log in at all - console included. The Terraform baseline inserts the
+  # same line for the cluster account.
+  - |
+    grep -q '^+:ubuntu:ALL$' /etc/security/access.conf 2>/dev/null ||
+      sed -i '/^-:ALL:ALL/i +:ubuntu:ALL' /etc/security/access.conf
   - |
     if [ -x /usr/local/sbin/prepare-data-disks.sh ]; then
       /usr/local/sbin/prepare-data-disks.sh || echo "prepare-data-disks.sh failed, continuing"
@@ -63,11 +70,29 @@ write_files:
                 via: 192.0.2.1
             nameservers:
               addresses: ["192.0.2.53"]
+  # The Terraform baseline writes the resolvers twice: netplan for the
+  # interface and a resolved drop-in. Netplan alone is enough until a second
+  # source (a DHCP lease on another NIC, a package that ships its own drop-in)
+  # takes the default route; Domains=~. pins the global resolver set.
+  - path: /etc/systemd/resolved.conf.d/nodescale.conf
+    permissions: '0644'
+    content: |
+      [Resolve]
+      DNS=192.0.2.53
+      Domains=~.
 
   # Parity with the Terraform baseline: a password login that works when a
   # worker has to be rescued by hand. 0600 because sshd refuses a group- or
   # world-writable include file. The matching apt policy is written by the
   # pre-requisites script, after the Pro packages that own 10periodic are gone.
+  - path: /etc/sudoers.d/ubuntu
+    permissions: '0440'
+    content: |
+      # Written by the node controller, mirroring the Terraform baseline so a
+      # worker that failed a stage can be inspected without a password prompt.
+      Defaults:ubuntu !requiretty
+      ubuntu ALL=(ALL) NOPASSWD: ALL
+
   - path: /etc/ssh/sshd_config.d/01-k8s-auth.conf
     content: |
       PubkeyAuthentication yes
@@ -75,6 +100,15 @@ write_files:
       KbdInteractiveAuthentication yes
       PermitRootLogin no
     permissions: '0600'
+  # bootstrap.caBundleRef: one file per certificate, then one
+  # update-ca-certificates run in runcmd. The Terraform baseline does the same
+  # through cloud-init's ca_certs.trusted.
+  - path: /usr/local/share/ca-certificates/nodescale-00.crt
+    permissions: '0644'
+    content: |
+      -----BEGIN CERTIFICATE-----
+      MIIBszCCAVmgAwIBAgIUTESTCERT
+      -----END CERTIFICATE-----
 
   # The Terraform baseline writes every node of the cluster into /etc/hosts, so
   # a worker can resolve its peers before DNS knows them. The controller knows
@@ -91,20 +125,24 @@ write_files:
     content: |
       overlay
       br_netfilter
+  # bootstrap.kernelModules: loaded before the sysctls below, because a
+  # conntrack parameter is silently dropped when its module is not there.
+  - path: /etc/modules-load.d/nodescale.conf
+    content: |
+      nf_conntrack
 
   - path: /etc/sysctl.d/k8s.conf
     content: |
       net.bridge.bridge-nf-call-iptables  = 1
       net.bridge.bridge-nf-call-ip6tables = 1
       net.ipv4.ip_forward                 = 1
-
-  - path: /etc/containerd/config.toml
+  # bootstrap.sysctls, last in lexical order on purpose: sysctl applies the
+  # directory in name order, so 99-zzz-nodescale.conf overrides the image's
+  # 99-unixteam-sysctl.conf instead of being overridden by it.
+  - path: /etc/sysctl.d/99-zzz-nodescale.conf
     content: |
-      version = 2
-      root = "/var/lib/containerd"
-      state = "/run/containerd"
-      [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
-        SystemdCgroup = true
+      net.core.rmem_max = 67108864
+      net.netfilter.nf_conntrack_max = 2621440
 
   - path: /etc/kubernetes/join-command.sh
     permissions: '0700'
@@ -354,6 +392,177 @@ write_files:
       log "done: $(df -h / | tail -n1)"
       exit 0
 
+  # The same Option A script the vCD initscript runs in postCustomization:
+  # LVM on the data disks, copy /var and /var/lib into the new volumes, fstab by
+  # UUID. vCD reboots the guest after customization; here the guest does it once
+  # from runcmd below, because moving /var only takes effect on the next boot.
+  - path: /usr/local/sbin/prepare-data-disks.sh
+    permissions: '0700'
+    content: |
+      #!/usr/bin/env bash
+      # Option A data-disk preparation, mirroring the Ansible prepare_k8s_nodes role:
+      #   LVM on the data disks -> temporary mounts -> move /var and /var/lib ->
+      #   rewrite fstab by UUID -> the guest is rebooted by vCD afterwards.
+      #
+      # The script never reboots: it runs during the vCD post-customization phase and
+      # vCD power-cycles the guest once the phase returns. A marker on the root
+      # filesystem keeps it idempotent, and LVM/filesystem creation is skipped when
+      # it already exists.
+      set -euo pipefail
+
+      MARKER=/etc/vcd-data-disks.done
+      LOG=/root/vcd-data-disks.log
+      exec >>"$LOG" 2>&1
+
+      log() {
+        echo "[$(date -Is)] $*"
+      }
+
+      if [[ -f "$MARKER" ]]; then
+        log "data disks already prepared; nothing to do"
+        exit 0
+      fi
+
+      for tool in pvcreate vgcreate lvcreate pvs vgs lvs mkfs blkid rsync blockdev mountpoint; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+          log "missing required tool: $tool"
+          exit 1
+        fi
+      done
+
+      wait_for_device() {
+        local dev="$1" size_gb="$2" i bytes expected
+        expected=$((size_gb * 1024 * 1024 * 1024))
+        for i in $(seq 1 60); do
+          if [[ -b "$dev" ]]; then
+            bytes=$(blockdev --getsize64 "$dev")
+            # Allow 1 GiB tolerance for controller/geometry rounding.
+            if (( bytes >= expected - 1073741824 && bytes <= expected + 1073741824 )); then
+              return 0
+            fi
+            log "device $dev has unexpected size $bytes (expected about $expected)"
+            return 1
+          fi
+          sleep 2
+        done
+        log "timed out waiting for $dev"
+        return 1
+      }
+
+      prepare_disk() {
+        local dev="$1" vg="$2" lv="$3" temp="$4" fs="$5" size_gb="$6"
+        local lvdev existing_fs
+
+        wait_for_device "$dev" "$size_gb"
+
+        if pvs --noheadings -o pv_name "$dev" 2>/dev/null | grep -qw "$dev"; then
+          log "$dev is already an LVM physical volume"
+        else
+          # Never overwrite a disk that already carries a filesystem or partition
+          # table. A blank data disk has no signature.
+          if blkid -p "$dev" >/dev/null 2>&1; then
+            log "$dev already has a filesystem/partition signature; refusing to overwrite"
+            return 1
+          fi
+          log "creating physical volume on $dev"
+          pvcreate -ff -y "$dev"
+        fi
+
+        if ! vgs "$vg" >/dev/null 2>&1; then
+          log "creating volume group $vg"
+          vgcreate "$vg" "$dev"
+        fi
+
+        if ! lvs "$vg/$lv" >/dev/null 2>&1; then
+          log "creating logical volume $vg/$lv"
+          lvcreate -l 100%FREE -n "$lv" "$vg"
+        fi
+
+        lvdev=$(readlink -f "/dev/${vg}/${lv}")
+        existing_fs=$(blkid -p -s TYPE -o value "$lvdev" 2>/dev/null || true)
+        if [[ -n "$existing_fs" && "$existing_fs" != "$fs" ]]; then
+          log "$lvdev already contains filesystem $existing_fs, expected $fs; refusing to format"
+          return 1
+        fi
+        if [[ -z "$existing_fs" ]]; then
+          log "formatting $lvdev as $fs"
+          mkfs -t "$fs" "$lvdev"
+        fi
+
+        mkdir -p "$temp"
+        if ! mountpoint -q "$temp"; then
+          log "mounting $lvdev at $temp"
+          mount "$lvdev" "$temp"
+        fi
+      }
+
+      sync_data() {
+        local src="$1" dst="$2"
+        shift 2
+        local excludes=() e
+
+        if [[ ! -d "$src" ]]; then
+          log "source $src does not exist; skipping copy"
+          return 0
+        fi
+        # Skip only when the target volume already carries the data. The source being
+        # a mount point is not enough: on a controller-made worker /var or /var/lib
+        # can be mounted when this runs, and skipping there left the new volume empty
+        # (no /var/lib/dpkg, apt then failed with "Unable to acquire the dpkg frontend
+        # lock").
+        if [[ -n "$(ls -A "$dst" 2>/dev/null | grep -v '^lost+found$')" ]]; then
+          log "$dst already contains data; skipping copy of $src"
+          return 0
+        fi
+        if [[ -z "$(ls -A "$src" 2>/dev/null)" ]]; then
+          log "source $src is empty; skipping copy"
+          return 0
+        fi
+
+        for e in "$@"; do
+          excludes+=("--exclude=$e")
+        done
+        log "copying $src -> $dst (excludes: ${*:-none})"
+        rsync -aHAX --one-file-system "${excludes[@]}" "$src"/ "$dst"/
+
+        # Keep excluded child mount points present under the parent so the later
+        # nested mount (e.g. /var/lib on data2) has a directory to mount over.
+        for e in "$@"; do
+          mkdir -p "$dst$e"
+        done
+      }
+
+      write_fstab() {
+        local final="$1" temp="$2" vg="$3" lv="$4" fs="$5"
+        local lvdev uuid
+
+        lvdev=$(readlink -f "/dev/${vg}/${lv}")
+        uuid=$(blkid -s UUID -o value "$lvdev")
+        if [[ -z "$uuid" ]]; then
+          log "no UUID found on $lvdev"
+          return 1
+        fi
+
+        # Remove stale entries for the temporary and final mount points, but keep
+        # comments. The trailing whitespace in the pattern prevents /var from
+        # matching /var/lib.
+        sed -i "\#^[^#].*[[:space:]]${temp}[[:space:]]#d" /etc/fstab
+        sed -i "\#^[^#].*[[:space:]]${final}[[:space:]]#d" /etc/fstab
+        echo "UUID=$uuid $final $fs defaults 0 2" >>/etc/fstab
+        log "fstab entry: UUID=$uuid $final $fs"
+      }
+      prepare_disk "/dev/sdb" "data1_vg" "data1_lv" "/data1" "ext4" 10
+      sync_data "/var" "/data1" "/lib"
+      write_fstab "/var" "/data1" "data1_vg" "data1_lv" "ext4"
+      prepare_disk "/dev/sdc" "data2_vg" "data2_lv" "/data2" "ext4" 30
+      sync_data "/var/lib" "/data2"
+      write_fstab "/var/lib" "/data2" "data2_vg" "data2_lv" "ext4"
+
+      touch "$MARKER"
+      sync
+      log "data disks prepared; vCD reboots the guest after post-customization so the new mounts take effect"
+      exit 0
+
   - path: /usr/local/sbin/vcd-grow-data-disks.sh
     permissions: '0700'
     content: |
@@ -427,7 +636,7 @@ write_files:
       LOG=/var/log/k8s-node-prereqs.log
       exec >>"$LOG" 2>&1
       log() { echo "[$(date -Is)] $*"; }
-      log "starting prerequisites render=0.4.1 hash=e46f7a26d589"
+      log "starting prerequisites render=0.7.0 hash=eeae8634f9f6"
 
       # 0. The virtual disk may be bigger than the template's partition table:
       #    a 20 GiB clone of an 8 GiB image leaves / at 7.6 GiB and the apt
@@ -446,7 +655,45 @@ write_files:
         log "prerequisites already done"
         exit 0
       fi
-
+      # 0a. Package sources first: every later step installs something, and on
+      #     a network without internet access an image that still points at the
+      #     public archive fails at the first apt call. The Terraform baseline
+      #     replaces the sources list with the environment's mirror for the
+      #     same reason. The file is deb822, which both 22.04 and 24.04 read.
+      codename="$(. /etc/os-release && echo "${VERSION_CODENAME:-}")"
+      if [[ -z "$codename" ]]; then
+        log "cannot derive the release codename; bootstrap.apt.mirror cannot be applied"
+        exit 1
+      fi
+      mirror="https://mirror.example.com/ubuntu-noble"
+      suites=""
+      if [[ -z "$suites" ]]; then
+        suites="$codename $codename-updates $codename-backports $codename-security"
+      fi
+      components=""
+      if [[ -z "$components" ]]; then
+        components="main universe restricted multiverse"
+      fi
+      cat >/etc/apt/sources.list.d/nodescale.sources <<EOF
+      Types: deb
+      URIs: $mirror
+      Suites: $suites
+      Components: $components
+      EOF
+      # One active source only: a second copy makes apt fetch every index
+      # twice and, worse, keeps a URI that this network cannot reach. The
+      # Kubernetes repository added later is left alone.
+      for f in /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
+        [[ -e "$f" ]] || continue
+        case "$f" in
+          */nodescale.sources|*/kubernetes.list|*.disabled-by-nodescale) continue ;;
+        esac
+        mv -f "$f" "$f.disabled-by-nodescale"
+      done
+      if [[ -f /etc/apt/sources.list ]]; then
+        sed -ri 's@^([[:space:]]*deb[[:space:]])@# disabled by nodescale: \1@' /etc/apt/sources.list
+      fi
+      log "apt sources replaced with ${mirror} (${codename})"
       # 0b. Parity with the Terraform baseline: unattended-upgrades must not
       #     compete for the dpkg lock while the node is being prepared, and
       #     Pro/ESM hooks must not inject repositories the cluster image never
@@ -481,7 +728,28 @@ write_files:
       # 2. Kernel modules and sysctls (config files are written above).
       modprobe overlay
       modprobe br_netfilter
+      modprobe nf_conntrack || log "modprobe nf_conntrack failed; continuing"
       sysctl --system
+      # sysctl skips a parameter whose module is not loaded: the guest looks
+      # configured and the value never took effect (nf_conntrack_max is the
+      # classic one - the module arrives with the first pod, long after this
+      # script ran). Say so instead of leaving it invisible.
+      for key in net.core.rmem_max net.netfilter.nf_conntrack_max; do
+        if ! sysctl -n "$key" >/dev/null 2>&1; then
+          log "WARNING: sysctl ${key} is not a live parameter after sysctl --system; if it belongs to a module, list the module in bootstrap.kernelModules"
+        fi
+      done
+
+      # 2b. The Terraform baseline unloads Ubuntu's apparmor profile for runc:
+      #     on kernels where it denies a mount, a pod fails at start with no
+      #     useful message. Guarded, because a generic image may ship no
+      #     apparmor at all and that is not an error.
+      if command -v apparmor_parser >/dev/null 2>&1 && [[ -f /etc/apparmor.d/runc ]]; then
+        mkdir -p /etc/apparmor.d/disable
+        ln -sf /etc/apparmor.d/runc /etc/apparmor.d/disable/runc
+        apparmor_parser -R /etc/apparmor.d/runc 2>/dev/null || true
+        log "runc apparmor profile disabled"
+      fi
 
       # 3. containerd.
       if ! command -v containerd >/dev/null 2>&1; then
@@ -489,8 +757,62 @@ write_files:
         DEBIAN_FRONTEND=noninteractive apt-get install -y containerd conntrack socat cloud-guest-utils
       fi
       mkdir -p /etc/containerd
+      # A generic image ships no containerd config at all (the package does not
+      # own the path) and the built-in defaults use SystemdCgroup=false, which
+      # the systemd cgroup driver kubelet runs cannot work with. Generate the
+      # base from the installed binary so it matches the version, then write
+      # this installation's values into a drop-in.
+      if [[ ! -f /etc/containerd/config.toml ]]; then
+        containerd config default > /etc/containerd/config.toml
+        log "generated /etc/containerd/config.toml from containerd config default"
+      fi
+      mkdir -p /etc/containerd/conf.d
+      if ! grep -q '/etc/containerd/conf.d/\*.toml' /etc/containerd/config.toml; then
+        if grep -q '^imports' /etc/containerd/config.toml; then
+          sed -i 's|^imports = .*|imports = ["/etc/containerd/conf.d/*.toml"]|' /etc/containerd/config.toml
+        else
+          sed -i '1i imports = ["/etc/containerd/conf.d/*.toml"]' /etc/containerd/config.toml
+        fi
+        log "enabled /etc/containerd/conf.d imports"
+      fi
+      # containerd 2.x renamed the CRI plugin: the runtime section is
+      # io.containerd.cri.v1.runtime and images (sandbox, registry) are
+      # io.containerd.cri.v1.images, while 1.x keeps both under
+      # io.containerd.grpc.v1.cri (a base file declaring version = 2, which
+      # containerd 2.x still accepts through its legacy mapping). A key in the
+      # wrong layout is ignored with a warning and SystemdCgroup silently stays
+      # false, so the layout is read from the base file, not assumed from the
+      # binary version.
+      runtime_plugin=io.containerd.grpc.v1.cri
+      images_plugin=io.containerd.grpc.v1.cri
+      sandbox_section="[plugins.\"io.containerd.grpc.v1.cri\"]"
+      sandbox_key=sandbox_image
+      if grep -qE '^[[:space:]]*version[[:space:]]*=[[:space:]]*3' /etc/containerd/config.toml ||
+        grep -q 'io.containerd.cri.v1.images' /etc/containerd/config.toml; then
+        runtime_plugin=io.containerd.cri.v1.runtime
+        images_plugin=io.containerd.cri.v1.images
+        sandbox_section="[plugins.\"io.containerd.cri.v1.images\".pinned_images]"
+        sandbox_key=sandbox
+      fi
+      {
+        echo "[plugins.\"${runtime_plugin}\".containerd.runtimes.runc.options]"
+        echo '  SystemdCgroup = true'
+        echo "${sandbox_section}"
+        echo "  ${sandbox_key} = \"registry.example.com/pause:3.9\""
+        if [[ "$images_plugin" != "io.containerd.cri.v1.images" ]]; then
+          echo "[plugins.\"${images_plugin}\".registry.mirrors.\"docker.io\"]"
+          echo '  endpoint = ["http://mirror.example.com"]'
+        fi
+      } > /etc/containerd/conf.d/10-nodescale.toml
+      log "wrote the containerd drop-in for ${runtime_plugin}"
       systemctl enable containerd
       systemctl restart containerd
+      if command -v containerd >/dev/null 2>&1; then
+        if ! containerd config dump 2>/dev/null | grep -q 'SystemdCgroup = true'; then
+          log "WARNING: SystemdCgroup is not true in the effective containerd config"
+          log "WARNING: if this containerd is 2.x, its CRI keys are io.containerd.cri.v1.*; set bootstrap.containerd.configRef"
+        fi
+      fi
 
       # 4. Kubernetes binaries, pinned when a version is configured.
       if ! command -v kubeadm >/dev/null 2>&1; then
@@ -526,7 +848,7 @@ write_files:
       LOG=/var/log/k8s-node-join.log
       exec >>"$LOG" 2>&1
       log() { echo "[$(date -Is)] $*"; }
-      log "starting join render=0.4.1 hash=e46f7a26d589"
+      log "starting join render=0.7.0 hash=eeae8634f9f6"
 
       MARKER=/etc/kubernetes/kubeadm-joined
       if [[ -f "$MARKER" ]]; then
@@ -670,14 +992,31 @@ write_files:
       WantedBy=multi-user.target
 
 runcmd:
+  # Trust the pool's CA bundle before anything reaches the network: apt, the
+  # Kubernetes repository and the container registry all use it.
+  - update-ca-certificates
+  - systemctl restart systemd-resolved || true
+  # bootstrap.ntpServers: the Terraform baseline sets the same sources per
+  # cluster. The block is marked so a re-run replaces it instead of appending.
+  - |
+    if [ -f /etc/chrony/chrony.conf ]; then
+      sed -i '/^# BEGIN nodescale ntp$/,/^# END nodescale ntp$/d' /etc/chrony/chrony.conf
+      {
+        echo '# BEGIN nodescale ntp'
+        echo 'server ntp1.example.com iburst'
+        echo 'server ntp2.example.com iburst'
+        echo '# END nodescale ntp'
+      } >> /etc/chrony/chrony.conf
+      systemctl restart chrony 2>/dev/null || true
+    fi
   - systemctl daemon-reload
-  - systemctl enable vcd-grow-disks.service
-  - systemctl enable vcd-ensure-layout.service
-  - systemctl start --no-block vcd-ensure-layout.service
-  - systemctl enable --now --no-block k8s-node-prereqs.service
-  # --now, not just enable: on the first boot of a worker the prerequisites
-  # have just finished and the node should join in this boot, not the next one.
-  - systemctl enable --now --no-block k8s-node-join.service
+  - systemctl enable vcd-grow-disks.service vcd-ensure-layout.service
+  - systemctl enable k8s-node-prereqs.service k8s-node-join.service
+  # Prepare the data disks and reboot once, exactly like vCD after the
+  # post-customization phase. The reboot is what makes /var and /var/lib mount
+  # from fstab; on the next boot the enabled units install the packages and
+  # join. A failed preparation does not reboot, so the VM stays inspectable.
+  - /usr/local/sbin/prepare-data-disks.sh && /sbin/reboot
   # The sshd drop-in above is read at start, and the image's socket unit may be
   # the one that answers: restart all three the way the Terraform baseline does.
   - systemctl restart ssh ssh.socket ssh.service || true

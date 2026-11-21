@@ -55,15 +55,39 @@ type WorkerPoolReconciler struct {
 	// Org and VDC are the vCD org/VDC the vCD factory is authenticated
 	// against (VCD_ORG/VCD_VDC). They are used to reject a CR whose
 	// spec.vcd.org/vdc points somewhere else instead of silently ignoring it.
-	// They are empty for another platform.
+	// They are empty on a vsphere installation.
 	Org string
 	VDC string
+
+	// Platform is the one platform this installation serves (NODESCALE_PLATFORM):
+	// vcd or vsphere. Empty is read as vcd so a binary started by hand, without
+	// the chart, keeps its old behaviour.
+	//
+	// A pool may omit spec.provider, in which case it means this platform; a
+	// pool that names the other one is rejected with InvalidSpec instead of
+	// failing later with "no cloud provider named ...", because the other
+	// factory is not even registered.
+	Platform string
+
+	// VSphereFolderRoot is the vCenter folder boundary the installation was
+	// configured with (VSPHERE_FOLDER_ROOT). It is checked here so a CR that
+	// points outside the granted folder is rejected with a message that names
+	// it, instead of failing on the first platform call. The provider checks
+	// the resolved inventory path, which is the authority.
+	VSphereFolderRoot string
 
 	// PodName and PodNamespace identify this controller's Pod (downward API).
 	// They let the last-worker guard refuse to delete the worker the pass
 	// itself runs on.
 	PodName      string
 	PodNamespace string
+
+	// BootstrapConfigMap is the installation-wide bootstrap policy
+	// (NODESCALE_BOOTSTRAP_CONFIGMAP): one ConfigMap in PodNamespace whose
+	// bootstrap.yaml key holds the defaults for NTP, the CA bundle, sysctls and
+	// containerd. Empty means an installation without defaults, in which case
+	// every pool must carry what it needs.
+	BootstrapConfigMap string
 
 	// ownNode caches the Node resolved from PodName, including an empty
 	// result, so the guard costs one API call per process.
@@ -189,11 +213,18 @@ func (r *WorkerPoolReconciler) reconcile(ctx context.Context, before, pool *infr
 	}
 	actual := ownedWorkerVMs(pool, all)
 
-	alloc, err := ipam.New(toIPAMPlan(pool.Spec.IPPlan, pool.Spec.VCD), toIPAMLedger(pool.Status.Ledger))
+	alloc, err := ipam.New(toIPAMPlan(pool.Spec.IPPlan), toIPAMLedger(pool.Status.Ledger))
 	if err != nil {
 		r.setCondition(pool, metav1.ConditionFalse, "InvalidIPPlan", err.Error())
 		return ctrl.Result{RequeueAfter: requeueInvalidSpec}, nil
 	}
+
+	// An address another VM in the pool's scope already answers on is not free,
+	// even when that VM is not ours: the masters, the load balancers, the
+	// deployment VM, a machine someone cloned by hand. The ledger cannot know
+	// about a VM the pool did not adopt, so without this a wrong namePrefix
+	// turns into a duplicate address.
+	alloc.Block(foreignAddresses(actual, all)...)
 
 	nodes, adopted, err := mergeNodes(pool, actual, alloc)
 	if err != nil {
@@ -288,6 +319,11 @@ func (r *WorkerPoolReconciler) reconcile(ctx context.Context, before, pool *infr
 			r.setCondition(pool, metav1.ConditionFalse, "CreateResumeFailed", err.Error())
 			return ctrl.Result{}, err
 		}
+		// Same as above: a deletion message from an earlier pass must not
+		// outlive the deletion.
+		r.setCondition(pool, metav1.ConditionFalse, "Provisioning", fmt.Sprintf(
+			"%d/%d workers Ready, finishing a worker create interrupted by a restart",
+			readyWorkers(pool.Status.Nodes), pool.Spec.Replicas))
 		return ctrl.Result{RequeueAfter: requeueProgressing}, nil
 	}
 
@@ -299,13 +335,21 @@ func (r *WorkerPoolReconciler) reconcile(ctx context.Context, before, pool *infr
 			r.setCondition(pool, metav1.ConditionFalse, "ScaleUpFailed", err.Error())
 			return ctrl.Result{}, err
 		}
+		// This pass ends before the readiness evaluation, so it has to say
+		// what it did: otherwise the condition keeps the previous pass's
+		// message and reports a state the pool is no longer in.
+		r.setCondition(pool, metav1.ConditionFalse, "NoResourceAvailable", fmt.Sprintf(
+			"%d/%d workers Ready, %d worker(s) queued for vDC capacity",
+			readyWorkers(pool.Status.Nodes), pool.Spec.Replicas,
+			countPhase(pool.Status.Nodes, infrav1.NodePhaseQueued)))
 		return ctrl.Result{RequeueAfter: requeueProgressing}, nil
 	}
 
 	desired := pool.Spec.Replicas
 	switch {
 	case desired > pool.Status.ObservedReplicas:
-		if err := r.scaleUp(ctx, before, pool, alloc, desired-pool.Status.ObservedReplicas); err != nil {
+		ourCPU, ourMem := poolMeasured(actual)
+		if err := r.scaleUp(ctx, before, pool, alloc, desired-pool.Status.ObservedReplicas, ourCPU, ourMem); err != nil {
 			logger.Error(err, "scale up failed", "pool", pool.Name)
 			r.setCondition(pool, metav1.ConditionFalse, "ScaleUpFailed", err.Error())
 			return ctrl.Result{}, err
@@ -486,10 +530,28 @@ func (r *WorkerPoolReconciler) refreshReadiness(ctx context.Context, pool *infra
 				r.ensureIngressPool(ctx, pool, st)
 			}
 		default:
+			// The Node exists but is not Ready. The clock bounds this state the
+			// same way it bounds a VM that never registered: without it a NotReady
+			// worker has no timer at all, and since a converging worker is not
+			// deletable from the page (earlier work, 2026-11-20), nothing could
+			// ever end it.
+			wasJoining := st.Phase == infrav1.NodePhaseJoining
 			st.Phase = infrav1.NodePhaseJoining
 			st.K8sReady = false
 			st.Message = "node registered, waiting for Ready"
-			st.ProvisioningStartedAt = nil
+			if !wasJoining || st.ProvisioningStartedAt == nil {
+				now := metav1.Now()
+				st.ProvisioningStartedAt = &now
+			}
+			if budget := provisioningTimeout(pool); time.Since(st.ProvisioningStartedAt.Time) >= budget {
+				st.Phase = infrav1.NodePhaseFailed
+				st.Message = fmt.Sprintf(
+					"the Node has been registered but not Ready for %s (spec.provisioning.timeout=%s); the VM is kept for inspection",
+					time.Since(st.ProvisioningStartedAt.Time).Round(time.Minute), budget)
+				r.eventf(pool, corev1.EventTypeWarning, "WorkerNotReadyTimeout",
+					fmt.Sprintf("worker %s: %s", st.Name, st.Message))
+				break
+			}
 			r.renewBootstrapToken(ctx, pool, st)
 		}
 		if !ok {
@@ -506,6 +568,24 @@ func (r *WorkerPoolReconciler) refreshReadiness(ctx context.Context, pool *infra
 		}
 	}
 	return nil
+}
+
+// readyWorkers counts the slots whose node is Ready, the same way
+// evaluatePoolCondition does.
+func readyWorkers(nodes []infrav1.WorkerNodeStatus) int32 {
+	return countPhase(nodes, infrav1.NodePhaseReady)
+}
+
+// countPhase is how many slots are in one phase, for the progress messages a
+// pass writes when it returns before the readiness evaluation.
+func countPhase(nodes []infrav1.WorkerNodeStatus, phase infrav1.NodePhase) int32 {
+	var n int32
+	for i := range nodes {
+		if nodes[i].Phase == phase {
+			n++
+		}
+	}
+	return n
 }
 
 // evaluatePoolCondition makes Ready mean "the requested workers are Ready",
@@ -550,6 +630,15 @@ func evaluatePoolCondition(pool *infrav1.K8sWorkerPool) (metav1.ConditionStatus,
 			msg += " (" + queuedMessage + ")"
 		}
 		return metav1.ConditionFalse, "NoResourceAvailable", msg
+	case pool.Status.Rollout.Phase == infrav1.RolloutPhaseProgressing:
+		// A worker being replaced or resized keeps Ready=1 for most of the roll
+		// (it is drained, then stopped), so counting Ready alone called the pool
+		// "Converged" while status.rollout said Progressing. The two must agree.
+		msg := fmt.Sprintf("%d/%d workers Ready, rollout in progress", ready, desired)
+		if w := pool.Status.Rollout.CurrentWorker; w != "" {
+			msg += " (" + w + ")"
+		}
+		return metav1.ConditionFalse, "RollingOut", msg
 	case pool.Status.ObservedReplicas != desired:
 		return metav1.ConditionFalse, "Scaling",
 			fmt.Sprintf("desired=%d observed=%d ready=%d", desired, pool.Status.ObservedReplicas, ready)
@@ -672,7 +761,17 @@ func (r *WorkerPoolReconciler) setCondition(pool *infrav1.K8sWorkerPool, status 
 // factory is the only thing the reconciler knows about the platform, so a pool
 // that names another implementation is served by that implementation.
 func (r *WorkerPoolReconciler) platform(pool *infrav1.K8sWorkerPool) (cloud.Provider, error) {
-	return r.Cloud.For(placementFor(pool))
+	return r.Cloud.For(placementFor(pool, r.installationPlatform()))
+}
+
+// installationPlatform is the platform this installation serves. An empty
+// value is read as vcd so a binary started by hand behaves as it did before
+// the platform became an installation property.
+func (r *WorkerPoolReconciler) installationPlatform() string {
+	if p := strings.ToLower(strings.TrimSpace(r.Platform)); p != "" {
+		return p
+	}
+	return cloud.ProviderVCD
 }
 
 // membership returns the load-balancer half of the pool's provider. It is nil
@@ -688,11 +787,12 @@ func (r *WorkerPoolReconciler) membership(pool *infrav1.K8sWorkerPool) (cloud.Po
 }
 
 // placementFor maps a pool's CR onto the provider-neutral placement the factory
-// takes. An empty spec.provider means vcd, which is what the CRD defaults it to.
-func placementFor(pool *infrav1.K8sWorkerPool) cloud.Placement {
+// takes. An empty spec.provider means the platform this installation serves,
+// which is also what validateSpec enforces.
+func placementFor(pool *infrav1.K8sWorkerPool, platform string) cloud.Placement {
 	pl := cloud.Placement{Provider: strings.ToLower(strings.TrimSpace(pool.Spec.Provider))}
 	if pl.Provider == "" {
-		pl.Provider = cloud.ProviderVCD
+		pl.Provider = platform
 	}
 	if v := pool.Spec.VCD; v != nil {
 		pl.VCD = &cloud.VCDPlacement{
@@ -702,6 +802,27 @@ func placementFor(pool *infrav1.K8sWorkerPool) cloud.Placement {
 			OrgNetwork: v.OrgNetwork,
 			Catalog:    v.Catalog,
 			CatalogOrg: v.CatalogOrg,
+		}
+	}
+	if v := pool.Spec.VSphere; v != nil {
+		// The guest network is derived the same way the renderer derives it:
+		// the gateway is the first host of the subnet and the prefix is the
+		// one that subnet declares, so the placement cannot disagree with the
+		// user-data the guest is given. The interface name and the resolvers
+		// are the bootstrap ones, shared with vCD.
+		prefix, _ := strconv.Atoi(cidrPrefix(pool.Spec.IPPlan.CIDR))
+		pl.VSphere = &cloud.VSpherePlacement{
+			Datacenter:   v.Datacenter,
+			Cluster:      v.Cluster,
+			ResourcePool: v.ResourcePool,
+			Datastore:    v.Datastore,
+			Network:      v.Network,
+			Folder:       v.Folder,
+			Host:         v.Host,
+			NICName:      pool.Spec.Bootstrap.NICName,
+			Gateway:      gatewayIP(pool.Spec.IPPlan.CIDR),
+			DNSServers:   pool.Spec.Bootstrap.DNS,
+			PrefixLen:    prefix,
 		}
 	}
 	return pl
@@ -723,11 +844,18 @@ func (r *WorkerPoolReconciler) validateSpec(pool *infrav1.K8sWorkerPool) string 
 	case strings.TrimSpace(pool.Spec.Join.Endpoint) == "":
 		return "spec.join.endpoint is required"
 	}
-	switch strings.ToLower(strings.TrimSpace(pool.Spec.Provider)) {
-	case "", cloud.ProviderVCD:
+	if msg := validateGuestPolicy(pool.Spec.Bootstrap); msg != "" {
+		return msg
+	}
+	platform := r.installationPlatform()
+	if p := strings.ToLower(strings.TrimSpace(pool.Spec.Provider)); p != "" && p != platform {
+		return fmt.Sprintf("spec.provider %q does not match the platform of this installation (%s): the platform is chosen when the controller is installed and never per pool, so a second platform needs a second installation", pool.Spec.Provider, platform)
+	}
+	switch platform {
+	case cloud.ProviderVCD:
 		switch {
 		case pool.Spec.VCD == nil:
-			return "spec.vcd is required when spec.provider is vcd"
+			return "spec.vcd is required on a vcd installation"
 		case strings.TrimSpace(pool.Spec.VCD.VApp) == "":
 			return "spec.vcd.vapp is required"
 		case strings.TrimSpace(pool.Spec.VCD.OrgNetwork) == "":
@@ -740,9 +868,30 @@ func (r *WorkerPoolReconciler) validateSpec(pool *infrav1.K8sWorkerPool) string 
 			return fmt.Sprintf("spec.vcd.vdc %q does not match the controller VDC %q (VCD_VDC)", pool.Spec.VCD.VDC, r.VDC)
 		}
 	case cloud.ProviderVSphere:
-		return "spec.provider vsphere is a stub: the vSphere provider is not implemented yet, only vcd is"
+		v := pool.Spec.VSphere
+		switch {
+		case v == nil:
+			return "spec.vsphere is required on a vsphere installation"
+		case strings.TrimSpace(v.Datacenter) == "":
+			return "spec.vsphere.datacenter is required: the datacenter is part of the pool's placement"
+		case strings.TrimSpace(v.Cluster) == "":
+			return "spec.vsphere.cluster is required"
+		case strings.TrimSpace(v.Folder) == "":
+			return "spec.vsphere.folder is required"
+		case strings.TrimSpace(v.Datastore) == "":
+			return "spec.vsphere.datastore is required"
+		case strings.TrimSpace(v.Network) == "":
+			return "spec.vsphere.network is required"
+		}
+		if root := strings.TrimSpace(r.VSphereFolderRoot); root != "" {
+			folder := normalizeVSphereFolder(v.Datacenter, v.Folder)
+			rootPath := normalizeVSphereFolder(v.Datacenter, root)
+			if folder != rootPath && !strings.HasPrefix(folder, rootPath+"/") {
+				return fmt.Sprintf("spec.vsphere.folder %q is outside the allowed root %q (VSPHERE_FOLDER_ROOT)", v.Folder, root)
+			}
+		}
 	default:
-		return fmt.Sprintf("spec.provider %q is not supported (vcd)", pool.Spec.Provider)
+		return fmt.Sprintf("this installation runs platform %q, which is not supported (vcd, vsphere)", platform)
 	}
 	if msg := validateIPWindow(pool.Spec.IPPlan); msg != "" {
 		return msg
@@ -764,9 +913,26 @@ func (r *WorkerPoolReconciler) validateSpec(pool *infrav1.K8sWorkerPool) string 
 	return ""
 }
 
+// normalizeVSphereFolder reduces a folder to the path below the datacenter
+// VM folder, so spec.vsphere.folder written as "HUB/dev", "/HUB/dev",
+// "vm/HUB/dev" or "/DC/vm/HUB/dev" all compare the same way.
+func normalizeVSphereFolder(dc, folder string) string {
+	rel := strings.TrimSpace(folder)
+	rel = strings.TrimPrefix(rel, "/")
+	if dc = strings.TrimSpace(dc); dc != "" {
+		rel = strings.TrimPrefix(rel, dc+"/vm/")
+	}
+	rel = strings.TrimPrefix(rel, "vm/")
+	return strings.Trim(rel, "/")
+}
+
 // validateIPWindow checks that the window is usable and fits the network. It is
 // a per-object check: whether the window overlaps another pool's is the job of
 // the admission webhook, because that needs the other objects.
+//
+// The arithmetic - vm_ip_offset, the gateway, the named offsets - lives in the
+// allocator, so the condition an operator sees names the same numbers New will
+// enforce.
 func validateIPWindow(plan infrav1.IPPlan) string {
 	if plan.NodeCount < 1 {
 		return fmt.Sprintf("spec.ipPlan.nodeCount %d must be at least 1: a pool without a window would take the whole network", plan.NodeCount)
@@ -775,21 +941,13 @@ func validateIPWindow(plan infrav1.IPPlan) string {
 	if err != nil {
 		return fmt.Sprintf("spec.ipPlan.cidr %q is not a CIDR: %v", plan.CIDR, err)
 	}
-	ones, bits := network.Mask.Size()
-	if bits != 32 {
+	if ones, bits := network.Mask.Size(); bits != 32 {
 		return fmt.Sprintf("spec.ipPlan.cidr %q is not IPv4", plan.CIDR)
+	} else if ones > 30 {
+		return fmt.Sprintf("spec.ipPlan.cidr %q is too small for a pool", plan.CIDR)
 	}
-	total := int64(1) << uint(32-ones)
-	start := int64(plan.WNodeOffset)
-	if start < 0 {
-		start = 0
-	}
-	if start >= total-1 {
-		return fmt.Sprintf("spec.ipPlan.wNodeOffset %d is outside %s", plan.WNodeOffset, plan.CIDR)
-	}
-	if start+int64(plan.NodeCount) > total-1 {
-		return fmt.Sprintf("spec.ipPlan.nodeCount %d from wNodeOffset %d does not fit %s: the window would end past the last usable address (%d available)",
-			plan.NodeCount, plan.WNodeOffset, plan.CIDR, total-1-start)
+	if err := ipam.Validate(toIPAMPlan(plan)); err != nil {
+		return "spec.ipPlan: " + err.Error()
 	}
 	return ""
 }
@@ -855,7 +1013,7 @@ func mergeNodes(pool *infrav1.K8sWorkerPool, vms []cloud.VM, alloc *ipam.Allocat
 // harmless because the next pass adopts the VMs that exist in vCD again. If a
 // create fails, the address is kept reserved only when the VM still exists in
 // vCD; otherwise it is released for reuse.
-func (r *WorkerPoolReconciler) scaleUp(ctx context.Context, before, pool *infrav1.K8sWorkerPool, alloc *ipam.Allocator, n int32) error {
+func (r *WorkerPoolReconciler) scaleUp(ctx context.Context, before, pool *infrav1.K8sWorkerPool, alloc *ipam.Allocator, n int32, ourCPUMHz, ourMemoryMB int64) error {
 	logger := log.FromContext(ctx)
 
 	for i := int32(0); i < n; i++ {
@@ -864,7 +1022,18 @@ func (r *WorkerPoolReconciler) scaleUp(ctx context.Context, before, pool *infrav
 		// pass. Park the rest of the request instead: the slots keep their
 		// name and address and resumeQueuedCreates starts them once the vDC
 		// has room.
-		if ok, why := r.capacityAllows(ctx, pool, workerCapacityRequest(pool, pool.Status.Nodes)); !ok {
+		//
+		// The check charges this pass's own admissions, not just the one worker
+		// about to be created. The platform reports what the hosts *measure*,
+		// while the pre-flight charges a nominal amount per worker, so a VM
+		// admitted a second ago has not moved the free figure yet: four one-worker
+		// checks against the same free MHz would all pass, which is how a request
+		// for four workers was created in full while the page said two fit
+		// (2026-11-20). batchRequest counts them.
+		// capacityAllowsBatch decides how many charges apply: on an entitlement
+		// platform every worker the pool has, otherwise this pass's admissions.
+		if ok, why := r.capacityAllowsBatch(ctx, pool, workerCapacityRequest(pool, pool.Status.Nodes),
+			1+inFlight(pool.Status.Nodes), ourCPUMHz, ourMemoryMB); !ok {
 			if err := r.queueSlots(ctx, pool, alloc, n-i, why); err != nil {
 				return err
 			}
@@ -906,6 +1075,13 @@ func (r *WorkerPoolReconciler) scaleUp(ctx context.Context, before, pool *infrav
 		})
 		pool.Status.ObservedReplicas = int32(len(pool.Status.Nodes))
 		pool.Status.Ledger = toStatusLedger(alloc.Ledger())
+		// The condition goes out with the slot, not at the end of the pass: a
+		// clone takes minutes, and until this line the published status still
+		// read "Converged N/N" from the pass before the scale-up (seen live on
+		// vSphere: desired=2, observed=2, message "1/1 workers Ready").
+		r.setCondition(pool, metav1.ConditionFalse, "Provisioning", fmt.Sprintf(
+			"%d/%d workers Ready, creating %s",
+			readyWorkers(pool.Status.Nodes), pool.Spec.Replicas, name))
 		if err := r.flush(ctx, before, pool); err != nil {
 			return err
 		}
@@ -1038,6 +1214,10 @@ func (r *WorkerPoolReconciler) createWorker(ctx context.Context, pool *infrav1.K
 	if err != nil {
 		return cloud.VM{}, "", err
 	}
+	guest, err := r.effectiveBootstrap(ctx, pool)
+	if err != nil {
+		return cloud.VM{}, "", err
+	}
 
 	var token string
 	release := func(cause error) (cloud.VM, string, error) {
@@ -1065,21 +1245,35 @@ func (r *WorkerPoolReconciler) createWorker(ctx context.Context, pool *infrav1.K
 	}
 
 	userData, initscript, err := r.Renderer.Render(cloudinit.Params{
-		NodeName:         name,
-		NodeIP:           ip,
-		CIDRPrefix:       cidrPrefix(pool.Spec.IPPlan.CIDR),
-		GatewayIP:        gatewayIP(pool.Spec.IPPlan.CIDR),
-		NICName:          pool.Spec.Bootstrap.NICName,
-		DNSServersJSON:   string(dnsJSON),
-		OSUser:           pool.Spec.Bootstrap.OSUser,
-		OSPasswordHash:   pool.Spec.Bootstrap.OSPasswordHash,
-		SSHAuthorizedKey: pool.Spec.Bootstrap.SSHAuthorizedKey,
-		K8sVersion:       pool.Spec.Bootstrap.K8sVersion,
-		K8sMinorRepo:     pool.Spec.Bootstrap.K8sMinorRepo,
-		JoinEndpoint:     pool.Spec.Join.Endpoint,
-		JoinCommand:      join,
-		Disks:            cloudInitDisks,
-		HostsLines:       r.hostsLines(ctx, pool),
+		NodeName:               name,
+		NodeIP:                 ip,
+		CIDRPrefix:             cidrPrefix(pool.Spec.IPPlan.CIDR),
+		GatewayIP:              gatewayIP(pool.Spec.IPPlan.CIDR),
+		NICName:                pool.Spec.Bootstrap.NICName,
+		DNSServersJSON:         string(dnsJSON),
+		DNSServersLine:         strings.Join(pool.Spec.Bootstrap.DNS, " "),
+		OSUser:                 pool.Spec.Bootstrap.OSUser,
+		OSPasswordHash:         pool.Spec.Bootstrap.OSPasswordHash,
+		SSHAuthorizedKeys:      guest.SSHAuthorizedKeys,
+		SSHAllowedSources:      pool.Spec.Bootstrap.SSHAllowedSources,
+		K8sVersion:             pool.Spec.Bootstrap.K8sVersion,
+		K8sMinorRepo:           pool.Spec.Bootstrap.K8sMinorRepo,
+		JoinEndpoint:           pool.Spec.Join.Endpoint,
+		JoinCommand:            join,
+		Disks:                  cloudInitDisks,
+		HostsLines:             r.hostsLines(ctx, pool),
+		NTPServers:             guest.NTPServers,
+		CACerts:                guest.CACerts,
+		Sysctls:                guest.Sysctls,
+		SysctlNames:            guest.SysctlNames,
+		KernelModules:          guest.KernelModules,
+		ContainerdSandboxImage: guest.ContainerdSandboxImage,
+		ContainerdMirrors:      guest.ContainerdMirrors,
+		ContainerdInsecure:     guest.ContainerdInsecure,
+		ContainerdFullConfig:   guest.ContainerdFull,
+		AptMirror:              guest.AptMirror,
+		AptSuites:              guest.AptSuites,
+		AptComponents:          guest.AptComponents,
 	})
 	if err != nil {
 		return release(fmt.Errorf("render bootstrap for %s: %w", name, err))
@@ -1168,6 +1362,27 @@ func ownedWorkerVMs(pool *infrav1.K8sWorkerPool, vms []cloud.VM) []cloud.VM {
 	for _, vm := range vms {
 		if strings.HasPrefix(vm.Name, prefix) {
 			out = append(out, vm)
+		}
+	}
+	return out
+}
+
+// foreignAddresses lists the addresses of VMs in the pool's scope that the pool
+// does not own. The pool must never hand them to a worker: the plan reserves
+// what it knows about, and this covers what it cannot know - a VM the
+// namePrefix did not recognise, an address a human added by hand.
+func foreignAddresses(owned, all []cloud.VM) []string {
+	isOwned := make(map[string]bool, len(owned))
+	for _, vm := range owned {
+		isOwned[vm.Name] = true
+	}
+	out := make([]string, 0, len(all))
+	for _, vm := range all {
+		if isOwned[vm.Name] {
+			continue
+		}
+		if ip := strings.TrimSpace(vm.IP); ip != "" {
+			out = append(out, ip)
 		}
 	}
 	return out
@@ -1293,21 +1508,20 @@ func buildJoinCommand(endpoint, token, caHash string) (string, error) {
 	return fmt.Sprintf("kubeadm join %s --token %s --discovery-token-ca-cert-hash %s", endpoint, token, caHash), nil
 }
 
-func toIPAMPlan(p infrav1.IPPlan, v *infrav1.VCDRef) ipam.Plan {
-	dvm := 0
-	if v != nil {
-		dvm = v.DVMOffset
-	}
+func toIPAMPlan(p infrav1.IPPlan) ipam.Plan {
 	return ipam.Plan{
-		CIDR:        p.CIDR,
-		MNodeOffset: p.MNodeOffset,
-		WNodeOffset: p.WNodeOffset,
-		DVMOffset:   dvm,
-		KubeAPILB:   p.KubeAPILB,
-		IngressLB:   p.IngressLB,
-		MasterCount: p.MasterCount,
-		NodeCount:   p.NodeCount,
-		Reserved:    p.Reserved,
+		CIDR:         p.CIDR,
+		VMIPOffset:   p.VMIPOffset,
+		MNodeOffset:  p.MNodeOffset,
+		WNodeOffset:  p.WNodeOffset,
+		DVMOffset:    p.DVMOffset,
+		KubeAPILB:    p.KubeAPILB,
+		IngressLB:    p.IngressLB,
+		LBNodeOffset: p.LBNodeOffset,
+		LBNodeCount:  p.LBNodeCount,
+		MasterCount:  p.MasterCount,
+		NodeCount:    p.NodeCount,
+		Reserved:     p.Reserved,
 	}
 }
 

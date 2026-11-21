@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -310,5 +311,177 @@ func TestQueuedWorkerStaysQueuedWhenTheCreateFails(t *testing.T) {
 	}
 	if !strings.Contains(n.Message, "the create failed") {
 		t.Fatalf("message after a failed create = %q", n.Message)
+	}
+}
+
+// A scale-out is one batch, and the pre-flight has to charge its own admissions.
+// The platform reports measured usage, so a worker admitted a second ago has not
+// changed the free figure yet; without counting the batch, every one-worker check
+// sees the same free capacity and the whole request is created - which is how
+// four workers were started on 2026-11-20 while the page said two fit.
+func TestScaleUpChargesTheWholeBatch(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(4)
+	// Room for exactly three test workers (2 vCPU x 2600 MHz each).
+	// A measured platform: the created workers are not booked, exactly like the
+	// host usage vSphere reports.
+	fc := &fakeCloud{noConsume: true, capacity: cloud.PlatformCapacity{
+		Physical:      true,
+		Measured:      true,
+		CPUMHzPerCore: 2600,
+		CPU:           cloud.ResourceCapacity{Limit: 3 * 2 * 2600, Used: 0},
+		MemoryMB:      cloud.ResourceCapacity{Limit: 1 << 20, Used: 0},
+	}}
+	r := newTestReconciler(t, fc, &fakeKube{}, pool)
+
+	if _, err := r.Reconcile(ctx, requestFor(pool)); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	got := getPool(t, r, pool)
+	if len(fc.created) != 3 {
+		for _, n := range got.Status.Nodes {
+			t.Logf("node %s %s %q", n.Name, n.Phase, n.Message)
+		}
+		t.Fatalf("created %d VMs, want 3: the fourth must be queued", len(fc.created))
+	}
+	var provisioning, queued int
+	for _, n := range got.Status.Nodes {
+		switch n.Phase {
+		case infrav1.NodePhaseProvisioning:
+			provisioning++
+		case infrav1.NodePhaseQueued:
+			queued++
+		}
+	}
+	if provisioning != 3 || queued != 1 {
+		t.Fatalf("phases: %d provisioning, %d queued, want 3 and 1", provisioning, queued)
+	}
+}
+
+// A worker admitted by an earlier pass is still Provisioning and consumes almost
+// nothing, so the platform's free figure has not moved. Its charge must be spent
+// before the next worker is admitted, or a scale-out keeps adding VMs pass after
+// pass while the pane says there is no room.
+func TestScaleUpChargesTheWorkersAlreadyStarting(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(3)
+	// One worker exists and is still starting.
+	pool.Status.Nodes = []infrav1.WorkerNodeStatus{{
+		Name: "pool-wrk-01", IP: "192.168.100.7", Phase: infrav1.NodePhaseProvisioning,
+		ProviderID: "vm-1", ProvisioningStartedAt: &metav1.Time{Time: time.Now()},
+	}}
+	pool.Status.ObservedReplicas = 1
+	fc := &fakeCloud{
+		vms:       []cloud.VM{{ID: "vm-1", Name: "pool-wrk-01", IP: "192.168.100.7", CPU: 2, MemoryMB: 4096}},
+		noConsume: true,
+		capacity: cloud.PlatformCapacity{
+			Physical: true, Measured: true, CPUMHzPerCore: 2600,
+			// Room for two charges in total, one of which the starting worker holds.
+			CPU:      cloud.ResourceCapacity{Limit: 2 * 2 * 2600, Used: 0},
+			MemoryMB: cloud.ResourceCapacity{Limit: 1 << 20, Used: 0},
+		},
+	}
+	r := newTestReconciler(t, fc, &fakeKube{}, pool)
+
+	if _, err := r.Reconcile(ctx, requestFor(pool)); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if len(fc.created) != 1 {
+		t.Fatalf("created %d VMs, want 1: the starting worker's charge leaves room for one", len(fc.created))
+	}
+	got := getPool(t, r, pool)
+	var provisioning, queued int
+	for _, n := range got.Status.Nodes {
+		switch n.Phase {
+		case infrav1.NodePhaseProvisioning:
+			provisioning++
+		case infrav1.NodePhaseQueued:
+			queued++
+		}
+	}
+	if provisioning != 2 || queued != 1 {
+		t.Fatalf("%d provisioning, %d queued, want 2 and 1", provisioning, queued)
+	}
+}
+
+// The entitlement rule: our workers are charged in full (their 1:1 entitlement),
+// everyone else is measured. Here the neighbours already hold two charges' worth
+// of the cluster and our one worker holds the third, so a second worker must be
+// queued even though the cluster looks half idle.
+func TestEntitlementChargesOurWorkersAgainstTheNeighboursLoad(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(2)
+	pool.Status.Nodes = []infrav1.WorkerNodeStatus{{
+		Name: "pool-wrk-01", IP: "192.168.100.7", Phase: infrav1.NodePhaseReady,
+		ProviderID: "vm-1", K8sReady: true,
+	}}
+	pool.Status.ObservedReplicas = 1
+	fc := &fakeCloud{
+		vms: []cloud.VM{{
+			ID: "vm-1", Name: "pool-wrk-01", IP: "192.168.100.7",
+			CPU: 2, MemoryMB: 4096, PoweredOn: true,
+			UsedCPUMHz: 1000, UsedMemoryMB: 1024,
+		}},
+		capacity: cloud.PlatformCapacity{
+			Physical: true, Measured: true, PerVMUsage: true, CPUMHzPerCore: 2600,
+			// 10.4 GHz of neighbours + 1 GHz of ours measured = 11.4 GHz used.
+			CPU:      cloud.ResourceCapacity{Limit: 3 * 2 * 2600, Used: 11400},
+			MemoryMB: cloud.ResourceCapacity{Limit: 1 << 20, Used: 1<<20 - 1},
+		},
+	}
+	r := newTestReconciler(t, fc, &fakeKube{nodes: readyNodes("pool-wrk-01")}, pool)
+
+	if _, err := r.Reconcile(ctx, requestFor(pool)); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	got := getPool(t, r, pool)
+	for _, n := range got.Status.Nodes {
+		if n.Name == "pool-wrk-02" && n.Phase != infrav1.NodePhaseQueued {
+			t.Fatalf("pool-wrk-02 = %s, want Queued: others 10.4 GHz + 2 charges > 15.6 GHz", n.Phase)
+		}
+	}
+	if len(fc.created) != 0 {
+		t.Fatalf("created %d VMs, want none: the cluster is already spoken for", len(fc.created))
+	}
+}
+
+// Seen live on 2026-11-20: the entitlement said no room, and a third worker was
+// created anyway. The check charged the new worker plus the ones still *starting*,
+// so an already-Ready worker cost nothing - exactly the case that mattered.
+func TestEntitlementChargesTheWorkersThatAreAlreadyReady(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(3)
+	pool.Spec.Flavor.CPUs = 2
+	pool.Status.Nodes = []infrav1.WorkerNodeStatus{
+		{Name: "pool-wrk-01", IP: "192.168.100.7", Phase: infrav1.NodePhaseReady, ProviderID: "vm-1", K8sReady: true},
+		{Name: "pool-wrk-02", IP: "192.168.100.8", Phase: infrav1.NodePhaseReady, ProviderID: "vm-2", K8sReady: true},
+	}
+	pool.Status.ObservedReplicas = 2
+	fc := &fakeCloud{
+		vms: []cloud.VM{
+			{ID: "vm-1", Name: "pool-wrk-01", IP: "192.168.100.7", CPU: 2, MemoryMB: 4096, PoweredOn: true, UsedCPUMHz: 500, UsedMemoryMB: 512},
+			{ID: "vm-2", Name: "pool-wrk-02", IP: "192.168.100.8", CPU: 2, MemoryMB: 4096, PoweredOn: true, UsedCPUMHz: 500, UsedMemoryMB: 512},
+		},
+		capacity: cloud.PlatformCapacity{
+			Physical: true, Measured: true, PerVMUsage: true, CPUMHzPerCore: 2600,
+			// Neighbours hold 10.4 GHz, ours measure 1 GHz: room for one more
+			// charge (15.6) but not for a third worker's (twice that).
+			CPU:      cloud.ResourceCapacity{Limit: 3 * 2 * 2600, Used: 11400},
+			MemoryMB: cloud.ResourceCapacity{Limit: 1 << 20, Used: 1 << 19},
+		},
+	}
+	r := newTestReconciler(t, fc, &fakeKube{nodes: readyNodes("pool-wrk-01", "pool-wrk-02")}, pool)
+
+	if _, err := r.Reconcile(ctx, requestFor(pool)); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	got := getPool(t, r, pool)
+	for _, n := range got.Status.Nodes {
+		if n.Name == "pool-wrk-03" && n.Phase != infrav1.NodePhaseQueued {
+			t.Fatalf("pool-wrk-03 = %s, want Queued: two Ready workers already hold two charges", n.Phase)
+		}
+	}
+	if len(fc.created) != 0 {
+		t.Fatalf("created %d VMs, want none", len(fc.created))
 	}
 }

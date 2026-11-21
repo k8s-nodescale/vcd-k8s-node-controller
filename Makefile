@@ -1,5 +1,5 @@
 IMAGE ?= docker.io/werton13/vcd-k8s-node-controller
-TAG ?= 1.0.0
+TAG ?= 1.3.31
 GO ?= go
 CONTROLLER_GEN ?= controller-gen
 
@@ -33,6 +33,6 @@ generate: ; $(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths=
 
 manifests: ; $(CONTROLLER_GEN) crd paths="./api/..." output:crd:artifacts:config=config/crd/bases
 
-helm-lint: ; helm lint charts/vcd-nodescale
+helm-lint: ; helm lint charts/vcd-nodescale --set platform=vcd && helm lint charts/vcd-nodescale --set platform=vsphere && ./hack/chart-matrix.sh
 
 clean: ; $(GO) clean ./...

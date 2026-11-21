@@ -1,8 +1,11 @@
-vcd-nodescale has been installed in namespace {{ include "vcd-nodescale.namespace" . }}.
+{{- $platform := include "vcd-nodescale.platform" . -}}
+{{- $ns := include "vcd-nodescale.namespace" . -}}
+vcd-nodescale has been installed in namespace {{ $ns }} and serves platform {{ $platform }}.
 
-If the vCD credentials Secret does not exist, create it:
+{{ if eq $platform "vcd" -}}
+The vCD credentials Secret is:
 
-  kubectl -n {{ include "vcd-nodescale.namespace" . }} create secret generic {{ .Values.vcd.existingSecret }} \
+  kubectl -n {{ $ns }} create secret generic {{ .Values.vcd.existingSecret }} \
     --from-literal=url=https://vcd.example.com/api \
     --from-literal=user=svc-node-controller \
     --from-literal=password='***' \
@@ -10,7 +13,34 @@ If the vCD credentials Secret does not exist, create it:
     --from-literal=vdc=My-VDC-Name \
     --from-literal=insecure=false
 
-Then create a K8sWorkerPool (see config/samples/infra_v1alpha1_k8sworkerpool.yaml).
+Keys: url, user, password, org, vdc, insecure (optional).
+{{- else -}}
+The vSphere credentials Secret is:
+
+  kubectl -n {{ $ns }} create secret generic {{ .Values.vsphere.existingSecret }} \
+    --from-literal=url=https://vcenter.example.com \
+    --from-literal=user=terraform@example.local \
+    --from-literal=password='***' \
+    --from-literal=insecure=true
+
+Keys: url, user, password, insecure (optional). Only the connection lives here:
+the datacenter, cluster, resource pool, folder, datastore and network of a pool
+are in its spec.vsphere.
+{{- with .Values.vsphere.folderRoot }}
+
+Pool folders must stay at or below the installation's folder root:
+
+  {{ . }}
+{{- end }}
+{{- end }}
+
+The Pod starts even while the Secret is missing: /readyz stays NotReady and
+every affected pool reports CloudError naming the missing key, so the controller
+never enters a restart loop over credentials.
+
+Then create a K8sWorkerPool (see the README section "Writing a K8sWorkerPool
+for an existing cluster" and config/samples/). The pool is cluster-scoped: no
+metadata.namespace, and k8sworkerpool commands take no -n.
 
 WARNING: once this controller is enabled, do not use Terraform to manage
 worker count or worker LB pool membership; use the CRD instead.
@@ -24,10 +54,10 @@ the controller's default certificate).
 The chart generated the two accounts. Read the passwords once, then delete the
 key so they stop existing:
 
-  kubectl -n {{ include "vcd-nodescale.namespace" . }} get secret {{ .Values.ui.auth.secretName }} \
+  kubectl -n {{ $ns }} get secret {{ .Values.ui.auth.secretName }} \
     -o jsonpath='{.data.initial-passwords}' | base64 -d
 
-  kubectl -n {{ include "vcd-nodescale.namespace" . }} patch secret {{ .Values.ui.auth.secretName }} \
+  kubectl -n {{ $ns }} patch secret {{ .Values.ui.auth.secretName }} \
     --type=json -p '[{"op":"remove","path":"/data/initial-passwords"}]'
 
 Rotate a password with "htpasswd -nB <user>" and put the hash into the

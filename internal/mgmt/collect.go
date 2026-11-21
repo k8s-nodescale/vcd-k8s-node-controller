@@ -14,6 +14,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	infrav1 "github.com/k8s-nodescale/vcd-k8s-node-controller/api/v1alpha1"
+	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/ipam"
 )
 
 type Collector struct {
@@ -192,8 +193,9 @@ func diskProgress(p *infrav1.K8sWorkerPool, unit int32, want int32) *DiskProgres
 	return &DiskProgress{From: from, Done: done, Total: total}
 }
 
-// ipWindow describes the part of the CIDR this pool may hand out: wNodeOffset
-// for nodeCount addresses. The broadcast address is never in it.
+// ipWindow describes the part of the CIDR this pool may hand out:
+// vmIPOffset+wNodeOffset for nodeCount addresses. The broadcast address is never
+// in it.
 func ipWindow(plan infrav1.IPPlan) (from, to string, size int32, declared bool) {
 	prefix, err := netip.ParsePrefix(plan.CIDR)
 	if err != nil || !prefix.Addr().Is4() {
@@ -201,7 +203,7 @@ func ipWindow(plan infrav1.IPPlan) (from, to string, size int32, declared bool) 
 	}
 	prefix = prefix.Masked()
 	total := int64(1) << uint(32-prefix.Bits())
-	start := int64(plan.WNodeOffset)
+	start := int64(ipam.Shift(plan.WNodeOffset, plan.VMIPOffset))
 	if start < 0 {
 		start = 0
 	}
@@ -258,7 +260,7 @@ func buildAddressSpaces(pools []infrav1.K8sWorkerPool) map[string]addressSpace {
 		}
 		prefix = prefix.Masked()
 		total := int64(1) << uint(32-prefix.Bits())
-		start := int64(plan.WNodeOffset)
+		start := int64(ipam.Shift(plan.WNodeOffset, plan.VMIPOffset))
 		if start < 0 {
 			start = 0
 		}
@@ -302,6 +304,12 @@ func buildAddressSpaces(pools []infrav1.K8sWorkerPool) map[string]addressSpace {
 		}
 		sp := addressSpace{}
 		for _, g := range gaps {
+			// One spare address is an address, not a range: "a - a" reads like
+			// a typo and hides that the gap is a single host.
+			if g[0] == g[1] {
+				sp.free = append(sp.free, addr(g[0]))
+				continue
+			}
 			sp.free = append(sp.free, addr(g[0])+" - "+addr(g[1]))
 		}
 		// The first gap that holds a default-sized pool, otherwise the largest
@@ -340,6 +348,7 @@ func (c *Collector) poolView(ctx context.Context, p *infrav1.K8sWorkerPool, byNo
 		Observed:        p.Status.ObservedReplicas,
 		Ready:           readyCount(p.Status.Nodes),
 		Phase:           p.Status.Rollout.Phase,
+		Activity:        activity(p),
 		MinReplicas:     p.Spec.ScaleDown.MinReplicas,
 		AllowLastWorker: p.Spec.ScaleDown.AllowLastWorker,
 		DeleteWorkers:   append([]string(nil), p.Spec.ScaleDown.DeleteWorkers...),
@@ -358,6 +367,7 @@ func (c *Collector) poolView(ctx context.Context, p *infrav1.K8sWorkerPool, byNo
 		}
 	}
 	view.Busy = busyReason(p)
+	view.Preflight = p.Spec.Capacity.Preflight == nil || *p.Spec.Capacity.Preflight
 
 	from, to, size, declared := ipWindow(p.Spec.IPPlan)
 	view.IPNetwork = p.Spec.IPPlan.CIDR
@@ -370,6 +380,8 @@ func (c *Collector) poolView(ctx context.Context, p *infrav1.K8sWorkerPool, byNo
 	if cap := p.Status.Capacity; cap != nil {
 		view.Capacity = &Capacity{
 			Model:             cap.Model,
+			Datacenter:        cap.Datacenter,
+			Cluster:           cap.Cluster,
 			CPUMHz:            cap.CPUMHz,
 			CPULimitMHz:       cap.CPULimitMHz,
 			MemoryMB:          cap.MemoryMB,
@@ -387,9 +399,25 @@ func (c *Collector) poolView(ctx context.Context, p *infrav1.K8sWorkerPool, byNo
 			PodUsablePerBlock: cap.PodUsablePerBlock,
 			PodMaxPerNode:     cap.PodMaxPerNode,
 			At:                cap.At.UTC().Format(time.RFC3339),
+			PerVMUsage:        cap.PerVMUsage,
+			OurCPUMHz:         cap.OurCPUMHz,
+			OurMemoryMB:       cap.OurMemoryMB,
+			CPUPerCore:        perCoreFor(p, cap),
+			CPUMHzPerCore:     cap.CPUMHzPerCore,
+			Physical:          cap.Physical,
+			Fit:               poolFit(p),
 			CPU:               shareOf(cap.CPUMHz, cap.CPULimitMHz),
 			Memory:            shareOf(cap.MemoryMB, cap.MemoryLimitMB),
 			Storage:           shareOf(cap.StorageMB, cap.StorageLimitMB),
+		}
+		for _, d := range cap.Datastores {
+			view.Capacity.Datastores = append(view.Capacity.Datastores, Datastore{
+				Name:       d.Name,
+				Default:    d.Default,
+				CapacityMB: d.CapacityMB,
+				UsedMB:     d.UsedMB,
+				Share:      shareOf(d.UsedMB, d.CapacityMB),
+			})
 		}
 	}
 

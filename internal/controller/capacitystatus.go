@@ -44,7 +44,8 @@ func (r *WorkerPoolReconciler) refreshCapacityStatus(ctx context.Context, pool *
 	cur := pool.Status.Capacity
 	if cur != nil &&
 		cur.ObservedReplicas == pool.Status.ObservedReplicas &&
-		time.Since(cur.At.Time) < capacityStatusTTL {
+		time.Since(cur.At.Time) < capacityStatusTTL &&
+		!refreshRequested(pool, cur) {
 		return
 	}
 
@@ -54,10 +55,34 @@ func (r *WorkerPoolReconciler) refreshCapacityStatus(ctx context.Context, pool *
 	if err == nil {
 		if capacity, cerr := prov.Capacity(ctx); cerr == nil {
 			snap.Model = capacity.Model
+			snap.Datacenter = capacity.Datacenter
+			snap.Cluster = capacity.Cluster
+			// The assumption the pre-flight is applying, published so the page
+			// explains the same arithmetic instead of guessing it.
+			snap.Physical = capacity.Physical
+			// What our own workers draw, so the story the page tells about the
+			// remaining room can separate us from the neighbours.
+			if vms, lerr := prov.ListWorkerVMs(ctx, nil); lerr == nil {
+				snap.OurCPUMHz, snap.OurMemoryMB = poolMeasured(ownedWorkerVMs(pool, vms))
+				snap.PerVMUsage = capacity.PerVMUsage
+			}
+			snap.CPUMHzPerCore = cpuMHzPerCore(pool, capacity)
+			snap.CPUPerCore = int32(cpuPerCore(pool, capacity))
 			snap.CPUMHz = capacity.CPU.Used
 			snap.CPULimitMHz = capacity.CPU.Limit
 			snap.MemoryMB = capacity.MemoryMB.Used
 			snap.MemoryLimitMB = capacity.MemoryMB.Limit
+			// The inventory is published as the platform reported it: the page
+			// shows what the cluster offers next to the one datastore the bar
+			// can carry, and computes the shares itself.
+			for _, d := range capacity.Datastores {
+				snap.Datastores = append(snap.Datastores, infrav1.DatastoreCapacity{
+					Name:       d.Name,
+					Default:    d.Default,
+					CapacityMB: d.LimitMB,
+					UsedMB:     d.UsedMB,
+				})
+			}
 			// One profile, never a sum: profiles have their own limits, and
 			// adding them describes a quota that does not exist. The default
 			// is the one a clone lands on.
@@ -266,4 +291,20 @@ func (r *WorkerPoolReconciler) calicoBudget(ctx context.Context, out *podBudget)
 		}
 	}
 	return true
+}
+
+// refreshRequested reports whether an operator asked for a fresh snapshot since
+// the last one. The page writes infrav1.CapacityRefreshAnnotation and the
+// controller honours it once, which is what makes "update now" possible without
+// shortening the TTL for everybody.
+func refreshRequested(pool *infrav1.K8sWorkerPool, cur *infrav1.CapacityStatus) bool {
+	raw := pool.Annotations[infrav1.CapacityRefreshAnnotation]
+	if raw == "" {
+		return false
+	}
+	at, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return false
+	}
+	return cur == nil || at.After(cur.At.Time)
 }

@@ -147,7 +147,7 @@ func TestMergeNodesKeepsNodeReportedResources(t *testing.T) {
 		Name: "pool-wrk-01", IP: "192.168.100.7", Phase: infrav1.NodePhaseReady,
 		CPU: 2, MemoryMB: 7841, K8sReady: true,
 	}}
-	alloc, err := ipam.New(toIPAMPlan(pool.Spec.IPPlan, pool.Spec.VCD), toIPAMLedger(pool.Status.Ledger))
+	alloc, err := ipam.New(toIPAMPlan(pool.Spec.IPPlan), toIPAMLedger(pool.Status.Ledger))
 	if err != nil {
 		t.Fatal(err)
 	}

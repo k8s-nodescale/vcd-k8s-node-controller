@@ -55,12 +55,148 @@ spec:
           metadata:
             type: object
           spec:
-            description: K8sWorkerPoolSpec defines the desired worker pool.
+            description: |-
+              K8sWorkerPoolSpec defines the desired worker pool.
+
+              The address window is a hard ceiling, unlike the capacity estimate: a worker
+              beyond it has no address to be given, and the controller can only fail trying.
+              The rule is here rather than in the UI so kubectl is held to it too.
             properties:
               bootstrap:
                 description: Bootstrap carries OS/cloud-init inputs used to render
                   new worker user-data.
                 properties:
+                  apt:
+                    description: |-
+                      Apt replaces the image's package sources with the environment's mirror.
+                      The Terraform baseline does the same (apt.sources_list): an image whose
+                      sources point at the public archive cannot install anything on a network
+                      without internet access, and the first apt call fails the boot.
+                    properties:
+                      components:
+                        description: |-
+                          Components overrides the components. Empty uses
+                          main universe restricted multiverse.
+                        items:
+                          type: string
+                        type: array
+                      mirror:
+                        description: |-
+                          Mirror is the URI written as the only active apt source, e.g.
+                          https://nexus.example.com/repository/ubuntu-noble. It is used as given:
+                          the path that carries the release name is not guessed. Empty keeps the
+                          image's sources.
+                        type: string
+                      suites:
+                        description: |-
+                          Suites overrides the suites. Empty derives them from the guest's release
+                          codename: <code>, <code>-updates, <code>-backports, <code>-security, the
+                          set the Terraform baseline enables.
+                        items:
+                          type: string
+                        type: array
+                    type: object
+                  caBundleRef:
+                    description: |-
+                      CABundleRef names a ConfigMap or Secret key holding the PEM bundle to
+                      trust in the guest. The bundle is usually environment policy shared by
+                      every pool, so it is not a literal in the CR: an installation-wide
+                      default lives in the bootstrap ConfigMap the chart renders, and this
+                      field only overrides it for one pool.
+                    properties:
+                      key:
+                        description: Key is the data key holding the value.
+                        type: string
+                      kind:
+                        description: |-
+                          Kind is ConfigMap (the default) or Secret. A CA bundle is public and
+                          belongs in a ConfigMap; Secret is accepted for installs that keep all
+                          their configuration in one store.
+                        enum:
+                        - ConfigMap
+                        - Secret
+                        type: string
+                      name:
+                        description: Name is the object name.
+                        type: string
+                      namespace:
+                        description: |-
+                          Namespace defaults to the namespace of the K8sWorkerPool, and to the
+                          controller's own namespace when the pool is cluster-scoped (which it is):
+                          that is where the chart puts the objects an installation shares. A
+                          reference from the installation-wide bootstrap ConfigMap always resolves
+                          in the controller's namespace.
+                        type: string
+                    required:
+                    - key
+                    - name
+                    type: object
+                  containerd:
+                    description: |-
+                      Containerd carries the site-specific part of the container runtime
+                      configuration. The controller generates the rest from the containerd
+                      binary installed in the guest, so a worker does not depend on the image
+                      shipping a prepared /etc/containerd/config.toml.
+                    properties:
+                      configRef:
+                        description: |-
+                          ConfigRef, when set, is the complete config.toml for this pool: the
+                          controller writes it verbatim and generates nothing. This is the escape
+                          hatch for a site whose runtime configuration cannot be expressed as a
+                          drop-in; it couples the pool to the containerd major version, which is
+                          why it is not the default.
+                        properties:
+                          key:
+                            description: Key is the data key holding the value.
+                            type: string
+                          kind:
+                            description: |-
+                              Kind is ConfigMap (the default) or Secret. A CA bundle is public and
+                              belongs in a ConfigMap; Secret is accepted for installs that keep all
+                              their configuration in one store.
+                            enum:
+                            - ConfigMap
+                            - Secret
+                            type: string
+                          name:
+                            description: Name is the object name.
+                            type: string
+                          namespace:
+                            description: |-
+                              Namespace defaults to the namespace of the K8sWorkerPool, and to the
+                              controller's own namespace when the pool is cluster-scoped (which it is):
+                              that is where the chart puts the objects an installation shares. A
+                              reference from the installation-wide bootstrap ConfigMap always resolves
+                              in the controller's namespace.
+                            type: string
+                        required:
+                        - key
+                        - name
+                        type: object
+                      insecureSkipVerify:
+                        description: |-
+                          InsecureSkipVerify disables TLS verification for the mirror endpoints,
+                          matching what the Ansible baseline sets for an http:// mirror. On
+                          containerd 2.x this becomes a per-registry certs.d hosts.toml, where that
+                          version keeps its TLS settings.
+                        type: boolean
+                      mirrors:
+                        additionalProperties:
+                          items:
+                            type: string
+                          type: array
+                        description: |-
+                          Mirrors maps a registry host to its endpoint list, e.g.
+                          {"docker.io": ["http://mirror.example.com"]}. Empty means the worker
+                          pulls from the registries directly, which only works where they are
+                          reachable.
+                        type: object
+                      sandboxImage:
+                        description: |-
+                          SandboxImage is the pause image kubelet asks containerd for. Empty keeps
+                          the binary default.
+                        type: string
+                    type: object
                   dns:
                     items:
                       type: string
@@ -69,14 +205,86 @@ spec:
                     type: string
                   k8sVersion:
                     type: string
+                  kernelModules:
+                    description: |-
+                      KernelModules are loaded and persisted in
+                      /etc/modules-load.d/nodescale.conf before the sysctls are applied: a
+                      conntrack parameter silently does nothing without its module.
+                    items:
+                      type: string
+                    type: array
                   nicName:
                     type: string
+                  ntpServers:
+                    description: |-
+                      NTPServers are the chrony sources written into the guest, each as
+                      "server <host> iburst". Empty keeps the image's own configuration: the
+                      Terraform baseline sets the same list per cluster (ntp.servers), so a
+                      worker built by the controller should not silently use another source.
+                    items:
+                      type: string
+                    type: array
                   osPasswordHash:
                     type: string
                   osUser:
                     type: string
+                  sshAllowedSources:
+                    description: |-
+                      SSHAllowedSources are extra sshd AllowUsers patterns the worker admits,
+                      e.g. "*@10.99.96.64/26". The images ship a restrictive AllowUsers line
+                      (the Terraform baseline appends the same values from allowed_ssh_ips); a
+                      worker that omits this list keeps the image's list, which may not include
+                      the operator's network.
+                    items:
+                      type: string
+                    type: array
                   sshAuthorizedKey:
                     type: string
+                  sshAuthorizedKeysRef:
+                    description: |-
+                      SSHAuthorizedKeysRef names a ConfigMap or Secret key holding public
+                      keys, one per line. They are added to the inline sshAuthorizedKey, so an
+                      operator can rotate a key in the store without editing the pool object;
+                      blank lines and lines starting with # are ignored. The keys still travel
+                      in the guest user-data (that is how cloud-init installs them), so this
+                      keeps them out of a widely readable CR, not off the VM.
+                    properties:
+                      key:
+                        description: Key is the data key holding the value.
+                        type: string
+                      kind:
+                        description: |-
+                          Kind is ConfigMap (the default) or Secret. A CA bundle is public and
+                          belongs in a ConfigMap; Secret is accepted for installs that keep all
+                          their configuration in one store.
+                        enum:
+                        - ConfigMap
+                        - Secret
+                        type: string
+                      name:
+                        description: Name is the object name.
+                        type: string
+                      namespace:
+                        description: |-
+                          Namespace defaults to the namespace of the K8sWorkerPool, and to the
+                          controller's own namespace when the pool is cluster-scoped (which it is):
+                          that is where the chart puts the objects an installation shares. A
+                          reference from the installation-wide bootstrap ConfigMap always resolves
+                          in the controller's namespace.
+                        type: string
+                    required:
+                    - key
+                    - name
+                    type: object
+                  sysctls:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      Sysctls are additional kernel parameters written to
+                      /etc/sysctl.d/99-zzz-nodescale.conf (later files win, so a pool value
+                      overrides the image's). The Kubernetes-required ones (bridge-nf-call,
+                      ip_forward) are always written and do not belong here.
+                    type: object
                 type: object
               capacity:
                 description: |-
@@ -92,6 +300,26 @@ spec:
                       does). The default, 2000, is the usual 2 GHz per vCPU.
                     format: int64
                     minimum: 100
+                    type: integer
+                  cpuPerCore:
+                    default: 1
+                    description: |-
+                      CPUPerCore is how many vCPUs the pre-flight lets one physical core carry,
+                      where the platform reports physical capacity (vSphere: the hosts of the
+                      pool's compute cluster). That number is a capacity the owner may choose to
+                      overcommit, and this field is that choice: 1 charges a worker its whole
+                      vCPU count in core speed, 2 charges half of it, and so on. It is ignored
+                      where the platform reports a quota instead (vCD), because dividing a quota
+                      would admit a request the platform then refuses - the failure the
+                      pre-flight exists to prevent.
+
+                      It changes only when a create is considered to fit. It never changes the
+                      size of a worker, never evicts one, and lowering it while workers are
+                      Queued simply leaves them queued. An unset value is 1, which is the
+                      pre-flight as it behaved before the field existed.
+                    format: int32
+                    maximum: 8
+                    minimum: 1
                     type: integer
                   preflight:
                     default: true
@@ -119,6 +347,10 @@ spec:
                         a worker VM.
                       properties:
                         busNumber:
+                          description: |-
+                            BusNumber and UnitNumber are always written, zero included: a disk on
+                            bus 1 unit 0 is not "a disk without a unit number", and a manifest that
+                            omits it reads that way.
                           format: int32
                           type: integer
                         busType:
@@ -134,7 +366,9 @@ spec:
                           format: int32
                           type: integer
                       required:
+                      - busNumber
                       - sizeGB
+                      - unitNumber
                       type: object
                     type: array
                   memoryMB:
@@ -189,9 +423,32 @@ spec:
                 properties:
                   cidr:
                     type: string
+                  dvmOffset:
+                    description: |-
+                      DVMOffset is the deployment VM (the Terraform bootstrap host) inside
+                      the range. The controller reserves it so no worker is ever handed that
+                      address; a deployment without a DVM leaves it at 0. It moved here from
+                      spec.vcd because the offset belongs to the address plan, not to the
+                      platform.
+                    type: integer
                   ingressLB:
                     type: integer
                   kubeapiLB:
+                    type: integer
+                  lbNodeCount:
+                    default: 0
+                    description: |-
+                      LBNodeCount is how many load-balancer VMs follow LBNodeOffset. Zero and
+                      one both mean "only the first": Terraform states the first host and not
+                      the count, so the field exists to say "there are two" without writing a
+                      hand-made reservation for the second.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  lbNodeOffset:
+                    description: |-
+                      LBNodeOffset is Terraform's lb_node: the first load-balancer VM. The
+                      reference Terraform runs two of them; LBNodeCount says how many.
                     type: integer
                   mNodeOffset:
                     type: integer
@@ -201,12 +458,13 @@ spec:
                   nodeCount:
                     default: 10
                     description: |-
-                      NodeCount is how many worker addresses this pool may take: its
-                      window is wNodeOffset .. wNodeOffset+nodeCount-1. Two pools can
-                      share one CIDR as long as their windows do not overlap, and a
-                      pool that outgrows its window fails instead of borrowing a
-                      neighbour's address. The default is 10, so every pool states a
-                      limit; a pool that needs the whole network says so with a number.
+                      NodeCount is how many worker addresses this pool may take: its window is
+                      vmIPOffset+wNodeOffset .. vmIPOffset+wNodeOffset+nodeCount-1. Two pools
+                      can share one CIDR as long as their windows do not overlap, and a pool
+                      that outgrows its window fails instead of borrowing a neighbour's
+                      address. The default is materialised into every pool by the API server,
+                      so "not set" is not a hidden mode and zero is not a sentinel: an
+                      operator who needs a larger pool says so.
                     format: int32
                     minimum: 1
                     type: integer
@@ -214,10 +472,20 @@ spec:
                     items:
                       type: string
                     type: array
+                  vmIPOffset:
+                    default: 0
+                    description: |-
+                      VMIPOffset is Terraform's vm_ip_offset: how many addresses of the
+                      subnet are skipped before the VM range begins. It exists for the case
+                      where the cluster cannot sit at the start of a clean subnet. The
+                      default of 0 keeps a plan that starts at the prefix.
+                    minimum: 0
+                    type: integer
                   wNodeOffset:
                     type: integer
                 required:
                 - cidr
+                - nodeCount
                 type: object
               join:
                 description: Join controls how new nodes join the cluster.
@@ -245,11 +513,12 @@ spec:
                   names (e.g. myorg-cluster-prod).
                 type: string
               provider:
-                default: vcd
                 description: |-
-                  Provider selects the platform that runs this pool's workers: vcd (the
-                  default) or vsphere. The platform block that matches it is required;
-                  the others are ignored.
+                  Provider names the platform that runs this pool's workers: vcd or
+                  vsphere. It is optional, and empty means the platform this controller
+                  installation serves - the normal case, because one installation serves
+                  one platform. A non-empty value must match it: naming the other platform
+                  is refused with InvalidSpec rather than silently ignored.
                 enum:
                 - vcd
                 - vsphere
@@ -393,6 +662,10 @@ spec:
                       many is refused; writing off a slot whose VM is already gone takes
                       nothing out of service and is never refused by the floor. It defaults to
                       1: emptying the pool has to be asked for with minReplicas: 0.
+
+                      No omitempty: 0 is a meaningful floor ("the pool may be emptied"), and a
+                      field dropped from the payload would come back as the default 1 on the
+                      next write.
                     format: int32
                     minimum: 0
                     type: integer
@@ -408,24 +681,18 @@ spec:
                       bypassed. Set this where a PDB must never be overridden and a human
                       should decide.
                     type: boolean
+                required:
+                - minReplicas
                 type: object
               vcd:
                 description: |-
-                  VCD points at the target vCloud Director objects. Required when
-                  spec.provider is vcd (the default), ignored otherwise.
+                  VCD points at the target vCloud Director objects. Required on a vcd
+                  installation, ignored otherwise.
                 properties:
                   catalog:
                     type: string
                   catalogOrg:
                     type: string
-                  dvmOffset:
-                    description: |-
-                      DVMOffset is the address offset of the deployment VM, the bootstrap
-                      host Terraform creates. The controller reserves that address so no
-                      worker is ever handed it. It lives here rather than in spec.ipPlan
-                      because only the vCD bootstrap has a DVM; the address plan itself is
-                      provider-neutral.
-                    type: integer
                   org:
                     type: string
                   orgNetwork:
@@ -440,60 +707,234 @@ spec:
                 - vapp
                 - vdc
                 type: object
+              vsphere:
+                description: |-
+                  VSphere points at the vSphere objects one pool lives in. Required when
+                  spec.provider is vsphere, ignored otherwise.
+                properties:
+                  cluster:
+                    description: |-
+                      Cluster is the compute cluster the pool runs in. Its hosts are the
+                      capacity of the pool: a worker is never placed on a host of another
+                      cluster.
+                    type: string
+                  datacenter:
+                    description: |-
+                      Datacenter is the vCenter datacenter, e.g. MSK_Dev_DC. It is required:
+                      the datacenter is part of where this pool lives, like the cluster and the
+                      datastore, so it is read from the pool and never from the controller
+                      configuration. There is deliberately no process-wide fallback, because
+                      two places to name it is two places to disagree.
+                    type: string
+                  datastore:
+                    description: |-
+                      Datastore holds the worker disks and is the storage the capacity
+                      pre-flight reads.
+                    type: string
+                  folder:
+                    description: |-
+                      Folder is where the VMs of the pool are created. It must be at or
+                      below the controller root (VSPHERE_FOLDER_ROOT) when that is set,
+                      which keeps a pool inside the boundary vCenter grants it.
+                    type: string
+                  host:
+                    description: |-
+                      Host pins every worker of the pool to one ESXi host of Cluster, by
+                      name or inventory path. Empty lets vCenter place each clone within the
+                      cluster, which is the normal case.
+
+                      A lab can require it: where each host has its own switch and the
+                      worker port group exists on only one of them, vCenter's own placement
+                      can put the clone on a host that cannot power it on ("No host is
+                      compatible with the virtual machine"). The host is then part of
+                      placement, exactly like the datastore and the network, so it is named
+                      in the pool - the same host the Terraform tfvars names in
+                      vsphere.esxi_host_name - and never in the controller's environment.
+                      A host that does not belong to Cluster is refused.
+                    type: string
+                  network:
+                    description: |-
+                      Network is the port group the worker NIC is attached to. The guest
+                      address comes from spec.ipPlan.cidr; the interface name and the
+                      resolvers come from spec.bootstrap.nicName and spec.bootstrap.dns, so
+                      there is one place to change them.
+                    type: string
+                  resourcePool:
+                    description: |-
+                      ResourcePool is the resource pool inside the cluster. Empty means the
+                      root resource pool of the cluster.
+                    type: string
+                required:
+                - cluster
+                - datacenter
+                - datastore
+                - folder
+                - network
+                type: object
             required:
             - flavor
             - ipPlan
             - namePrefix
             - replicas
             type: object
+            x-kubernetes-validations:
+            - message: 'spec.replicas cannot exceed spec.ipPlan.nodeCount: the pool''s
+                ip range has no address for the extra workers (raise nodeCount or
+                lower replicas)'
+              rule: self.replicas <= self.ipPlan.nodeCount
           status:
             description: K8sWorkerPoolStatus is the observed state.
             properties:
               capacity:
                 description: |-
-                  Capacity is the platform's own view of the vDC the pool lives in: what is used and what the vDC caps, plus the pod subnet budget. It is a snapshot, taken when a scale operation completed and refreshed on a slow timer.
+                  Capacity is the platform's own view of the vDC the pool lives in: what
+                  is used and what the vDC caps, plus the pod subnet budget. The page
+                  cannot ask vCD, and the controller is the only thing that talks to the
+                  platform, so the numbers are published here. A nil Capacity means no
+                  snapshot was taken yet.
                 properties:
                   at:
+                    description: At is when the snapshot was taken.
                     format: date-time
+                    type: string
+                  cluster:
                     type: string
                   cpuLimitMHz:
                     format: int64
                     type: integer
                   cpuMHz:
+                    description: CPUMHz is what vCD counts as used and the ceiling
+                      it enforces.
                     format: int64
                     type: integer
+                  cpuMHzPerCore:
+                    format: int64
+                    type: integer
+                  cpuPerCore:
+                    description: |-
+                      CPUPerCore is the overcommit assumption the pre-flight is using, and
+                      CPUMHzPerCore the core speed it charges a vCPU at. They are published so
+                      the page explains the same arithmetic the gate applies, instead of
+                      guessing it.
+                    format: int32
+                    type: integer
+                  datacenter:
+                    description: |-
+                      Datacenter and Cluster name the scope the numbers above are read from,
+                      where the platform has one. On vSphere it is the compute cluster: its
+                      hosts are the compute a pool may use and its datastores are the storage,
+                      not the datacenter's. Empty on vCD, whose scope is the whole vDC.
+                    type: string
+                  datastores:
+                    description: |-
+                      Datastores is the storage the scope makes available, one entry per
+                      datastore, the pool's own marked Default. It answers "what else is
+                      there" next to the single bar, which can only show the one a worker is
+                      written to.
+                    items:
+                      description: |-
+                        DatastoreCapacity is one datastore of the scope, in the same units as the
+                        storage bar: what it holds and what is already written to it.
+                      properties:
+                        capacityMB:
+                          format: int64
+                          type: integer
+                        default:
+                          description: |-
+                            Default marks the datastore the pool names in spec.vsphere.datastore:
+                            the one a clone is written to.
+                          type: boolean
+                        name:
+                          type: string
+                        usedMB:
+                          format: int64
+                          type: integer
+                      required:
+                      - name
+                      type: object
+                    type: array
                   memoryLimitMB:
                     format: int64
                     type: integer
                   memoryMB:
+                    description: MemoryMB is the same pair for memory.
                     format: int64
                     type: integer
                   model:
+                    description: Model is the vDC allocation model, informational.
                     type: string
                   observedReplicas:
+                    description: |-
+                      ObservedReplicas is the pool size the snapshot was taken at, which is
+                      what makes "refresh after a scale completed" decidable.
                     format: int32
                     type: integer
+                  ourCPU_MHz:
+                    description: |-
+                      OurCPUMHz and OurMemoryMB are what this pool's own workers are measured to
+                      consume, split out of the totals above. Together with the totals they give
+                      the neighbours' load (total - ours), which is what the pool's entitlement is
+                      measured against: a pool may only grow while its workers' standing charge
+                      plus the neighbours' measured draw still fit the platform.
+                    format: int64
+                    type: integer
+                  ourMemoryMB:
+                    format: int64
+                    type: integer
+                  perVMUsage:
+                    description: |-
+                      PerVMUsage says OurCPUMHz and OurMemoryMB were reported, so a reader can
+                      separate this pool's draw from the neighbours' load instead of treating the
+                      whole total as somebody else's.
+                    type: boolean
+                  physical:
+                    description: |-
+                      Physical says the CPU and memory numbers above are the physical capacity
+                      of the hosts (vSphere), not a quota the platform enforces (vCD). Only a
+                      physical number may be overcommitted; the page offers the assumption only
+                      when this is true.
+                    type: boolean
                   podBlockSize:
+                    description: |-
+                      PodBlockSize and PodUsablePerBlock describe the CNI's block: a /26 is 64
+                      addresses of which Calico keeps one, so 63 pods fit in a block.
                     format: int32
                     type: integer
                   podBlocks:
+                    description: |-
+                      PodBlocks and PodBlocksUsed are the CNI's own view: a range can have
+                      addresses left and still have no block to hand out.
                     format: int32
                     type: integer
                   podBlocksUsed:
                     format: int32
                     type: integer
                   podCIDR:
+                    description: |-
+                      PodCIDR is the cluster's pod network. Its address count sized against
+                      the per-node allowance (110 pods, the kubelet default) is what decides
+                      whether another node can be added at all.
                     type: string
                   podIPs:
+                    description: PodIPs is how many addresses the pod network holds.
                     format: int64
                     type: integer
                   podMaxPerNode:
+                    description: |-
+                      PodMaxPerNode is the fullest block in the pool: what the nodes carry
+                      today, which is what the low-density reading is sized from.
                     format: int32
                     type: integer
                   podNodes:
+                    description: |-
+                      PodNodes is every node of the cluster, masters included: they run pods
+                      and cost the same slice.
                     format: int32
                     type: integer
                   podRemainingNodes:
+                    description: |-
+                      PodRemainingNodes is how many more nodes the range can carry:
+                      (PodIPs - PodNodes*110) / 110, floored at zero.
                     format: int32
                     type: integer
                   podUsablePerBlock:
@@ -506,6 +947,9 @@ spec:
                     format: int64
                     type: integer
                   storageName:
+                    description: |-
+                      Storage names the storage profile the numbers belong to, so a bar is
+                      never a sum of profiles with different limits.
                     type: string
                 type: object
               conditions:
@@ -615,11 +1059,14 @@ spec:
                             spec.flavor.disks on every pass, so raising one is a rollout like any
                             other compute change and a reduction is a recreate.
                           items:
+                            description: DiskStatus is one data disk of a worker,
+                              as the platform reports it.
                             properties:
                               busNumber:
                                 description: |-
                                   BusNumber and UnitNumber address the disk on its controller. Both are
-                                  needed: the provider matches a spec disk to a platform disk by the pair.
+                                  needed: the provider matches a spec disk to a platform disk by the pair,
+                                  and a missing bus number silently matches nothing.
                                 format: int32
                                 type: integer
                               sizeGB:
@@ -629,6 +1076,7 @@ spec:
                                 format: int32
                                 type: integer
                             required:
+                            - busNumber
                             - sizeGB
                             - unitNumber
                             type: object
@@ -782,11 +1230,14 @@ spec:
                           spec.flavor.disks on every pass, so raising one is a rollout like any
                           other compute change and a reduction is a recreate.
                         items:
+                          description: DiskStatus is one data disk of a worker, as
+                            the platform reports it.
                           properties:
                             busNumber:
                               description: |-
                                 BusNumber and UnitNumber address the disk on its controller. Both are
-                                needed: the provider matches a spec disk to a platform disk by the pair.
+                                needed: the provider matches a spec disk to a platform disk by the pair,
+                                and a missing bus number silently matches nothing.
                               format: int32
                               type: integer
                             sizeGB:
@@ -796,6 +1247,7 @@ spec:
                               format: int32
                               type: integer
                           required:
+                          - busNumber
                           - sizeGB
                           - unitNumber
                           type: object

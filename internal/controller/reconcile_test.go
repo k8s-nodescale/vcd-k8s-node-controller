@@ -42,6 +42,10 @@ type fakeCloud struct {
 	calls           int
 	failAt          int
 	failAfterCreate bool
+	// noConsume keeps a created VM out of the fake capacity, the way a platform
+	// that reports measured host usage behaves: a worker created a moment ago has
+	// not moved the number yet.
+	noConsume bool
 }
 
 // For makes the fake a cloud.Factory: one fake serves every pool, whatever
@@ -98,7 +102,9 @@ func (f *fakeCloud) CreateVM(ctx context.Context, spec cloud.CreateVMSpec) (clou
 	}
 	f.vms = append(f.vms, vm)
 	f.created = append(f.created, spec)
-	f.consume(spec)
+	if !f.noConsume {
+		f.consume(spec)
+	}
 	return vm, nil
 }
 
@@ -357,7 +363,7 @@ func testPool(replicas int32) *infrav1.K8sWorkerPool {
 	return &infrav1.K8sWorkerPool{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       "default",
-			Namespace:  "vcd-nodescale-system",
+			Namespace:  "nodescale-system",
 			Generation: 1,
 		},
 		Spec: infrav1.K8sWorkerPoolSpec{
@@ -378,11 +384,12 @@ func testPool(replicas int32) *infrav1.K8sWorkerPool {
 			},
 			VCD: &infrav1.VCDRef{
 				Org: "myorg", VDC: "My-VDC", VApp: "vapp",
-				OrgNetwork: "net", Catalog: "Templates", DVMOffset: -3,
+				OrgNetwork: "net", Catalog: "Templates",
 			},
 			IPPlan: infrav1.IPPlan{
 				CIDR: "192.168.100.0/24", MNodeOffset: 4, WNodeOffset: 7,
-				KubeAPILB: 2, IngressLB: 3, MasterCount: 3, NodeCount: 200,
+				KubeAPILB: 2, IngressLB: 3, DVMOffset: -3,
+				MasterCount: 3, NodeCount: 200,
 			},
 			Join: infrav1.JoinConfig{
 				Endpoint: "192.168.100.2:6443",

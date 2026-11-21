@@ -1,0 +1,61 @@
+# A pool on a vSphere installation (platform: vsphere).
+#
+# This object describes a worker set that already exists, so the first apply is
+# a handover, not a scale-up: `replicas` is the current worker count, and
+# `namePrefix` / `folder` / `ipPlan` must reproduce what is already running.
+# The README section "Writing a K8sWorkerPool for an existing cluster" explains
+# where every value can be read.
+apiVersion: k8s-nodescale.github.io/v1alpha1
+kind: K8sWorkerPool
+metadata:
+  name: example-cluster
+spec:
+  replicas: 3
+  namePrefix: example-cluster        # nodes are <prefix>-wrk-NN
+  provider: vsphere                  # optional: empty means the installation's platform
+  vsphere:
+    datacenter: EXAMPLE-DC           # required; no process-wide fallback
+    cluster: example-cluster         # the compute cluster; the host below is the capacity
+    folder: /EXAMPLE-DC/vm/k8s
+    datastore: EXAMPLE-DATASTORE
+    network: EXAMPLE-PORTGROUP
+    # resourcePool: ""               # empty means the cluster's root pool
+  bootstrap:
+    osUser: ubuntu
+    nicName: ens192
+    dns:
+      - 192.0.2.53
+      - 192.0.2.54
+    k8sVersion: "1.28.15-1.1"
+    k8sMinorRepo: "v1.28"
+  flavor:
+    template: ubuntu-24.04-k8s-template
+    cpus: 8
+    memoryMB: 4096
+    osDiskGB: 40
+    disks:                           # bus/unit must match the image's controllers
+      - sizeGB: 60
+        mount: /var/lib
+        busType: paravirtual
+        busNumber: 0
+        unitNumber: 1
+  ipPlan:
+    cidr: 192.168.100.0/24
+    vmIPOffset: 0                    # the range starts at the prefix; set a skip when one is needed
+    dvmOffset: 2                     # .2
+    kubeapiLB: 3                     # .3
+    lbNodeOffset: 5                  # .5
+    lbNodeCount: 2                   # .5-.6
+    mNodeOffset: 7                   # .7
+    masterCount: 3                   # .7-.9
+    wNodeOffset: 10                  # .10
+    nodeCount: 10                    # .10-.19
+    # reserved: ["192.168.100.200"]
+  join:
+    endpoint: 192.168.100.3:6443
+    tokenTTL: 1h
+    labels:
+      node-role.kubernetes.io/worker: ""
+  scaleDown:
+    minReplicas: 1
+    drainTimeout: 10m

@@ -1,6 +1,7 @@
 package mgmt
 
 import (
+	"context"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -34,6 +35,9 @@ type Server struct {
 	// default. Everything the server answers lives under it, so the ingress
 	// needs no rewrite.
 	PathPrefix string
+	// Release is the version the page prints in its header, injected into the
+	// HTML at serve time. Empty means "dev".
+	Release string
 
 	// cluster is the kubeadm cluster name, read once.
 	clusterOnce sync.Once
@@ -70,6 +74,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST "+p+"/api/pools/{name}/flavor", s.postFlavor)
 	mux.HandleFunc("POST "+p+"/api/pools/{name}/delete-workers", s.postDeleteWorkers)
 	mux.HandleFunc("POST "+p+"/api/pools/{name}/disks", s.postDisks)
+	mux.HandleFunc("POST "+p+"/api/pools/{name}/cpu-per-core", s.postCPUPerCore)
+	mux.HandleFunc("POST "+p+"/api/pools/{name}/refresh-capacity", s.postRefreshCapacity)
+	mux.HandleFunc("POST "+p+"/api/pools/{name}/preflight", s.postPreflight)
 	if p != "" {
 		mux.HandleFunc("GET "+p, func(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, p+"/", http.StatusFound)
@@ -103,7 +110,12 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	out := strings.Replace(string(page), "__PREFIX__", s.prefix(), 1)
+	out := strings.ReplaceAll(string(page), "__PREFIX__", s.prefix())
+	release := s.Release
+	if release == "" {
+		release = "dev"
+	}
+	out = strings.ReplaceAll(out, "__VERSION__", html.EscapeString(release))
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -212,6 +224,7 @@ func (s *Server) postReplicas(w http.ResponseWriter, r *http.Request) {
 		writeError(w, statusFor(err), err)
 		return
 	}
+	s.collectNow(r.Context())
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "replicas": body.Replicas})
 }
 
@@ -225,6 +238,7 @@ func (s *Server) postFlavor(w http.ResponseWriter, r *http.Request) {
 		writeError(w, statusFor(err), err)
 		return
 	}
+	s.collectNow(r.Context())
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -241,7 +255,47 @@ func (s *Server) postDisks(w http.ResponseWriter, r *http.Request) {
 		writeError(w, statusFor(err), err)
 		return
 	}
+	s.collectNow(r.Context())
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) postCPUPerCore(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		CPUPerCore int32 `json:"cpuPerCore"`
+	}
+	if err := decode(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := s.SetCPUPerCore(r.Context(), r.PathValue("name"), body.CPUPerCore); err != nil {
+		writeError(w, statusFor(err), err)
+		return
+	}
+	s.collectNow(r.Context())
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "cpuPerCore": body.CPUPerCore})
+}
+
+func (s *Server) postRefreshCapacity(w http.ResponseWriter, r *http.Request) {
+	if err := s.RefreshCapacity(r.Context(), r.PathValue("name")); err != nil {
+		writeError(w, statusFor(err), err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) postPreflight(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := decode(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := s.SetPreflight(r.Context(), r.PathValue("name"), body.Enabled); err != nil {
+		writeError(w, statusFor(err), err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "enabled": body.Enabled})
 }
 
 func (s *Server) postDeleteWorkers(w http.ResponseWriter, r *http.Request) {
@@ -256,7 +310,22 @@ func (s *Server) postDeleteWorkers(w http.ResponseWriter, r *http.Request) {
 		writeError(w, statusFor(err), err)
 		return
 	}
+	s.collectNow(r.Context())
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// collectNow refreshes the cached snapshot after a write. Without it the page
+// that made the change gets the collector's previous pass back on the refresh it
+// does immediately afterwards - up to a full collector period (15s) of "my click
+// did nothing", which is exactly how the CPU assumption switch looked broken
+// (2026-11-20). The collection is cheap next to a round trip to the cluster.
+func (s *Server) collectNow(ctx context.Context) {
+	if s.Collector == nil {
+		return
+	}
+	if _, err := s.Collector.CollectOnce(ctx); err != nil {
+		logf("collection after a write failed: %v", err)
+	}
 }
 
 // statusFor maps an API error onto the status the page shows.

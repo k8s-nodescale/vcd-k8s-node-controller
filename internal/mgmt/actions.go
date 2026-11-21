@@ -9,6 +9,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	infrav1 "github.com/k8s-nodescale/vcd-k8s-node-controller/api/v1alpha1"
 )
@@ -130,13 +131,36 @@ func (s *Server) DeleteWorkers(ctx context.Context, name string, workers []strin
 		return fmt.Errorf("%w: no worker named", ErrInvalid)
 	}
 	action := "delete=" + strings.Join(workers, ",")
-	return s.update(ctx, name, action, func(p *infrav1.K8sWorkerPool) error {
+	return s.updateUnlessBusy(ctx, name, action, func(p *infrav1.K8sWorkerPool) bool {
+		// Only workers that cannot be serving: a Ready one is a member of the
+		// pool and removing it spends the drain budget, so it keeps the lock.
+		return removableWhileBusy(p.Status.Nodes, workers)
+	}, func(p *infrav1.K8sWorkerPool) error {
 		for _, w := range workers {
 			if w == "" || containsName(p.Spec.ScaleDown.DeleteWorkers, w) {
 				continue
 			}
 			p.Spec.ScaleDown.DeleteWorkers = append(p.Spec.ScaleDown.DeleteWorkers, w)
 		}
+		return nil
+	})
+}
+
+// SetCPUPerCore records how many vCPUs the pre-flight lets one physical core
+// carry. It changes only the admission check: no worker is resized, none is
+// removed, and a worker parked as Queued starts on the next pass if the new
+// assumption now fits it.
+//
+// The range is the field's own (1..8). A platform that reports a quota instead
+// of physical capacity ignores the value, and the controller is the only place
+// that decides which is which, so a write here is never refused for it.
+func (s *Server) SetCPUPerCore(ctx context.Context, name string, perCore int32) error {
+	if perCore < 1 || perCore > 8 {
+		return fmt.Errorf("%w: cpuPerCore must be between 1 and 8", ErrInvalid)
+	}
+	return s.update(ctx, name, fmt.Sprintf("cpuPerCore=%d", perCore), func(p *infrav1.K8sWorkerPool) error {
+		v := perCore
+		p.Spec.Capacity.CPUPerCore = &v
 		return nil
 	})
 }
@@ -153,6 +177,17 @@ func containsName(list []string, name string) bool {
 // update reads, mutates and writes one pool, retrying a lost race with the
 // controller's own status writes instead of failing the operator's click.
 func (s *Server) update(ctx context.Context, name, action string, mutate func(*infrav1.K8sWorkerPool) error) error {
+	return s.updateUnlessBusy(ctx, name, action, nil, mutate)
+}
+
+// updateUnlessBusy is update with a caller-decided exemption from the
+// one-operation-at-a-time rule. It exists for removing a worker that is not
+// serving: that takes a slot away rather than a member of the pool out of
+// service, so it spends no drain budget and must stay possible while another
+// operation is in flight - which is exactly when an operator needs it. A worker
+// stuck in Provisioning used to lock every control, including the delete that
+// would have freed it (2026-11-20).
+func (s *Server) updateUnlessBusy(ctx context.Context, name, action string, exempt func(*infrav1.K8sWorkerPool) bool, mutate func(*infrav1.K8sWorkerPool) error) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		p := &infrav1.K8sWorkerPool{}
 		if err := s.Client.Get(ctx, types.NamespacedName{Name: name}, p); err != nil {
@@ -160,12 +195,21 @@ func (s *Server) update(ctx context.Context, name, action string, mutate func(*i
 		}
 		// One operation at a time: a resize, a scale and a removal all drain
 		// the same workers and share the same budget.
-		if why := busyReason(p); why != "" {
+		if why := busyReason(p); why != "" && !(exempt != nil && exempt(p)) {
 			return fmt.Errorf("%w: an operation is already in progress: %s", ErrInvalid, why)
 		}
+		before := p.DeepCopy()
 		if err := mutate(p); err != nil {
 			return err
 		}
+		// Any action asks for fresh numbers: the snapshot the page shows is up to
+		// capacityStatusTTL old, and what the operator just changed is exactly what
+		// they want to see reflected. It also means "set replicas" cannot leave the
+		// pane a TTL behind the decision the controller just made.
+		if p.Annotations == nil {
+			p.Annotations = map[string]string{}
+		}
+		p.Annotations[infrav1.CapacityRefreshAnnotation] = time.Now().UTC().Format(time.RFC3339)
 		if actor, ok := actorFrom(ctx); ok && actor.Username != "" {
 			if p.Annotations == nil {
 				p.Annotations = map[string]string{}
@@ -173,6 +217,67 @@ func (s *Server) update(ctx context.Context, name, action string, mutate func(*i
 			p.Annotations[lastActionAnnotation] = fmt.Sprintf("%s (%s) %s at %s",
 				actor.Username, actor.Role, action, time.Now().UTC().Format(time.RFC3339))
 		}
-		return s.Client.Update(ctx, p)
+		// A merge patch carries only what changed. A full Update re-serialises
+		// the whole object, and a zero value behind `omitempty` vanishes: a pool
+		// with spec.scaleDown.minReplicas: 0 came back with the CRD default (1)
+		// after any click, and that is InvalidSpec the moment allowLastWorker is
+		// set (found live on 2026-11-20). A narrow patch also stops a click from
+		// overwriting a spec field somebody else changed meanwhile.
+		return s.Client.Patch(ctx, p, client.MergeFrom(before))
+	})
+}
+
+// removableWhileBusy reports whether every named worker may be removed while
+// another operation is in flight. An unknown name qualifies: the controller drops
+// it with a warning event.
+//
+// Provisioning and Joining are deliberately excluded: both are a worker in
+// flight, both are bounded by spec.provisioning.timeout (a VM without a Node, and
+// a Node that never becomes Ready), and deleting a half-finished create from under
+// the controller is not something a stray click should do. Failed, Missing and
+// Queued are the states those budgets end in, so they are the way out of a worker
+// that never came up.
+func removableWhileBusy(nodes []infrav1.WorkerNodeStatus, names []string) bool {
+	for _, name := range names {
+		for i := range nodes {
+			if !strings.EqualFold(nodes[i].Name, name) {
+				continue
+			}
+			switch nodes[i].Phase {
+			case infrav1.NodePhaseQueued, infrav1.NodePhaseFailed,
+				infrav1.NodePhaseMissing, infrav1.NodePhaseDeleting:
+			default:
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// RefreshCapacity asks the controller for a fresh capacity snapshot: the page
+// writes an annotation the controller compares with the snapshot's own time. It
+// is exempt from the one-operation-at-a-time rule - reading capacity harms
+// nothing, and a running operation is when the numbers are wanted most.
+func (s *Server) RefreshCapacity(ctx context.Context, name string) error {
+	return s.updateUnlessBusy(ctx, name, "refresh-capacity",
+		func(*infrav1.K8sWorkerPool) bool { return true },
+		func(p *infrav1.K8sWorkerPool) error {
+			if p.Annotations == nil {
+				p.Annotations = map[string]string{}
+			}
+			p.Annotations[infrav1.CapacityRefreshAnnotation] = time.Now().UTC().Format(time.RFC3339)
+			return nil
+		})
+}
+
+// SetPreflight turns the capacity planner on or off. Off means the controller
+// neither reads the platform's capacity nor parks a worker that does not fit, and
+// takes no snapshot - the owner plans the resources by themselves, which the page
+// says instead of showing numbers it no longer refreshes.
+func (s *Server) SetPreflight(ctx context.Context, name string, enabled bool) error {
+	return s.update(ctx, name, fmt.Sprintf("preflight=%t", enabled), func(p *infrav1.K8sWorkerPool) error {
+		v := enabled
+		p.Spec.Capacity.Preflight = &v
+		return nil
 	})
 }

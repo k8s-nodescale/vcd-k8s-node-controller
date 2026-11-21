@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -9,6 +10,7 @@ import (
 
 	infrav1 "github.com/k8s-nodescale/vcd-k8s-node-controller/api/v1alpha1"
 	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/cloud"
+	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/kube"
 )
 
 // backdateProvisioning rewinds the watchdog clock of one worker, so a test can
@@ -130,5 +132,39 @@ func TestProvisioningWatchdogFallsBackToTheDefaultTimeout(t *testing.T) {
 
 	if n := nodeByName(getPool(t, r, pool), "pool-wrk-01"); n.Phase != infrav1.NodePhaseFailed {
 		t.Fatalf("phase = %s, want Failed from the 15m default", n.Phase)
+	}
+}
+
+// A Node that registers and never becomes Ready has no timer of its own, and from
+// 2026-11-20 a converging worker is not deletable from the page either. Without a
+// budget that state could never end.
+func TestJoiningWorkerIsFailedWhenItNeverBecomesReady(t *testing.T) {
+	pool := testPool(1)
+	pool.Spec.Provisioning = infrav1.ProvisioningPolicy{Timeout: metav1.Duration{Duration: 15 * time.Minute}}
+	fc := &fakeCloud{vms: []cloud.VM{workerVM(1, "192.168.100.7")}}
+	fk := &fakeKube{nodes: []kube.NodeInfo{{
+		Name: "pool-wrk-01", Ready: false, CPU: 2000, MemoryBytes: 4 << 30,
+	}}}
+	r := newTestReconciler(t, fc, fk, pool)
+
+	reconcileOnce(t, r, pool)
+	n := nodeByName(getPool(t, r, pool), "pool-wrk-01")
+	if n == nil || n.Phase != infrav1.NodePhaseJoining {
+		t.Fatalf("worker = %#v, want Joining (the Node exists, not Ready)", n)
+	}
+
+	backdateProvisioning(t, r, pool, "pool-wrk-01", 20*time.Minute)
+	reconcileOnce(t, r, pool)
+
+	got := getPool(t, r, pool)
+	n = nodeByName(got, "pool-wrk-01")
+	if n == nil || n.Phase != infrav1.NodePhaseFailed {
+		t.Fatalf("worker = %#v, want Failed after the budget", n)
+	}
+	if !strings.Contains(n.Message, "not Ready") {
+		t.Fatalf("message = %q, want it to say the Node never became Ready", n.Message)
+	}
+	if len(fc.deleted) != 0 {
+		t.Fatalf("deleted %v, the watchdog must keep the VM", fc.deleted)
 	}
 }

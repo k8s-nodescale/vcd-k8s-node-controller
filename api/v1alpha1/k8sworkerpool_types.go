@@ -77,7 +77,18 @@ const (
 	RolloutPhaseQueued = "Queued"
 )
 
+// CapacityRefreshAnnotation is set by the management page to ask for a fresh
+// capacity snapshot. The controller compares it with the snapshot's own time and
+// re-reads the platform once; it is not a spec field because it is a request, not
+// a desired state.
+const CapacityRefreshAnnotation = "k8s-nodescale.github.io/capacity-refresh-at"
+
 // K8sWorkerPoolSpec defines the desired worker pool.
+//
+// The address window is a hard ceiling, unlike the capacity estimate: a worker
+// beyond it has no address to be given, and the controller can only fail trying.
+// The rule is here rather than in the UI so kubectl is held to it too.
+// +kubebuilder:validation:XValidation:rule="self.replicas <= self.ipPlan.nodeCount",message="spec.replicas cannot exceed spec.ipPlan.nodeCount: the pool's ip range has no address for the extra workers (raise nodeCount or lower replicas)"
 type K8sWorkerPoolSpec struct {
 	// Replicas is the desired number of worker nodes.
 	// +kubebuilder:validation:Minimum=0
@@ -94,18 +105,24 @@ type K8sWorkerPoolSpec struct {
 	// resize candidate (see spec.rollout).
 	Flavor NodeFlavor `json:"flavor"`
 
-	// Provider selects the platform that runs this pool's workers: vcd (the
-	// default) or vsphere. The platform block that matches it is required;
-	// the others are ignored.
+	// Provider names the platform that runs this pool's workers: vcd or
+	// vsphere. It is optional, and empty means the platform this controller
+	// installation serves - the normal case, because one installation serves
+	// one platform. A non-empty value must match it: naming the other platform
+	// is refused with InvalidSpec rather than silently ignored.
 	// +kubebuilder:validation:Enum=vcd;vsphere
-	// +kubebuilder:default=vcd
 	// +optional
 	Provider string `json:"provider,omitempty"`
 
-	// VCD points at the target vCloud Director objects. Required when
-	// spec.provider is vcd (the default), ignored otherwise.
+	// VCD points at the target vCloud Director objects. Required on a vcd
+	// installation, ignored otherwise.
 	// +optional
 	VCD *VCDRef `json:"vcd,omitempty"`
+
+	// VSphere points at the vSphere objects one pool lives in. Required when
+	// spec.provider is vsphere, ignored otherwise.
+	// +optional
+	VSphere *VSphereRef `json:"vsphere,omitempty"`
 
 	// IPPlan mirrors the Terraform ip_plan variable so the controller
 	// never collides with Terraform-managed infrastructure or reserved VIPs.
@@ -166,6 +183,25 @@ type CapacityPolicy struct {
 	// +kubebuilder:default=2000
 	// +optional
 	CPUMHzPerCore int64 `json:"cpuMhzPerCore,omitempty"`
+
+	// CPUPerCore is how many vCPUs the pre-flight lets one physical core carry,
+	// where the platform reports physical capacity (vSphere: the hosts of the
+	// pool's compute cluster). That number is a capacity the owner may choose to
+	// overcommit, and this field is that choice: 1 charges a worker its whole
+	// vCPU count in core speed, 2 charges half of it, and so on. It is ignored
+	// where the platform reports a quota instead (vCD), because dividing a quota
+	// would admit a request the platform then refuses - the failure the
+	// pre-flight exists to prevent.
+	//
+	// It changes only when a create is considered to fit. It never changes the
+	// size of a worker, never evicts one, and lowering it while workers are
+	// Queued simply leaves them queued. An unset value is 1, which is the
+	// pre-flight as it behaved before the field existed.
+	// +kubebuilder:default=1
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=8
+	// +optional
+	CPUPerCore *int32 `json:"cpuPerCore,omitempty"`
 }
 
 // ProvisioningPolicy bounds how long a created VM may run without its Node.
@@ -238,13 +274,153 @@ type RolloutPolicy struct {
 
 // BootstrapConfig carries the OS-level inputs for generated cloud-init.
 type BootstrapConfig struct {
-	OSUser           string   `json:"osUser,omitempty"`
-	OSPasswordHash   string   `json:"osPasswordHash,omitempty"`
-	SSHAuthorizedKey string   `json:"sshAuthorizedKey,omitempty"`
-	NICName          string   `json:"nicName,omitempty"`
-	DNS              []string `json:"dns,omitempty"`
-	K8sVersion       string   `json:"k8sVersion,omitempty"`
-	K8sMinorRepo     string   `json:"k8sMinorRepo,omitempty"`
+	OSUser           string `json:"osUser,omitempty"`
+	OSPasswordHash   string `json:"osPasswordHash,omitempty"`
+	SSHAuthorizedKey string `json:"sshAuthorizedKey,omitempty"`
+
+	// SSHAuthorizedKeysRef names a ConfigMap or Secret key holding public
+	// keys, one per line. They are added to the inline sshAuthorizedKey, so an
+	// operator can rotate a key in the store without editing the pool object;
+	// blank lines and lines starting with # are ignored. The keys still travel
+	// in the guest user-data (that is how cloud-init installs them), so this
+	// keeps them out of a widely readable CR, not off the VM.
+	// +optional
+	SSHAuthorizedKeysRef *ConfigKeyRef `json:"sshAuthorizedKeysRef,omitempty"`
+
+	// SSHAllowedSources are extra sshd AllowUsers patterns the worker admits,
+	// e.g. "*@10.99.96.64/26". The images ship a restrictive AllowUsers line
+	// (the Terraform baseline appends the same values from allowed_ssh_ips); a
+	// worker that omits this list keeps the image's list, which may not include
+	// the operator's network.
+	// +optional
+	SSHAllowedSources []string `json:"sshAllowedSources,omitempty"`
+
+	// NTPServers are the chrony sources written into the guest, each as
+	// "server <host> iburst". Empty keeps the image's own configuration: the
+	// Terraform baseline sets the same list per cluster (ntp.servers), so a
+	// worker built by the controller should not silently use another source.
+	// +optional
+	NTPServers []string `json:"ntpServers,omitempty"`
+
+	// CABundleRef names a ConfigMap or Secret key holding the PEM bundle to
+	// trust in the guest. The bundle is usually environment policy shared by
+	// every pool, so it is not a literal in the CR: an installation-wide
+	// default lives in the bootstrap ConfigMap the chart renders, and this
+	// field only overrides it for one pool.
+	// +optional
+	CABundleRef *ConfigKeyRef `json:"caBundleRef,omitempty"`
+
+	// Sysctls are additional kernel parameters written to
+	// /etc/sysctl.d/99-zzz-nodescale.conf (later files win, so a pool value
+	// overrides the image's). The Kubernetes-required ones (bridge-nf-call,
+	// ip_forward) are always written and do not belong here.
+	// +optional
+	Sysctls map[string]string `json:"sysctls,omitempty"`
+
+	// KernelModules are loaded and persisted in
+	// /etc/modules-load.d/nodescale.conf before the sysctls are applied: a
+	// conntrack parameter silently does nothing without its module.
+	// +optional
+	KernelModules []string `json:"kernelModules,omitempty"`
+
+	// Containerd carries the site-specific part of the container runtime
+	// configuration. The controller generates the rest from the containerd
+	// binary installed in the guest, so a worker does not depend on the image
+	// shipping a prepared /etc/containerd/config.toml.
+	// +optional
+	Containerd *ContainerdConfig `json:"containerd,omitempty"`
+
+	// Apt replaces the image's package sources with the environment's mirror.
+	// The Terraform baseline does the same (apt.sources_list): an image whose
+	// sources point at the public archive cannot install anything on a network
+	// without internet access, and the first apt call fails the boot.
+	// +optional
+	Apt *AptConfig `json:"apt,omitempty"`
+
+	NICName      string   `json:"nicName,omitempty"`
+	DNS          []string `json:"dns,omitempty"`
+	K8sVersion   string   `json:"k8sVersion,omitempty"`
+	K8sMinorRepo string   `json:"k8sMinorRepo,omitempty"`
+}
+
+// ConfigKeyRef names one key of a ConfigMap or a Secret.
+type ConfigKeyRef struct {
+	// Kind is ConfigMap (the default) or Secret. A CA bundle is public and
+	// belongs in a ConfigMap; Secret is accepted for installs that keep all
+	// their configuration in one store.
+	// +kubebuilder:validation:Enum=ConfigMap;Secret
+	// +optional
+	Kind string `json:"kind,omitempty"`
+
+	// Name is the object name.
+	Name string `json:"name"`
+
+	// Namespace defaults to the namespace of the K8sWorkerPool, and to the
+	// controller's own namespace when the pool is cluster-scoped (which it is):
+	// that is where the chart puts the objects an installation shares. A
+	// reference from the installation-wide bootstrap ConfigMap always resolves
+	// in the controller's namespace.
+	// +optional
+	Namespace string `json:"namespace,omitempty"`
+
+	// Key is the data key holding the value.
+	Key string `json:"key"`
+}
+
+// AptConfig is the package-source policy for a worker's guest. Only the mirror
+// is required: the suites and components follow the release and the baseline
+// unless a pool names its own.
+type AptConfig struct {
+	// Mirror is the URI written as the only active apt source, e.g.
+	// https://nexus.example.com/repository/ubuntu-noble. It is used as given:
+	// the path that carries the release name is not guessed. Empty keeps the
+	// image's sources.
+	// +optional
+	Mirror string `json:"mirror,omitempty"`
+
+	// Suites overrides the suites. Empty derives them from the guest's release
+	// codename: <code>, <code>-updates, <code>-backports, <code>-security, the
+	// set the Terraform baseline enables.
+	// +optional
+	Suites []string `json:"suites,omitempty"`
+
+	// Components overrides the components. Empty uses
+	// main universe restricted multiverse.
+	// +optional
+	Components []string `json:"components,omitempty"`
+}
+
+// ContainerdConfig is the environment-specific part of containerd's
+// configuration. Everything else (the full 290-line document) is generated in
+// the guest by `containerd config default`, so it matches the installed
+// version instead of a copy taken from another cluster.
+type ContainerdConfig struct {
+	// SandboxImage is the pause image kubelet asks containerd for. Empty keeps
+	// the binary default.
+	// +optional
+	SandboxImage string `json:"sandboxImage,omitempty"`
+
+	// Mirrors maps a registry host to its endpoint list, e.g.
+	// {"docker.io": ["http://mirror.example.com"]}. Empty means the worker
+	// pulls from the registries directly, which only works where they are
+	// reachable.
+	// +optional
+	Mirrors map[string][]string `json:"mirrors,omitempty"`
+
+	// InsecureSkipVerify disables TLS verification for the mirror endpoints,
+	// matching what the Ansible baseline sets for an http:// mirror. On
+	// containerd 2.x this becomes a per-registry certs.d hosts.toml, where that
+	// version keeps its TLS settings.
+	// +optional
+	InsecureSkipVerify bool `json:"insecureSkipVerify,omitempty"`
+
+	// ConfigRef, when set, is the complete config.toml for this pool: the
+	// controller writes it verbatim and generates nothing. This is the escape
+	// hatch for a site whose runtime configuration cannot be expressed as a
+	// drop-in; it couples the pool to the containerd major version, which is
+	// why it is not the default.
+	// +optional
+	ConfigRef *ConfigKeyRef `json:"configRef,omitempty"`
 }
 
 // NodeFlavor describes a worker VM shape.
@@ -291,32 +467,118 @@ type VCDRef struct {
 	OrgNetwork string `json:"orgNetwork"`
 	Catalog    string `json:"catalog,omitempty"`
 	CatalogOrg string `json:"catalogOrg,omitempty"`
+}
 
-	// DVMOffset is the address offset of the deployment VM, the bootstrap
-	// host Terraform creates. The controller reserves that address so no
-	// worker is ever handed it. It lives here rather than in spec.ipPlan
-	// because only the vCD bootstrap has a DVM; the address plan itself is
-	// provider-neutral.
+// VSphereRef names the vSphere objects and the guest network one pool uses.
+//
+// The capacity pre-flight reads the same two objects the create uses: the
+// compute cluster (the free CPU and memory of its hosts) and the datastore
+// (its free space), so "the platform has room" means "the cluster this pool
+// runs in has room", not "some host in the datacenter has room".
+type VSphereRef struct {
+	// Datacenter is the vCenter datacenter, e.g. MSK_Dev_DC. It is required:
+	// the datacenter is part of where this pool lives, like the cluster and the
+	// datastore, so it is read from the pool and never from the controller
+	// configuration. There is deliberately no process-wide fallback, because
+	// two places to name it is two places to disagree.
+	Datacenter string `json:"datacenter"`
+
+	// Cluster is the compute cluster the pool runs in. Its hosts are the
+	// capacity of the pool: a worker is never placed on a host of another
+	// cluster.
+	Cluster string `json:"cluster"`
+
+	// ResourcePool is the resource pool inside the cluster. Empty means the
+	// root resource pool of the cluster.
 	// +optional
-	DVMOffset int `json:"dvmOffset,omitempty"`
+	ResourcePool string `json:"resourcePool,omitempty"`
+
+	// Folder is where the VMs of the pool are created. It must be at or
+	// below the controller root (VSPHERE_FOLDER_ROOT) when that is set,
+	// which keeps a pool inside the boundary vCenter grants it.
+	Folder string `json:"folder"`
+
+	// Datastore holds the worker disks and is the storage the capacity
+	// pre-flight reads.
+	Datastore string `json:"datastore"`
+
+	// Network is the port group the worker NIC is attached to. The guest
+	// address comes from spec.ipPlan.cidr; the interface name and the
+	// resolvers come from spec.bootstrap.nicName and spec.bootstrap.dns, so
+	// there is one place to change them.
+	Network string `json:"network"`
+
+	// Host pins every worker of the pool to one ESXi host of Cluster, by
+	// name or inventory path. Empty lets vCenter place each clone within the
+	// cluster, which is the normal case.
+	//
+	// A lab can require it: where each host has its own switch and the
+	// worker port group exists on only one of them, vCenter's own placement
+	// can put the clone on a host that cannot power it on ("No host is
+	// compatible with the virtual machine"). The host is then part of
+	// placement, exactly like the datastore and the network, so it is named
+	// in the pool - the same host the Terraform tfvars names in
+	// vsphere.esxi_host_name - and never in the controller's environment.
+	// A host that does not belong to Cluster is refused.
+	// +optional
+	Host string `json:"host,omitempty"`
 }
 
 // IPPlan mirrors Terraform's ip_plan variable. It carries only the
 // provider-neutral address plan.
+//
+// Every offset below is relative to the start of the VM range, and VMIPOffset
+// says where that range starts inside the prefix:
+//
+//	address = prefix + vmIPOffset + offset
+//
+// The gateway (prefix+1) belongs to the subnet rather than to the range, so it
+// is not shifted.
 type IPPlan struct {
-	CIDR        string `json:"cidr"`
-	MNodeOffset int    `json:"mNodeOffset,omitempty"`
-	WNodeOffset int    `json:"wNodeOffset,omitempty"`
-	KubeAPILB   int    `json:"kubeapiLB,omitempty"`
-	IngressLB   int    `json:"ingressLB,omitempty"`
-	MasterCount int32  `json:"masterCount,omitempty"`
+	CIDR string `json:"cidr"`
+
+	// VMIPOffset is Terraform's vm_ip_offset: how many addresses of the
+	// subnet are skipped before the VM range begins. It exists for the case
+	// where the cluster cannot sit at the start of a clean subnet. The
+	// default of 0 keeps a plan that starts at the prefix.
+	// +kubebuilder:default=0
+	// +kubebuilder:validation:Minimum=0
+	VMIPOffset int `json:"vmIPOffset,omitempty"`
+
+	// DVMOffset is the deployment VM (the Terraform bootstrap host) inside
+	// the range. The controller reserves it so no worker is ever handed that
+	// address; a deployment without a DVM leaves it at 0. It moved here from
+	// spec.vcd because the offset belongs to the address plan, not to the
+	// platform.
+	// +optional
+	DVMOffset int `json:"dvmOffset,omitempty"`
+
+	MNodeOffset int `json:"mNodeOffset,omitempty"`
+	WNodeOffset int `json:"wNodeOffset,omitempty"`
+	KubeAPILB   int `json:"kubeapiLB,omitempty"`
+	IngressLB   int `json:"ingressLB,omitempty"`
+
+	// LBNodeOffset is Terraform's lb_node: the first load-balancer VM. The
+	// reference Terraform runs two of them; LBNodeCount says how many.
+	// +optional
+	LBNodeOffset int `json:"lbNodeOffset,omitempty"`
+
+	// LBNodeCount is how many load-balancer VMs follow LBNodeOffset. Zero and
+	// one both mean "only the first": Terraform states the first host and not
+	// the count, so the field exists to say "there are two" without writing a
+	// hand-made reservation for the second.
+	// +kubebuilder:default=0
+	// +kubebuilder:validation:Minimum=0
+	LBNodeCount int32 `json:"lbNodeCount,omitempty"`
+
+	MasterCount int32 `json:"masterCount,omitempty"`
 	// NodeCount is how many worker addresses this pool may take: its window is
-	// wNodeOffset .. wNodeOffset+nodeCount-1. Two pools can share one CIDR as
-	// long as their windows do not overlap, and a pool that outgrows its window
-	// fails instead of borrowing a neighbour's address. The default is
-	// materialised into every pool by the API server, so "not set" is not a
-	// hidden mode and zero is not a sentinel: an operator who needs a larger
-	// pool says so.
+	// vmIPOffset+wNodeOffset .. vmIPOffset+wNodeOffset+nodeCount-1. Two pools
+	// can share one CIDR as long as their windows do not overlap, and a pool
+	// that outgrows its window fails instead of borrowing a neighbour's
+	// address. The default is materialised into every pool by the API server,
+	// so "not set" is not a hidden mode and zero is not a sentinel: an
+	// operator who needs a larger pool says so.
 	// +kubebuilder:default=10
 	// +kubebuilder:validation:Minimum=1
 	NodeCount int32    `json:"nodeCount"`
@@ -361,7 +623,11 @@ type ScaleDownPolicy struct {
 	// 1: emptying the pool has to be asked for with minReplicas: 0.
 	// +kubebuilder:default=1
 	// +kubebuilder:validation:Minimum=0
-	MinReplicas  int32           `json:"minReplicas,omitempty"`
+	//
+	// No omitempty: 0 is a meaningful floor ("the pool may be emptied"), and a
+	// field dropped from the payload would come back as the default 1 on the
+	// next write.
+	MinReplicas  int32           `json:"minReplicas"`
 	DrainTimeout metav1.Duration `json:"drainTimeout,omitempty"`
 
 	// DeleteWorkers names specific workers to remove, in order, regardless of
@@ -447,9 +713,51 @@ type CapacityStatus struct {
 	// +optional
 	StorageName string `json:"storageName,omitempty"`
 	// +optional
-	StorageMB int64 `json:"storageMB,omitempty"`
-	// +optional
+	StorageMB      int64 `json:"storageMB,omitempty"`
 	StorageLimitMB int64 `json:"storageLimitMB,omitempty"`
+
+	// CPUPerCore is the overcommit assumption the pre-flight is using, and
+	// CPUMHzPerCore the core speed it charges a vCPU at. They are published so
+	// the page explains the same arithmetic the gate applies, instead of
+	// guessing it.
+	// +optional
+	CPUPerCore int32 `json:"cpuPerCore,omitempty"`
+	// +optional
+	CPUMHzPerCore int64 `json:"cpuMHzPerCore,omitempty"`
+	// PerVMUsage says OurCPUMHz and OurMemoryMB were reported, so a reader can
+	// separate this pool's draw from the neighbours' load instead of treating the
+	// whole total as somebody else's.
+	// +optional
+	PerVMUsage bool `json:"perVMUsage,omitempty"`
+	// OurCPUMHz and OurMemoryMB are what this pool's own workers are measured to
+	// consume, split out of the totals above. Together with the totals they give
+	// the neighbours' load (total - ours), which is what the pool's entitlement is
+	// measured against: a pool may only grow while its workers' standing charge
+	// plus the neighbours' measured draw still fit the platform.
+	// +optional
+	OurCPUMHz int64 `json:"ourCPU_MHz,omitempty"`
+	// +optional
+	OurMemoryMB int64 `json:"ourMemoryMB,omitempty"`
+	// Physical says the CPU and memory numbers above are the physical capacity
+	// of the hosts (vSphere), not a quota the platform enforces (vCD). Only a
+	// physical number may be overcommitted; the page offers the assumption only
+	// when this is true.
+	// +optional
+	Physical bool `json:"physical,omitempty"`
+	// Datacenter and Cluster name the scope the numbers above are read from,
+	// where the platform has one. On vSphere it is the compute cluster: its
+	// hosts are the compute a pool may use and its datastores are the storage,
+	// not the datacenter's. Empty on vCD, whose scope is the whole vDC.
+	// +optional
+	Datacenter string `json:"datacenter,omitempty"`
+	// +optional
+	Cluster string `json:"cluster,omitempty"`
+	// Datastores is the storage the scope makes available, one entry per
+	// datastore, the pool's own marked Default. It answers "what else is
+	// there" next to the single bar, which can only show the one a worker is
+	// written to.
+	// +optional
+	Datastores []DatastoreCapacity `json:"datastores,omitempty"`
 	// PodCIDR is the cluster's pod network. Its address count sized against
 	// the per-node allowance (110 pods, the kubelet default) is what decides
 	// whether another node can be added at all.
@@ -489,6 +797,20 @@ type CapacityStatus struct {
 	// what makes "refresh after a scale completed" decidable.
 	// +optional
 	ObservedReplicas int32 `json:"observedReplicas,omitempty"`
+}
+
+// DatastoreCapacity is one datastore of the scope, in the same units as the
+// storage bar: what it holds and what is already written to it.
+type DatastoreCapacity struct {
+	Name string `json:"name"`
+	// Default marks the datastore the pool names in spec.vsphere.datastore:
+	// the one a clone is written to.
+	// +optional
+	Default bool `json:"default,omitempty"`
+	// +optional
+	CapacityMB int64 `json:"capacityMB,omitempty"`
+	// +optional
+	UsedMB int64 `json:"usedMB,omitempty"`
 }
 
 // IPLedger is the persistent IP allocation ledger.

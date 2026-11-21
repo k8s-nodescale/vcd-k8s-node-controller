@@ -40,6 +40,45 @@ func cpuMHzPerCore(pool *infrav1.K8sWorkerPool, capacity cloud.PlatformCapacity)
 	return defaultCPUMHzPerCore
 }
 
+// cpuPerCore is how many vCPUs the pre-flight lets one physical core carry.
+//
+// Only a physical number may be overcommitted. A quota is what the platform will
+// actually grant, so dividing it would admit a request the platform then refuses
+// - exactly the failure the pre-flight exists to prevent. vCD's limit is a
+// quota; vSphere's is the hosts' own capacity.
+func cpuPerCore(pool *infrav1.K8sWorkerPool, capacity cloud.PlatformCapacity) int64 {
+	if !capacity.Physical {
+		return 1
+	}
+	if n := pool.Spec.Capacity.CPUPerCore; n != nil && *n > 1 {
+		return int64(*n)
+	}
+	return 1
+}
+
+// cpuChargeMHz is the MHz one vCPU is charged at: the core speed divided by the
+// overcommit assumption, rounded up so the charge is never optimistic.
+func cpuChargeMHz(pool *infrav1.K8sWorkerPool, capacity cloud.PlatformCapacity) int64 {
+	mhz := cpuMHzPerCore(pool, capacity)
+	ratio := cpuPerCore(pool, capacity)
+	if ratio <= 1 || mhz <= 0 {
+		return mhz
+	}
+	return (mhz + ratio - 1) / ratio
+}
+
+// poolMeasured sums what the pool's own VMs are measured to consume. It is the
+// part of the platform's used figure that belongs to this pool, and subtracting it
+// is what lets the pre-flight charge the pool's workers their entitlement without
+// also counting their measured draw as a neighbour's.
+func poolMeasured(vms []cloud.VM) (cpuMHz, memMB int64) {
+	for i := range vms {
+		cpuMHz += vms[i].UsedCPUMHz
+		memMB += vms[i].UsedMemoryMB
+	}
+	return cpuMHz, memMB
+}
+
 // capacityAllows runs the pre-flight for one request and returns why it does not
 // fit when it does not.
 //
@@ -47,6 +86,29 @@ func cpuMHzPerCore(pool *infrav1.K8sWorkerPool, capacity cloud.PlatformCapacity)
 // and attempting the create (the behaviour before the pre-flight existed) is
 // better than a pool that cannot scale because a read broke.
 func (r *WorkerPoolReconciler) capacityAllows(ctx context.Context, pool *infrav1.K8sWorkerPool, req cloud.CapacityRequest) (bool, string) {
+	return r.capacityAllowsBatch(ctx, pool, req, 1, 0, 0)
+}
+
+// workersWithVM counts the slots the pool has actually spent: queued slots have no
+// VM, missing ones have none any more.
+func workersWithVM(nodes []infrav1.WorkerNodeStatus) int32 {
+	var n int32
+	for i := range nodes {
+		switch nodes[i].Phase {
+		case infrav1.NodePhaseQueued, infrav1.NodePhaseMissing:
+		default:
+			n++
+		}
+	}
+	return n
+}
+
+// capacityAllowsBatch is capacityAllows for a scale-out that admits several
+// workers in one pass. Where the platform's Used is measured (vSphere) the
+// workers admitted earlier in the pass are charged too, because their usage is
+// not in the figure yet; where it is allocated (vCD) they are already counted and
+// charging them again would halve the batch.
+func (r *WorkerPoolReconciler) capacityAllowsBatch(ctx context.Context, pool *infrav1.K8sWorkerPool, req cloud.CapacityRequest, admitted int32, ourCPUMHz, ourMemoryMB int64) (bool, string) {
 	if !capacityPreflightEnabled(pool) {
 		return true, ""
 	}
@@ -62,11 +124,51 @@ func (r *WorkerPoolReconciler) capacityAllows(ctx context.Context, pool *infrav1
 			"pool", pool.Name, "error", err)
 		return true, ""
 	}
-	ok, short := capacity.Fits(req, cpuMHzPerCore(pool, capacity))
+	// The neighbours' load is what the cluster has to back our entitlement
+	// against: the total minus our own measured draw. Where the platform reports
+	// per-VM usage this turns the check from "is the host idle now" into "can the
+	// cluster still back the workers this pool has committed to".
+	if capacity.PerVMUsage {
+		others := capacity.CPU.Used - ourCPUMHz
+		if others < 0 {
+			others = 0
+		}
+		capacity.CPU.Used = others
+		othersMem := capacity.MemoryMB.Used - ourMemoryMB
+		if othersMem < 0 {
+			othersMem = 0
+		}
+		capacity.MemoryMB.Used = othersMem
+	}
+
+	// How many charges to apply depends on what the platform's used figure means,
+	// and getting it wrong is how a third worker was admitted while the pane said
+	// none fit (2026-11-20):
+	//
+	//   - per-VM usage (vSphere entitlement): every worker the pool has is charged,
+	//     because "ours" was just subtracted from used;
+	//   - measured but not per-VM: only this pass's admissions, since the ones
+	//     already created are not in the figure yet either;
+	//   - a quota (vCD): one worker, the platform has already booked the rest.
+	if capacity.PerVMUsage {
+		admitted = workersWithVM(pool.Status.Nodes) + 1
+	} else if !capacity.Measured {
+		admitted = 1
+	}
+	if admitted > 1 {
+		req = batchRequest(req, admitted)
+	}
+	ok, short := capacity.Fits(req, cpuChargeMHz(pool, capacity))
 	if ok {
 		return true, ""
 	}
-	return false, strings.Join(short, "; ")
+	why := strings.Join(short, "; ")
+	// The shortfall is stated in the charge the gate used; say which assumption
+	// that was, or the number looks like a plain core speed.
+	if ratio := cpuPerCore(pool, capacity); ratio > 1 {
+		why += fmt.Sprintf(" (CPU charged at %d vCPU : 1 core)", ratio)
+	}
+	return false, why
 }
 
 // workerCapacityRequest is the capacity one new worker of this pool adds.
@@ -120,6 +222,37 @@ func resizeCapacityRequest(have, target *infrav1.FlavorStatus) cloud.CapacityReq
 		req.StorageMB = map[string]int64{"": int64(d) * 1024}
 	}
 	return req
+}
+
+// inFlight counts the pool's workers whose VM exists but whose load the platform
+// has not measured yet: a worker in Provisioning or Joining consumes almost
+// nothing, so the free figure does not move when it is admitted. Their standing
+// charge is what keeps a scale-out from being optimistic pass after pass.
+func inFlight(nodes []infrav1.WorkerNodeStatus) int32 {
+	var n int32
+	for i := range nodes {
+		switch nodes[i].Phase {
+		case infrav1.NodePhaseProvisioning, infrav1.NodePhaseJoining:
+			n++
+		}
+	}
+	return n
+}
+
+// batchRequest is n copies of one worker's request: what this pass has already
+// admitted plus the one it is about to admit. The pre-flight charges nominal
+// MHz per worker while the platform reports measured usage, so without counting
+// its own batch it sees the same free capacity for every worker of a scale-out.
+func batchRequest(one cloud.CapacityRequest, n int32) cloud.CapacityRequest {
+	if n <= 1 {
+		return one
+	}
+	out := one
+	for i := int32(1); i < n; i++ {
+		out = addCapacityRequest(out, one)
+	}
+	out.Workers = n
+	return out
 }
 
 // addCapacityRequest sums two requests, so a batch can be checked as one.
