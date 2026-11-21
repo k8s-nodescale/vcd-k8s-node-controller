@@ -118,15 +118,47 @@ type StorageProfileCapacity struct {
 	UsedMB  int64
 }
 
+// CapacityModel is the question a capacity answer answers.
+//
+// The two platforms ask different ones, and the difference is not cosmetic: an
+// overcommit assumption and an entitlement split only mean something for real
+// hardware, and a quota must never be divided. Encoding that in one bool let a
+// provider be "measured but not per-VM", a state neither platform means and the
+// status could not even publish.
+type CapacityModel string
+
+const (
+	// CapacityQuota is a ceiling the platform enforces by allocating. A VM
+	// counts against it the moment it is created, the next create is refused
+	// when the numbers are spent, and the scope (a vDC) is the whole pool of
+	// resources - there is no neighbour whose load could be separated from
+	// this pool's, because the quota is already only this pool's.
+	CapacityQuota CapacityModel = "quota"
+	// CapacityPhysical is real hardware: the cores and memory of the hosts a
+	// pool may use, with usage measured on the hosts and per-VM usage
+	// readable. It is the only model where overcommitting a core means
+	// anything, and the only one where a worker's own measured draw has to be
+	// separated from its neighbours' before its entitlement is charged on top:
+	// the hosts measure everyone, and the pool pays for its whole shape.
+	CapacityPhysical CapacityModel = "physical"
+)
+
+// String keeps logs and status legible without a conversion at each call site.
+func (m CapacityModel) String() string { return string(m) }
+
 // PlatformCapacity is what the platform still has free for another worker.
 //
 // It is what the platform itself rates a new VM against, so a caller can refuse a create
 // that cannot fit instead of letting it fail halfway through a clone.
 type PlatformCapacity struct {
-	// Model is the platform's own name for its allocation model, e.g. vCD's
-	// AllocationPool or PayAsYouGo. It is informational: a zero Limit already
+	// Model is the question the numbers below answer. Empty means the provider
+	// does not say, which the pre-flight reads the cautious way: charge this
+	// pass's own admissions and nothing else.
+	Model CapacityModel
+	// AllocationModel is the platform's own name for how it allocates, e.g.
+	// vCD's AllocationPool or PayAsYouGo. Informational: a zero Limit already
 	// means "no cap".
-	Model string
+	AllocationModel string
 	// CPUMHzPerCore is the speed the vDC rates one vCPU at, as configured on
 	// the vDC. Zero means it was not readable for this account.
 	CPUMHzPerCore int64
@@ -136,23 +168,6 @@ type PlatformCapacity struct {
 	// empty on vCD, where the vDC is the whole scope.
 	Datacenter string
 	Cluster    string
-	// Physical says CPU and memory are the physical capacity of those hosts
-	// (vSphere), not a quota the platform enforces (vCD). An overcommit
-	// assumption may only be applied to a physical number: dividing a quota
-	// would admit a request the platform then refuses.
-	Physical bool
-	// PerVMUsage says the platform can report what a single VM consumes, which is
-	// what lets a pool separate its own measured draw from the neighbours' load.
-	// Without it the pool can only charge entitlement against total usage, which
-	// would count its own running workers twice.
-	PerVMUsage bool
-	// Measured says Used is what the platform observes on the hosts, so a VM
-	// created a moment ago has not moved it yet. A pre-flight that admits a
-	// batch must then charge its own admissions, or every one-worker check in
-	// the pass reads the same free number (vSphere). Where Used is allocated
-	// (vCD books the VM as it is created) that would charge it twice, so the
-	// flag stays false and only one worker is charged at a time.
-	Measured bool
 	CPU      ResourceCapacity // MHz
 	MemoryMB ResourceCapacity // MB
 	Storage  []StorageProfileCapacity
@@ -269,8 +284,9 @@ type VM struct {
 	// DiskGB is the total capacity of all disks on the VM.
 	DiskGB int32
 	// UsedCPUMHz and UsedMemoryMB are what the platform measures this VM
-	// consuming right now. Zero when the platform does not report per-VM usage;
-	// PlatformCapacity.PerVMUsage says whether it does.
+	// consuming right now. Set by a physical platform (PlatformCapacity.Model ==
+	// CapacityPhysical), which is the only model where the pool's own draw has
+	// to be separated from its neighbours'; zero elsewhere.
 	UsedCPUMHz   int64
 	UsedMemoryMB int64
 	// OSDiskGB is the system disk (bus 0/unit 0) alone, which is what

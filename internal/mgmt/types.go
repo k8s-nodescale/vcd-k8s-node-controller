@@ -212,7 +212,13 @@ type Disk struct {
 // the vDC counts as used, what it caps, and how much pod network is left. The
 // percentages are computed here like every other share, so the page only paints.
 type Capacity struct {
-	Model             string `json:"model,omitempty"`
+	// CapacityModel is the question the numbers answer: "physical" (host
+	// capacity, measured usage, entitlement rule) or "quota" (a ceiling the
+	// platform enforces by allocating). The page picks its arithmetic and its
+	// switches by this, not by guessing from the values.
+	CapacityModel string `json:"capacityModel,omitempty"`
+	// AllocationModel is the platform's own name for how it allocates.
+	AllocationModel   string `json:"allocationModel,omitempty"`
 	Datacenter        string `json:"datacenter,omitempty"`
 	Cluster           string `json:"cluster,omitempty"`
 	CPUMHz            int64  `json:"cpuMHz,omitempty"`
@@ -240,17 +246,11 @@ type Capacity struct {
 	// effect before any collection answers.
 	CPUMHzPerCore int64 `json:"cpuMHzPerCore,omitempty"`
 	// OurCPUMHz and OurMemoryMB are what this pool's workers are measured to
-	// consume; the rest of the totals is everyone else's. The page subtracts it to
-	// get the neighbours' load, which is what our entitlement is measured against.
-	// PerVMUsage says the platform reported those two, so the pane can separate
-	// our draw from the neighbours' load and charge our entitlement on top.
-	PerVMUsage  bool  `json:"perVMUsage,omitempty"`
+	// consume; the rest of the totals is everyone else's. Published on a
+	// physical platform only, where the page subtracts it to get the
+	// neighbours' load and charges our entitlement on top.
 	OurCPUMHz   int64 `json:"ourCPU_MHz,omitempty"`
 	OurMemoryMB int64 `json:"ourMemoryMB,omitempty"`
-	// Physical says the CPU and memory numbers are the hosts' own capacity
-	// (vSphere) rather than a quota (vCD); the assumption above applies only
-	// here, and the page offers to change it only here.
-	Physical bool `json:"physical,omitempty"`
 	// Fit is how many more workers of this pool's flavour still fit, per
 	// dimension. The page shows the smallest and names the dimension.
 	Fit *Fit `json:"fit,omitempty"`

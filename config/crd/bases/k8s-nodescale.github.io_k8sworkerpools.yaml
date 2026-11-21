@@ -793,9 +793,21 @@ spec:
                   platform, so the numbers are published here. A nil Capacity means no
                   snapshot was taken yet.
                 properties:
+                  allocationModel:
+                    description: |-
+                      AllocationModel is the platform's own name for how it allocates, e.g.
+                      vCD's AllocationPool. Informational.
+                    type: string
                   at:
                     description: At is when the snapshot was taken.
                     format: date-time
+                    type: string
+                  capacityModel:
+                    description: |-
+                      CapacityModel is the question these numbers answer, so a reader knows
+                      which rule produced them: "physical" is the hosts' own capacity with a
+                      measured usage and an entitlement rule, "quota" is a ceiling the platform
+                      enforces by allocating. Empty when the provider did not say.
                     type: string
                   cluster:
                     type: string
@@ -860,9 +872,6 @@ spec:
                     description: MemoryMB is the same pair for memory.
                     format: int64
                     type: integer
-                  model:
-                    description: Model is the vDC allocation model, informational.
-                    type: string
                   observedReplicas:
                     description: |-
                       ObservedReplicas is the pool size the snapshot was taken at, which is
@@ -872,28 +881,16 @@ spec:
                   ourCPU_MHz:
                     description: |-
                       OurCPUMHz and OurMemoryMB are what this pool's own workers are measured to
-                      consume, split out of the totals above. Together with the totals they give
-                      the neighbours' load (total - ours), which is what the pool's entitlement is
-                      measured against: a pool may only grow while its workers' standing charge
-                      plus the neighbours' measured draw still fit the platform.
+                      consume, split out of the totals above. They are published on a physical
+                      platform only (CapacityModel "physical"): there the totals cover everyone,
+                      so the neighbours' load is total - ours, and the pool's entitlement is
+                      charged on top of that. A quota is already only this pool's, so it has no
+                      such split and leaves both zero.
                     format: int64
                     type: integer
                   ourMemoryMB:
                     format: int64
                     type: integer
-                  perVMUsage:
-                    description: |-
-                      PerVMUsage says OurCPUMHz and OurMemoryMB were reported, so a reader can
-                      separate this pool's draw from the neighbours' load instead of treating the
-                      whole total as somebody else's.
-                    type: boolean
-                  physical:
-                    description: |-
-                      Physical says the CPU and memory numbers above are the physical capacity
-                      of the hosts (vSphere), not a quota the platform enforces (vCD). Only a
-                      physical number may be overcommitted; the page offers the assumption only
-                      when this is true.
-                    type: boolean
                   podBlockSize:
                     description: |-
                       PodBlockSize and PodUsablePerBlock describe the CNI's block: a /26 is 64

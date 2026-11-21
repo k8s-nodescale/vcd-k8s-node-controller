@@ -2,6 +2,7 @@ package mgmt
 
 import (
 	infrav1 "github.com/k8s-nodescale/vcd-k8s-node-controller/api/v1alpha1"
+	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/cloud"
 )
 
 // poolFit answers the question the page is read for: how many more workers of
@@ -30,6 +31,9 @@ func poolFit(p *infrav1.K8sWorkerPool) *Fit {
 
 	// The workers admitted but not yet measured: their VMs exist, their load is
 	// not in the platform's figure, so their standing charge is spent already.
+	// That is true on a platform that measures, and false on one that allocates:
+	// a quota books a VM the moment it is created, so charging it again would
+	// count it twice. The model says which - the same word the gate reads.
 	var starting int64
 	for i := range p.Status.Nodes {
 		switch p.Status.Nodes[i].Phase {
@@ -37,6 +41,8 @@ func poolFit(p *infrav1.K8sWorkerPool) *Fit {
 			starting++
 		}
 	}
+	physical := c.CapacityModel == string(cloud.CapacityPhysical)
+	quota := c.CapacityModel == string(cloud.CapacityQuota)
 
 	// CPU
 	if c.CPULimitMHz > 0 && c.CPUMHzPerCore > 0 && p.Spec.Flavor.CPUs > 0 {
@@ -49,14 +55,24 @@ func poolFit(p *infrav1.K8sWorkerPool) *Fit {
 		per := int64(p.Spec.Flavor.CPUs) * perCore
 		if per > 0 {
 			out.CPUPerWorkerMHz = per
-			free := c.CPULimitMHz - c.CPUMHz - starting*per
-			if c.PerVMUsage {
+			var free int64
+			switch {
+			case physical:
 				// Entitlement: our workers charged in full, the neighbours measured.
 				others := c.CPUMHz - c.OurCPUMHz
 				if others < 0 {
 					others = 0
 				}
 				free = c.CPULimitMHz - others - workersWithVM(p)*per
+			case quota:
+				// The platform has already booked every VM it knows about,
+				// including the ones still starting, so the free part is the
+				// whole difference and nothing is charged twice.
+				free = c.CPULimitMHz - c.CPUMHz
+			default:
+				// The provider did not say: charge what is starting, which can
+				// only make the answer smaller.
+				free = c.CPULimitMHz - c.CPUMHz - starting*per
 			}
 			if free < 0 {
 				free = 0 // over the entitlement reads as no room, not as unknown
@@ -70,13 +86,18 @@ func poolFit(p *infrav1.K8sWorkerPool) *Fit {
 	if c.MemoryLimitMB > 0 && p.Spec.Flavor.MemoryMB > 0 {
 		per := int64(p.Spec.Flavor.MemoryMB)
 		out.MemoryPerWorkerMB = per
-		free := c.MemoryLimitMB - c.MemoryMB - starting*per
-		if c.PerVMUsage {
+		var free int64
+		switch {
+		case physical:
 			others := c.MemoryMB - c.OurMemoryMB
 			if others < 0 {
 				others = 0
 			}
 			free = c.MemoryLimitMB - others - workersWithVM(p)*per
+		case quota:
+			free = c.MemoryLimitMB - c.MemoryMB
+		default:
+			free = c.MemoryLimitMB - c.MemoryMB - starting*per
 		}
 		if free < 0 {
 			free = 0
@@ -112,7 +133,7 @@ func poolFit(p *infrav1.K8sWorkerPool) *Fit {
 // TTL expires, and a switch that takes ten minutes to do anything is a switch
 // that looks broken.
 func perCoreFor(p *infrav1.K8sWorkerPool, c *infrav1.CapacityStatus) int32 {
-	if c == nil || !c.Physical {
+	if c == nil || c.CapacityModel != string(cloud.CapacityPhysical) {
 		return 1
 	}
 	if n := p.Spec.Capacity.CPUPerCore; n != nil && *n > 1 {

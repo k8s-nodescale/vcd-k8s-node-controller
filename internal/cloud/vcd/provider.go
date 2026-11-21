@@ -219,8 +219,12 @@ func (p *Pool) Capacity(ctx context.Context) (cloud.PlatformCapacity, error) {
 	}
 
 	out := cloud.PlatformCapacity{
-		Model:         vdc.Vdc.AllocationModel,
-		CPUMHzPerCore: p.cpuMHzPerCore(ctx),
+		// A vDC is a quota: the platform books a VM against it as it is
+		// created, the scope is the whole pool of resources, and no part of it
+		// may be overcommitted.
+		Model:           cloud.CapacityQuota,
+		AllocationModel: vdc.Vdc.AllocationModel,
+		CPUMHzPerCore:   p.cpuMHzPerCore(ctx),
 	}
 	if len(vdc.Vdc.ComputeCapacity) > 0 && vdc.Vdc.ComputeCapacity[0] != nil {
 		cc := vdc.Vdc.ComputeCapacity[0]

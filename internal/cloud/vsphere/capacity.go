@@ -51,7 +51,6 @@ func (p *Provider) Capacity(ctx context.Context) (cloud.PlatformCapacity, error)
 	if err != nil {
 		return cloud.PlatformCapacity{}, fmt.Errorf("vsphere: hosts of cluster %q: %w", p.placement.Cluster, err)
 	}
-	model := "vSphere " + p.placement.Cluster
 	if p.placement.Host != "" {
 		// A pinned host is the only host a worker can use, so it is the only
 		// host whose room is real for this pool. Counting the whole cluster
@@ -69,7 +68,6 @@ func (p *Provider) Capacity(ctx context.Context) (cloud.PlatformCapacity, error)
 				p.placement.Host, p.placement.Cluster)
 		}
 		hosts = pinned
-		model = model + "/" + hostLeaf(p.placement.Host)
 	}
 	refs := make([]types.ManagedObjectReference, 0, len(hosts))
 	for _, h := range hosts {
@@ -85,18 +83,13 @@ func (p *Provider) Capacity(ctx context.Context) (cloud.PlatformCapacity, error)
 	// of a cluster do not report the same speed.
 	sort.Slice(mhs, func(i, j int) bool { return mhs[i].Name < mhs[j].Name })
 
-	out := cloud.PlatformCapacity{Model: model}
+	// The hosts of the cluster are the numbers: real cores, real memory, usage
+	// measured on the hosts and per VM. That is what makes an overcommit
+	// assumption and an entitlement split meaningful, and it is what the model
+	// says in one word instead of three flags.
+	out := cloud.PlatformCapacity{Model: cloud.CapacityPhysical}
 	out.Datacenter = p.placement.Datacenter
 	out.Cluster = p.placement.Cluster
-	// The hosts of the cluster are the numbers: real cores, real memory. The
-	// pre-flight may therefore apply an overcommit assumption to them.
-	out.Physical = true
-	// Host usage is measured, not allocated: a worker created seconds ago is not
-	// in the figure yet, so the pre-flight has to charge its own batch.
-	out.Measured = true
-	// And it can say what each VM consumes, so the pool can subtract its own draw
-	// from the total and charge its workers their entitlement on top of the rest.
-	out.PerVMUsage = true
 	usable := 0
 	for i := range mhs {
 		m := &mhs[i]

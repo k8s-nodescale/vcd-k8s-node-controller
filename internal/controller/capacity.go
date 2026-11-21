@@ -44,10 +44,10 @@ func cpuMHzPerCore(pool *infrav1.K8sWorkerPool, capacity cloud.PlatformCapacity)
 //
 // Only a physical number may be overcommitted. A quota is what the platform will
 // actually grant, so dividing it would admit a request the platform then refuses
-// - exactly the failure the pre-flight exists to prevent. vCD's limit is a
-// quota; vSphere's is the hosts' own capacity.
+// - exactly the failure the pre-flight exists to prevent. The model says which
+// one this is; a provider that does not say gets the cautious answer.
 func cpuPerCore(pool *infrav1.K8sWorkerPool, capacity cloud.PlatformCapacity) int64 {
-	if !capacity.Physical {
+	if capacity.Model != cloud.CapacityPhysical {
 		return 1
 	}
 	if n := pool.Spec.Capacity.CPUPerCore; n != nil && *n > 1 {
@@ -120,15 +120,17 @@ func (r *WorkerPoolReconciler) capacityAllowsBatch(ctx context.Context, pool *in
 	}
 	capacity, err := prov.Capacity(ctx)
 	if err != nil {
-		log.FromContext(ctx).V(1).Info("capacity pre-flight skipped: the vDC capacity could not be read",
+		log.FromContext(ctx).V(1).Info("capacity pre-flight skipped: the platform capacity could not be read",
 			"pool", pool.Name, "error", err)
 		return true, ""
 	}
 	// The neighbours' load is what the cluster has to back our entitlement
-	// against: the total minus our own measured draw. Where the platform reports
-	// per-VM usage this turns the check from "is the host idle now" into "can the
-	// cluster still back the workers this pool has committed to".
-	if capacity.PerVMUsage {
+	// against: on a physical platform the total covers everyone, so it is the
+	// total minus our own measured draw. This turns the check from "is the host
+	// idle now" into "can the cluster still back the workers this pool has
+	// committed to". A quota has no neighbours to separate - it is already only
+	// this pool's - so nothing is subtracted there.
+	if capacity.Model == cloud.CapacityPhysical {
 		others := capacity.CPU.Used - ourCPUMHz
 		if others < 0 {
 			others = 0
@@ -141,18 +143,19 @@ func (r *WorkerPoolReconciler) capacityAllowsBatch(ctx context.Context, pool *in
 		capacity.MemoryMB.Used = othersMem
 	}
 
-	// How many charges to apply depends on what the platform's used figure means,
-	// and getting it wrong is how a third worker was admitted while the pane said
-	// none fit (2026-11-20):
+	// How many charges to apply follows from the model, and getting it wrong is
+	// how a third worker was admitted while the pane said none fit (2026-11-20):
 	//
-	//   - per-VM usage (vSphere entitlement): every worker the pool has is charged,
-	//     because "ours" was just subtracted from used;
-	//   - measured but not per-VM: only this pass's admissions, since the ones
-	//     already created are not in the figure yet either;
-	//   - a quota (vCD): one worker, the platform has already booked the rest.
-	if capacity.PerVMUsage {
+	//   - physical (vSphere): usage is measured and per-VM, so every worker the
+	//     pool has is charged, because "ours" was just subtracted from used;
+	//   - quota (vCD): one worker, because the platform has already booked the
+	//     ones that exist and the one in flight;
+	//   - undeclared: this pass's own admissions, the cautious reading of a
+	//     figure that was measured but cannot be split.
+	switch capacity.Model {
+	case cloud.CapacityPhysical:
 		admitted = workersWithVM(pool.Status.Nodes) + 1
-	} else if !capacity.Measured {
+	case cloud.CapacityQuota:
 		admitted = 1
 	}
 	if admitted > 1 {
@@ -291,6 +294,15 @@ func applyCreatedWorker(n *infrav1.WorkerNodeStatus, vm cloud.VM, tokID string, 
 	n.BootstrapTokenID = tokID
 }
 
+// capacityNoun names the platform whose capacity a worker is waiting for, so a
+// vSphere pool does not report a vDC it does not run on.
+func capacityNoun(pool *infrav1.K8sWorkerPool) string {
+	if pool.Spec.Provider == cloud.ProviderVSphere {
+		return "vSphere cluster capacity"
+	}
+	return "vDC capacity"
+}
+
 // queueSlots parks count slots as Queued. They have no VM, so the address and
 // the name stay reserved and the ledger is published with them: the pool keeps
 // reporting the request instead of silently reading the shortfall as "nothing
@@ -310,7 +322,7 @@ func (r *WorkerPoolReconciler) queueSlots(ctx context.Context, pool *infrav1.K8s
 			Name:     workerName(pool.Spec.NamePrefix, ordinal),
 			IP:       ip,
 			Phase:    infrav1.NodePhaseQueued,
-			Message:  "waiting for vDC capacity: " + why,
+			Message:  "waiting for " + capacityNoun(pool) + ": " + why,
 			CPU:      pool.Spec.Flavor.CPUs,
 			MemoryMB: pool.Spec.Flavor.MemoryMB,
 			Flavor: &infrav1.FlavorStatus{
@@ -323,7 +335,7 @@ func (r *WorkerPoolReconciler) queueSlots(ctx context.Context, pool *infrav1.K8s
 	}
 	pool.Status.ObservedReplicas = int32(len(pool.Status.Nodes))
 	pool.Status.Ledger = toStatusLedger(alloc.Ledger())
-	log.FromContext(ctx).Info("workers queued for vDC capacity", "pool", pool.Name, "queued", count, "reason", why)
+	log.FromContext(ctx).Info("workers queued for capacity", "pool", pool.Name, "queued", count, "reason", why)
 	return nil
 }
 
@@ -344,7 +356,7 @@ func (r *WorkerPoolReconciler) resumeQueuedCreates(ctx context.Context, before, 
 			// One read per pass is enough: every queued slot asks for the same
 			// worker shape, so a shortfall here is a shortfall for the rest of
 			// the queue too. Refresh their report and wait.
-			msg := "waiting for vDC capacity: " + why
+			msg := "waiting for " + capacityNoun(pool) + ": " + why
 			for j := i; j < len(pool.Status.Nodes); j++ {
 				if q := &pool.Status.Nodes[j]; q.Phase == infrav1.NodePhaseQueued && q.DeleteStartedAt == nil {
 					q.Message = msg
@@ -383,7 +395,7 @@ func (r *WorkerPoolReconciler) resumeQueuedCreates(ctx context.Context, before, 
 		}
 		logger.Info("started a queued worker", "worker", n.Name, "ip", n.IP, "providerID", vm.ID)
 		r.eventf(pool, corev1.EventTypeNormal, "WorkerDequeued",
-			fmt.Sprintf("vDC capacity is available again; worker %s (%s) is being created", n.Name, n.IP))
+			fmt.Sprintf("%s is available again; worker %s (%s) is being created", capacityNoun(pool), n.Name, n.IP))
 		handled = true
 	}
 	return handled, nil

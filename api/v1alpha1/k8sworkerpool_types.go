@@ -695,9 +695,16 @@ type K8sWorkerPoolStatus struct {
 // CapacityStatus is a snapshot of the platform capacity and the pod subnet,
 // taken when a scale operation completed (and occasionally to catch drift).
 type CapacityStatus struct {
-	// Model is the vDC allocation model, informational.
+	// CapacityModel is the question these numbers answer, so a reader knows
+	// which rule produced them: "physical" is the hosts' own capacity with a
+	// measured usage and an entitlement rule, "quota" is a ceiling the platform
+	// enforces by allocating. Empty when the provider did not say.
 	// +optional
-	Model string `json:"model,omitempty"`
+	CapacityModel string `json:"capacityModel,omitempty"`
+	// AllocationModel is the platform's own name for how it allocates, e.g.
+	// vCD's AllocationPool. Informational.
+	// +optional
+	AllocationModel string `json:"allocationModel,omitempty"`
 	// CPUMHz is what vCD counts as used and the ceiling it enforces.
 	// +optional
 	CPUMHz int64 `json:"cpuMHz,omitempty"`
@@ -724,26 +731,16 @@ type CapacityStatus struct {
 	CPUPerCore int32 `json:"cpuPerCore,omitempty"`
 	// +optional
 	CPUMHzPerCore int64 `json:"cpuMHzPerCore,omitempty"`
-	// PerVMUsage says OurCPUMHz and OurMemoryMB were reported, so a reader can
-	// separate this pool's draw from the neighbours' load instead of treating the
-	// whole total as somebody else's.
-	// +optional
-	PerVMUsage bool `json:"perVMUsage,omitempty"`
 	// OurCPUMHz and OurMemoryMB are what this pool's own workers are measured to
-	// consume, split out of the totals above. Together with the totals they give
-	// the neighbours' load (total - ours), which is what the pool's entitlement is
-	// measured against: a pool may only grow while its workers' standing charge
-	// plus the neighbours' measured draw still fit the platform.
+	// consume, split out of the totals above. They are published on a physical
+	// platform only (CapacityModel "physical"): there the totals cover everyone,
+	// so the neighbours' load is total - ours, and the pool's entitlement is
+	// charged on top of that. A quota is already only this pool's, so it has no
+	// such split and leaves both zero.
 	// +optional
 	OurCPUMHz int64 `json:"ourCPU_MHz,omitempty"`
 	// +optional
 	OurMemoryMB int64 `json:"ourMemoryMB,omitempty"`
-	// Physical says the CPU and memory numbers above are the physical capacity
-	// of the hosts (vSphere), not a quota the platform enforces (vCD). Only a
-	// physical number may be overcommitted; the page offers the assumption only
-	// when this is true.
-	// +optional
-	Physical bool `json:"physical,omitempty"`
 	// Datacenter and Cluster name the scope the numbers above are read from,
 	// where the platform has one. On vSphere it is the compute cluster: its
 	// hosts are the compute a pool may use and its datastores are the storage,

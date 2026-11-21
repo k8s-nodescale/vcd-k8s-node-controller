@@ -1157,6 +1157,13 @@
     return n;
   }
 
+  // isPhysical / isQuota are the page's reading of status.capacity.capacityModel.
+  // A physical platform measures the hosts and can split our draw out of the
+  // total; a quota books a VM as it is created, so there is nothing in flight to
+  // charge and nothing to overcommit. The gate reads the same word.
+  function isPhysical(c) { return !!c && c.capacityModel === "physical"; }
+  function isQuota(c) { return !!c && c.capacityModel === "quota"; }
+
   function reservedOf(p, c) {
     var n = workersWithVM(p);
     var out = { workers: n, cpuMHz: 0, memMB: 0 };
@@ -1164,7 +1171,13 @@
     var cpus = p.flavor.cpus || 0;
     var perCPU = c.cpuMHzPerCore > 0 && cpus > 0
       ? cpus * Math.ceil(c.cpuMHzPerCore / (c.cpuPerCore || 1)) : 0;
-    if (c.perVMUsage) {
+    if (isQuota(c)) {
+      // The platform has already booked every VM the pool owns: there is no
+      // claim to draw on top of the measured fill, and drawing one would say
+      // the pool holds capacity it does not.
+      return out;
+    }
+    if (isPhysical(c)) {
       // The claim is the whole standing charge of the workers; what is already
       // burning is measured, so the bar only needs the part above it.
       out.cpuMHz = Math.max(0, n * perCPU - (c.ourCPU_MHz || 0));
@@ -1197,7 +1210,7 @@
     if (c.cpuMHzPerCore > 0 && c.cpuLimitMHz > 0 && p && p.flavor && p.flavor.cpus > 0) {
       var ratio = perCore || 1;
       var per = p.flavor.cpus * Math.ceil(c.cpuMHzPerCore / ratio);
-      if (c.perVMUsage) {
+      if (isPhysical(c)) {
         // Entitlement: our workers are charged in full, everyone else is measured.
         var ours = c.ourCPU_MHz || 0;
         var others = Math.max(0, c.cpuMHz - ours);
@@ -1245,7 +1258,7 @@
     }
     if (f.memory != null && f.memoryPerWorkerMB > 0) {
       var freeMem, memBasis;
-      if (c.perVMUsage) {
+      if (isPhysical(c)) {
         var othersMem = Math.max(0, c.memoryMB - (c.ourMemoryMB || 0));
         var committedMem = othersMem + workersWithVM(p) * f.memoryPerWorkerMB;
         freeMem = c.memoryLimitMB - committedMem;
@@ -1331,7 +1344,7 @@
   // planner is on: with no admission check there is nothing to assume, so it is
   // shown greyed and disabled rather than hidden - the setting still exists.
   function cpuAssumSwitch(c, enabled) {
-    if (!c || !c.physical) { return ""; }
+    if (!isPhysical(c)) { return ""; }
     return '<label class="sw' + (enabled ? "" : " off") + '" title="' +
       (enabled
         ? "how many vCPUs the pre-flight lets one physical core carry: 1 charges a worker its whole vCPU count in core speed, 2 charges half of it"
@@ -1345,6 +1358,17 @@
   // top, the assumption it governs underneath.
   function fitControls(c, plannerOn) {
     return '<div class="fitctl">' + preflightSwitch(plannerOn) + cpuAssumSwitch(c, plannerOn) + "</div>";
+  }
+
+  // fitNote explains the rule behind the numbers, which is the one thing a
+  // reader cannot infer from them: on hosts, the free part is shared and a
+  // worker is charged its whole shape; in a quota, everyone is charged and
+  // nothing is shared.
+  function fitNote(c) {
+    if (isQuota(c)) {
+      return "This is a quota the platform enforces, scoped to the vDC: every worker is charged its whole allocation and the platform books it the moment it is created, so nothing is overcommitted and nothing is shared with another pool.";
+    }
+    return "Each number is what still fits in the free part of that dimension - not how many workers in total the hardware could run. The hosts are shared, so the free part also belongs to every other VM on them; a worker charges far more than it burns, which is why shrinking the pool does not enlarge this by much.";
   }
 
   function fitBox(dims, fit, c) {
@@ -1361,7 +1385,7 @@
     });
     return '<div class="fitbox"><table>' + rows.join("") +
       "<tr><td><b>fits</b> - the smallest of the five</td><td><b>+" + fit + "</b></td></tr></table>" +
-      '<div class="capnote">Each number is what still fits in the free part of that dimension - not how many workers in total the hardware could run. The hosts are shared, so the free part also belongs to every other VM on them; a worker charges far more than it burns, which is why shrinking the pool does not enlarge this by much.' +
+      '<div class="capnote">' + fitNote(c) +
       ((c.cpuPerCore || 1) > 2 ? " spec.capacity.cpuPerCore is " + c.cpuPerCore + "; this page toggles 1 and 2." : "") +
       "</div></div>";
   }

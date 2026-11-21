@@ -8,6 +8,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	infrav1 "github.com/k8s-nodescale/vcd-k8s-node-controller/api/v1alpha1"
+	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/cloud"
 )
 
 // fitPool is a pool whose snapshot has room in every dimension: 15.6 GHz free
@@ -25,7 +26,7 @@ func fitPool(perCore int32) *infrav1.K8sWorkerPool {
 		CPULimitMHz:    69360,
 		CPUMHzPerCore:  2600,
 		CPUPerCore:     perCore,
-		Physical:       true,
+		CapacityModel:  string(cloud.CapacityPhysical),
 		MemoryMB:       738015,
 		MemoryLimitMB:  1571338,
 		StorageMB:      8565484,
@@ -129,15 +130,17 @@ func TestCapacityViewCarriesTheChargeBasis(t *testing.T) {
 	if c.Fit == nil || c.Fit.CPU == nil {
 		t.Fatalf("no cpu fit in the view: %#v", c.Fit)
 	}
-	if !c.Physical {
-		t.Fatal("physical was dropped from the view")
+	if c.CapacityModel != string(cloud.CapacityPhysical) {
+		t.Fatalf("capacityModel = %q in the view, want physical", c.CapacityModel)
 	}
 }
 
-// A worker that is still starting has a VM but no measured load. Its standing
-// charge is spent, so it must reduce the number of workers that still fit - the
-// pane promised room that the previous click had already committed.
-func TestFitChargesWorkersThatAreStillStarting(t *testing.T) {
+// On hosts, every worker the pool has is charged its whole shape, whatever the
+// hosts currently measure: that is the entitlement, and it is what the gate
+// applies. A worker still starting already holds one, so it must reduce the
+// number that still fit - the pane otherwise promises room the previous click
+// committed.
+func TestFitChargesEveryWorkerOnAPhysicalPlatform(t *testing.T) {
 	p := fitPool(1)
 	if f := poolFit(p); f.CPU == nil || *f.CPU != 2 {
 		t.Fatalf("cpu = %v, want 2 with nothing starting", f.CPU)
@@ -148,12 +151,36 @@ func TestFitChargesWorkersThatAreStillStarting(t *testing.T) {
 		{Name: "w-3", Phase: infrav1.NodePhaseJoining},
 	}
 	f := poolFit(p)
-	// 34680 - 2*15600 = 3480, which fits nothing.
+	// 34680 - 3*15600 is negative: three charges already exceed the free part.
 	if f.CPU == nil || *f.CPU != 0 {
-		t.Fatalf("cpu = %v, want 0 while two workers are starting", f.CPU)
+		t.Fatalf("cpu = %v, want 0 with three workers charged", f.CPU)
 	}
-	if f.Memory == nil || *f.Memory != 201 {
-		t.Fatalf("memory = %v, want 201 after the two reservations", f.Memory)
+	// (1571338 - 738015 - 3*4096) / 4096 = 200.4, so 200 workers of 4 GB.
+	if f.Memory == nil || *f.Memory != 200 {
+		t.Fatalf("memory = %v, want 200 after three charges", f.Memory)
+	}
+}
+
+// A quota books a VM the moment it is created, so a worker still starting is
+// already in the platform's used figure. Charging it again was the drift of
+// 2026-11-21: the pane said fewer fit than the gate admitted.
+func TestQuotaFitDoesNotChargeWhatThePlatformAlreadyBooked(t *testing.T) {
+	p := fitPool(1)
+	p.Status.Capacity.CapacityModel = string(cloud.CapacityQuota)
+	p.Status.Capacity.CPUPerCore = 0
+	p.Status.Nodes = []infrav1.WorkerNodeStatus{
+		{Name: "w-1", Phase: infrav1.NodePhaseProvisioning},
+		{Name: "w-2", Phase: infrav1.NodePhaseJoining},
+	}
+	f := poolFit(p)
+	// 34680 free of 15600 per worker is two, exactly as before they started:
+	// the used figure already contains them.
+	if f.CPU == nil || *f.CPU != 2 {
+		t.Fatalf("cpu = %v, want 2: a quota already booked the starting workers", f.CPU)
+	}
+	// (1571338 - 738015) / 4096 = 203.4: nothing is charged twice.
+	if f.Memory == nil || *f.Memory != 203 {
+		t.Fatalf("memory = %v, want 203 with nothing charged twice", f.Memory)
 	}
 }
 
@@ -171,7 +198,6 @@ func TestFitUsesTheEntitlementWhenUsageIsPerVM(t *testing.T) {
 	}
 	p.Status.Capacity.OurCPUMHz = 10000
 	p.Status.Capacity.OurMemoryMB = 200000
-	p.Status.Capacity.PerVMUsage = true
 	p.Status.Capacity.CPUMHz = 92800 // 92.8 GHz measured in total
 
 	f := poolFit(p)

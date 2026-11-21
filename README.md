@@ -188,7 +188,7 @@ One `K8sWorkerPool` describes the worker set of a single cluster. You own
 | `provisioning.timeout` | no | How long a VM may run without its Kubernetes Node before the worker is parked as `Failed` (default `15m`). The VM is kept for inspection and the pool reports `Ready=False`/`WorkerFailed`; a registration that arrives later still promotes the worker to `Ready`. |
 | `capacity.preflight` | no | Read the vDC's free capacity before a create or a resize and park work that cannot fit (default `true`). See [When the vDC is full](#when-the-vdc-is-full). |
 | `capacity.cpuMhzPerCore` | no | MHz per vCPU used for the CPU estimate when the vDC does not report its own speed to the controller account (default `2000`). The admin view of the vDC is read once; a tenant account that cannot read it falls back to this number. |
-| `capacity.cpuPerCore` | no | How many vCPUs the pre-flight lets one **physical** core carry, where the platform reports physical capacity (vSphere). `1` (default) charges a worker its whole vCPU count in core speed, `2` charges half of it. Ignored where the limit is a quota (vCD). See [Overcommitting CPU](#overcommitting-cpu-where-the-limit-is-physical-vsphere). |
+| `capacity.cpuPerCore` | no | How many vCPUs the pre-flight lets one **physical** core carry, where the platform reports physical capacity (vSphere). `1` (default) charges a worker its whole vCPU count in core speed, `2` charges half of it. Ignored where the limit is a quota (vCD), and `status.capacity.cpuPerCore` is published only on a physical model, so the page never shows an assumption that does not apply. See [Overcommitting CPU](#overcommitting-cpu-where-the-limit-is-physical-vsphere). |
 
 #### Platform providers
 
@@ -1125,12 +1125,25 @@ parked as `Queued`, its name and address stay reserved, and the pool reports
       "2 worker(s) queued for vDC capacity: demo-cluster-wrk-04 (10.10.0.10), ...
        (waiting for vDC capacity: memory: need 8192 MB, 4096 MB free)"
 
-A scale-out is checked as a batch, not one worker at a time. Where the platform's
-used capacity is *measured* (vSphere's host usage), a worker created a second ago
-has not moved the figure, so the pass charges its own admissions: asking for four
-workers when two fit creates two and queues two. Where the platform *books* a VM
-into its allocation as it is created (vCD), the figure already includes it and the
-check charges one worker at a time.
+A scale-out is checked as a batch, not one worker at a time. The rule follows the
+**capacity model** the provider declares (`status.capacity.capacityModel`), which
+is the same word the page reads:
+
+- `physical` (vSphere): the platform *measures* host usage, so a worker created a
+  second ago has not moved the figure. The pass charges every worker the pool has
+  (its entitlement) on top of the neighbours' measured load, so asking for four
+  workers when two fit creates two and queues two.
+- `quota` (vCD): the platform *books* a VM into its allocation as it is created,
+  so the figure already includes the workers that exist and the one in flight. The
+  check charges one worker per admission, and queueing happens exactly when the
+  vDC's own numbers are spent.
+- empty (a provider that declares nothing): the cautious reading, this pass's own
+  admissions. It can only make the answer smaller.
+
+The queue message names the platform with the model, not with a constant: a vCD
+pool says `waiting for vDC capacity: ...` and a vSphere pool says `waiting for
+vSphere cluster capacity: ...`, in the condition, the worker message and the
+event.
 
 `status.observedReplicas` counts the queued slots, so a scale-out is accepted and
 visible instead of being retried as a failing create. Every pass retries the
@@ -1147,6 +1160,15 @@ A capacity read that fails never blocks the pool: the controller logs it at
 verbosity 1 and attempts the create, which is the behaviour without the
 pre-flight. The check is an estimate in vCD's own units - vCD remains the
 authority, and a create it still refuses is reported as before.
+
+The snapshot says which question its numbers answer - `status.capacity.capacityModel`
+is `physical` or `quota`, with `status.capacity.allocationModel` carrying the
+platform's own name for the allocation (vCD's `AllocationPool`, `PayAsYouGo`) when
+it has one. A reader that finds no `capacityModel` is looking at a snapshot from a
+provider that did not declare one, and must apply the cautious rule above. The
+distinction is not cosmetic: the two models differ in what `used` means, in
+whether a starting worker is already charged, and in whether an overcommit
+assumption is legal.
 
 The system disk of a new worker is `spec.flavor.osDiskGB`. When that is unset the
 clone keeps the template size, which the controller cannot read here, so it uses
@@ -1202,10 +1224,11 @@ the hosts were oversubscribed. With this rule an idle worker still holds its
 entitlement, which is what stops a pool from growing to a number of nodes the
 cluster could never back once payload lands.
 
-`status.capacity` publishes `ourCPU_MHz`, `ourMemoryMB` and `perVMUsage`, and the
-page draws the pool's claim as the light segment after the measured fill, so
-"92 GHz used" can read as "9 of it yours, 83 somebody else's, and your eight
-workers already claim the machine".
+`status.capacity` publishes `capacityModel: physical` together with `ourCPU_MHz`
+and `ourMemoryMB` - those two are read and published only on this model, because a
+quota needs no split - and the page draws the pool's claim as the light segment
+after the measured fill, so "92 GHz used" can read as "9 of it yours, 83 somebody
+else's, and your eight workers already claim the machine".
 
 When nothing fits, the `+0` chip is red and the breakdown replaces the one-line
 basis with the arithmetic itself, generated from the live numbers:
@@ -1218,8 +1241,12 @@ basis with the arithmetic itself, generated from the live numbers:
 That is the answer to "the bar says 71 % used, why does nothing fit": the bar
 measures, the entitlement charges.
 
-A platform whose figure is a quota (vCD) has no such split: its limit is already
-the pool's, so the measured rule applies there unchanged.
+A platform whose figure is a quota (vCD) has no such split and publishes
+`capacityModel: quota` with both per-VM fields absent: its limit is already the
+pool's, so every worker is charged its allocation once and nothing is divided. The
+page reads the model and not the presence of a number, so the light "claim"
+segment, the `Assume 2 vCPU : 1 core` switch and the entitlement arithmetic are
+all simply absent there - the pane cannot offer a rule the gate will not apply.
 
 The page offers the same setting as `Assume 2 vCPU : 1 core` beside its fit line
 and writes this field, so the number it shows and the number that admits a worker

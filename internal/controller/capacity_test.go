@@ -326,8 +326,7 @@ func TestScaleUpChargesTheWholeBatch(t *testing.T) {
 	// A measured platform: the created workers are not booked, exactly like the
 	// host usage vSphere reports.
 	fc := &fakeCloud{noConsume: true, capacity: cloud.PlatformCapacity{
-		Physical:      true,
-		Measured:      true,
+		Model:         cloud.CapacityPhysical,
 		CPUMHzPerCore: 2600,
 		CPU:           cloud.ResourceCapacity{Limit: 3 * 2 * 2600, Used: 0},
 		MemoryMB:      cloud.ResourceCapacity{Limit: 1 << 20, Used: 0},
@@ -375,7 +374,7 @@ func TestScaleUpChargesTheWorkersAlreadyStarting(t *testing.T) {
 		vms:       []cloud.VM{{ID: "vm-1", Name: "pool-wrk-01", IP: "192.168.100.7", CPU: 2, MemoryMB: 4096}},
 		noConsume: true,
 		capacity: cloud.PlatformCapacity{
-			Physical: true, Measured: true, CPUMHzPerCore: 2600,
+			Model: cloud.CapacityPhysical, CPUMHzPerCore: 2600,
 			// Room for two charges in total, one of which the starting worker holds.
 			CPU:      cloud.ResourceCapacity{Limit: 2 * 2 * 2600, Used: 0},
 			MemoryMB: cloud.ResourceCapacity{Limit: 1 << 20, Used: 0},
@@ -404,6 +403,32 @@ func TestScaleUpChargesTheWorkersAlreadyStarting(t *testing.T) {
 	}
 }
 
+// A quota books a worker the moment it is created, so the pre-flight charges one
+// worker per admission: the workers that exist are already inside the used
+// figure. Rebuilding a batch there would charge them twice and halve a scale-out
+// the platform can take.
+func TestQuotaChargesOneWorkerPerAdmission(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(2)
+	// Room for exactly two test workers (2 vCPU x 2600 MHz each); the fake books
+	// every created VM against the capacity, exactly like a vDC.
+	fc := &fakeCloud{capacity: cloud.PlatformCapacity{
+		Model:         cloud.CapacityQuota,
+		CPUMHzPerCore: 2600,
+		CPU:           cloud.ResourceCapacity{Limit: 2 * 2 * 2600},
+		MemoryMB:      cloud.ResourceCapacity{Limit: 1 << 20},
+	}}
+	r := newTestReconciler(t, fc, &fakeKube{}, pool)
+
+	if _, err := r.Reconcile(ctx, requestFor(pool)); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if len(fc.created) != 2 {
+		t.Fatalf("created %d VMs against a quota with room for two, want 2: "+
+			"the platform already booked the first", len(fc.created))
+	}
+}
+
 // The entitlement rule: our workers are charged in full (their 1:1 entitlement),
 // everyone else is measured. Here the neighbours already hold two charges' worth
 // of the cluster and our one worker holds the third, so a second worker must be
@@ -423,7 +448,7 @@ func TestEntitlementChargesOurWorkersAgainstTheNeighboursLoad(t *testing.T) {
 			UsedCPUMHz: 1000, UsedMemoryMB: 1024,
 		}},
 		capacity: cloud.PlatformCapacity{
-			Physical: true, Measured: true, PerVMUsage: true, CPUMHzPerCore: 2600,
+			Model: cloud.CapacityPhysical, CPUMHzPerCore: 2600,
 			// 10.4 GHz of neighbours + 1 GHz of ours measured = 11.4 GHz used.
 			CPU:      cloud.ResourceCapacity{Limit: 3 * 2 * 2600, Used: 11400},
 			MemoryMB: cloud.ResourceCapacity{Limit: 1 << 20, Used: 1<<20 - 1},
@@ -463,7 +488,7 @@ func TestEntitlementChargesTheWorkersThatAreAlreadyReady(t *testing.T) {
 			{ID: "vm-2", Name: "pool-wrk-02", IP: "192.168.100.8", CPU: 2, MemoryMB: 4096, PoweredOn: true, UsedCPUMHz: 500, UsedMemoryMB: 512},
 		},
 		capacity: cloud.PlatformCapacity{
-			Physical: true, Measured: true, PerVMUsage: true, CPUMHzPerCore: 2600,
+			Model: cloud.CapacityPhysical, CPUMHzPerCore: 2600,
 			// Neighbours hold 10.4 GHz, ours measure 1 GHz: room for one more
 			// charge (15.6) but not for a third worker's (twice that).
 			CPU:      cloud.ResourceCapacity{Limit: 3 * 2 * 2600, Used: 11400},

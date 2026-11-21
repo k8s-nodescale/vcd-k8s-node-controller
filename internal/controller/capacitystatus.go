@@ -14,6 +14,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	infrav1 "github.com/k8s-nodescale/vcd-k8s-node-controller/api/v1alpha1"
+	"github.com/k8s-nodescale/vcd-k8s-node-controller/internal/cloud"
 )
 
 // capacityStatusTTL is how long a snapshot may stand before it is retaken even
@@ -54,20 +55,24 @@ func (r *WorkerPoolReconciler) refreshCapacityStatus(ctx context.Context, pool *
 	prov, err := r.platform(pool)
 	if err == nil {
 		if capacity, cerr := prov.Capacity(ctx); cerr == nil {
-			snap.Model = capacity.Model
+			snap.CapacityModel = capacity.Model.String()
+			snap.AllocationModel = capacity.AllocationModel
 			snap.Datacenter = capacity.Datacenter
 			snap.Cluster = capacity.Cluster
 			// The assumption the pre-flight is applying, published so the page
-			// explains the same arithmetic instead of guessing it.
-			snap.Physical = capacity.Physical
-			// What our own workers draw, so the story the page tells about the
-			// remaining room can separate us from the neighbours.
-			if vms, lerr := prov.ListWorkerVMs(ctx, nil); lerr == nil {
-				snap.OurCPUMHz, snap.OurMemoryMB = poolMeasured(ownedWorkerVMs(pool, vms))
-				snap.PerVMUsage = capacity.PerVMUsage
+			// explains the same arithmetic instead of guessing it. Only a
+			// physical platform has one: dividing a quota would admit a request
+			// the platform then refuses, so a quota publishes neither number.
+			if capacity.Model == cloud.CapacityPhysical {
+				snap.CPUPerCore = int32(cpuPerCore(pool, capacity))
+				// What our own workers draw, so the page can separate us from
+				// the neighbours. A quota needs no split - it is already only
+				// this pool's - and the read is skipped there.
+				if vms, lerr := prov.ListWorkerVMs(ctx, nil); lerr == nil {
+					snap.OurCPUMHz, snap.OurMemoryMB = poolMeasured(ownedWorkerVMs(pool, vms))
+				}
 			}
 			snap.CPUMHzPerCore = cpuMHzPerCore(pool, capacity)
-			snap.CPUPerCore = int32(cpuPerCore(pool, capacity))
 			snap.CPUMHz = capacity.CPU.Used
 			snap.CPULimitMHz = capacity.CPU.Limit
 			snap.MemoryMB = capacity.MemoryMB.Used

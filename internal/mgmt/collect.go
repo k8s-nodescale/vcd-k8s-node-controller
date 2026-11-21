@@ -379,7 +379,8 @@ func (c *Collector) poolView(ctx context.Context, p *infrav1.K8sWorkerPool, byNo
 
 	if cap := p.Status.Capacity; cap != nil {
 		view.Capacity = &Capacity{
-			Model:             cap.Model,
+			CapacityModel:     cap.CapacityModel,
+			AllocationModel:   cap.AllocationModel,
 			Datacenter:        cap.Datacenter,
 			Cluster:           cap.Cluster,
 			CPUMHz:            cap.CPUMHz,
@@ -399,16 +400,16 @@ func (c *Collector) poolView(ctx context.Context, p *infrav1.K8sWorkerPool, byNo
 			PodUsablePerBlock: cap.PodUsablePerBlock,
 			PodMaxPerNode:     cap.PodMaxPerNode,
 			At:                cap.At.UTC().Format(time.RFC3339),
-			PerVMUsage:        cap.PerVMUsage,
-			OurCPUMHz:         cap.OurCPUMHz,
-			OurMemoryMB:       cap.OurMemoryMB,
-			CPUPerCore:        perCoreFor(p, cap),
-			CPUMHzPerCore:     cap.CPUMHzPerCore,
-			Physical:          cap.Physical,
-			Fit:               poolFit(p),
-			CPU:               shareOf(cap.CPUMHz, cap.CPULimitMHz),
-			Memory:            shareOf(cap.MemoryMB, cap.MemoryLimitMB),
-			Storage:           shareOf(cap.StorageMB, cap.StorageLimitMB),
+
+			OurCPUMHz:     cap.OurCPUMHz,
+			OurMemoryMB:   cap.OurMemoryMB,
+			CPUPerCore:    perCoreFor(p, cap),
+			CPUMHzPerCore: cap.CPUMHzPerCore,
+
+			Fit:     poolFit(p),
+			CPU:     shareOf(cap.CPUMHz, cap.CPULimitMHz),
+			Memory:  shareOf(cap.MemoryMB, cap.MemoryLimitMB),
+			Storage: shareOf(cap.StorageMB, cap.StorageLimitMB),
 		}
 		for _, d := range cap.Datastores {
 			view.Capacity.Datastores = append(view.Capacity.Datastores, Datastore{

@@ -10,10 +10,11 @@ import (
 )
 
 // cpuZone is a cluster whose free CPU is short of a 1:1 charge for one worker
-// and long enough at 2:1. testPool asks for 2 vCPU, so 1:1 is 5200 MHz.
-func cpuZone(physical bool, freeMHz int64) cloud.PlatformCapacity {
+// and long enough at 2:1. testPool asks for 2 vCPU, so 1:1 is 5200 MHz. The
+// model decides whether the assumption may apply at all.
+func cpuZone(model cloud.CapacityModel, freeMHz int64) cloud.PlatformCapacity {
 	return cloud.PlatformCapacity{
-		Physical:      physical,
+		Model:         model,
 		CPUMHzPerCore: 2600,
 		CPU:           cloud.ResourceCapacity{Limit: freeMHz, Used: 0},
 		MemoryMB:      cloud.ResourceCapacity{Limit: 1 << 20, Used: 0},
@@ -25,7 +26,7 @@ func cpuZone(physical bool, freeMHz int64) cloud.PlatformCapacity {
 func TestScaleUpHonoursCPUPerCore(t *testing.T) {
 	ctx := context.Background()
 	pool := testPool(1)
-	fc := &fakeCloud{capacity: cpuZone(true, 4000)}
+	fc := &fakeCloud{capacity: cpuZone(cloud.CapacityPhysical, 4000)}
 	r := newTestReconciler(t, fc, &fakeKube{}, pool)
 
 	if _, err := r.Reconcile(ctx, requestFor(pool)); err != nil {
@@ -60,7 +61,7 @@ func TestCPUPerCoreDoesNotApplyToAQuota(t *testing.T) {
 	pool := testPool(1)
 	perCore := int32(4)
 	pool.Spec.Capacity.CPUPerCore = &perCore
-	fc := &fakeCloud{capacity: cpuZone(false, 4000)}
+	fc := &fakeCloud{capacity: cpuZone(cloud.CapacityQuota, 4000)}
 	r := newTestReconciler(t, fc, &fakeKube{}, pool)
 
 	if _, err := r.Reconcile(ctx, requestFor(pool)); err != nil {
@@ -82,7 +83,7 @@ func TestQueuedMessageNamesTheAssumption(t *testing.T) {
 	pool := testPool(1)
 	perCore := int32(2)
 	pool.Spec.Capacity.CPUPerCore = &perCore
-	fc := &fakeCloud{capacity: cpuZone(true, 100)} // nothing fits
+	fc := &fakeCloud{capacity: cpuZone(cloud.CapacityPhysical, 100)} // nothing fits
 	r := newTestReconciler(t, fc, &fakeKube{}, pool)
 
 	if _, err := r.Reconcile(ctx, requestFor(pool)); err != nil {
