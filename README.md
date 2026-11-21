@@ -143,7 +143,7 @@ One `K8sWorkerPool` describes the worker set of a single cluster. You own
 | `bootstrap.sshAuthorizedKey` | no | Public key installed for `osUser`. |
 | `bootstrap.sshAuthorizedKeysRef` | no | `kind` (`ConfigMap`/`Secret`), `name`, `key`, `namespace` (defaults to the controller's) - a store holding public keys, one per line; added to `sshAuthorizedKey`, duplicates dropped, blank and `#` lines ignored. Rotate a key in the store without editing the pool. The keys still travel in the guest user-data (that is how cloud-init installs them), so this keeps them out of a widely readable CR, not off the VM. A missing object or key fails the create, naming this field. |
 | `bootstrap.nicName` | no | Guest NIC name (`ens192` on the Ubuntu template). |
-| `bootstrap.sshAllowedSources[]` | no | Extra sshd `AllowUsers` patterns for the workers, e.g. `*@10.99.96.64/26`. The image ships a restrictive `AllowUsers` line; these are appended to it exactly like the Terraform baseline appends `allowed_ssh_ips`. |
+| `bootstrap.sshAllowedSources[]` | no | Extra sshd `AllowUsers` patterns for the workers, e.g. `*@10.99.96.64/26`. The image ships a restrictive `AllowUsers` line; these are appended to it exactly like the Terraform baseline appends `allowed_ssh_ips`. Empty takes the installation default (`bootstrap.defaults.sshAllowedSources`), which is how the Terraform modules pass `os_config.allowed_ssh_ips` once for the whole cluster instead of repeating it in every pool. |
 | `bootstrap.dns` | no | Resolvers written into the guest. |
 | `bootstrap.k8sVersion` | no | Full apt version pinned in the guest, e.g. `1.35.9-1.1`. |
 | `bootstrap.k8sMinorRepo` | no | `pkgs.k8s.io` minor repo, e.g. `v1.35`. |
@@ -757,6 +757,7 @@ the two scenarios can be compared line by line:
 | cgroup driver | `SystemdCgroup = true` in that template | generated drop-in, always |
 | apt mirror | `ubuntu_mirror_baseurl` (`apt.sources_list`) | `bootstrap.defaults.apt.mirror` (suites/components optional) |
 | resolvers | Ansible `resolved.conf.d` drop-in | `bootstrap.dns`, always written to netplan and the drop-in |
+| SSH allow list | `allowed_ssh_ips` -> sshd `AllowUsers` | `bootstrap.defaults.sshAllowedSources` (or the pool's `spec.bootstrap.sshAllowedSources`) |
 | `runc` apparmor profile | Ansible `disable ubuntu's default apparmor runc profile` | unloaded in the prerequisites script, always |
 
 Values apply to workers created after the change: an existing worker keeps the
@@ -888,6 +889,7 @@ spec:
     # ConfigMap, see "Guest policy"); a pool names a field only to differ:
     # ntpServers: [ntp1.example.com, ntp2.example.com]
     # caBundleRef: {name: environment-roots, key: ca.pem}
+    # sshAllowedSources: ["*@10.99.231.0/24"]   # sshd AllowUsers
     # sysctls: {net.netfilter.nf_conntrack_max: "2621440"}
     # kernelModules: [nf_conntrack]
     # containerd:

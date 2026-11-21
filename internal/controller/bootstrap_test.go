@@ -224,6 +224,35 @@ containerd:
 	}
 }
 
+// The sshd AllowUsers list follows the same precedence as the rest of the guest
+// policy: the Terraform baseline writes it once for the installation, and a pool
+// that names its own keeps it. Without the merge a worker created by the
+// controller on a platform whose Terraform sets allowed_ssh_ips would keep the
+// image's list and be unreachable from where SSH is actually allowed.
+func TestEffectiveBootstrapMergesSSHAllowedSources(t *testing.T) {
+	r := bootstrapReconciler(t, installationConfigMap(t, `
+sshAllowedSources: ["*@10.97.6.219", "*@10.99.231.0/24"]
+`))
+	pool := bootstrapPool(infrav1.BootstrapConfig{})
+
+	got, err := r.effectiveBootstrap(context.Background(), pool)
+	if err != nil {
+		t.Fatalf("effectiveBootstrap: %v", err)
+	}
+	if len(got.SSHAllowedSources) != 2 || got.SSHAllowedSources[1] != "*@10.99.231.0/24" {
+		t.Fatalf("the installation's allow list was not carried: %#v", got.SSHAllowedSources)
+	}
+
+	pool.Spec.Bootstrap.SSHAllowedSources = []string{"*@192.168.100.0/24"}
+	got, err = r.effectiveBootstrap(context.Background(), pool)
+	if err != nil {
+		t.Fatalf("effectiveBootstrap: %v", err)
+	}
+	if len(got.SSHAllowedSources) != 1 || got.SSHAllowedSources[0] != "*@192.168.100.0/24" {
+		t.Fatalf("the pool's allow list did not win: %#v", got.SSHAllowedSources)
+	}
+}
+
 // TestEffectiveBootstrapResolvesCARefs covers both scopes: a pool reference
 // resolves in the pool's namespace, an installation default in the controller's.
 // The apt policy merges field by field like the rest: a pool that names only a

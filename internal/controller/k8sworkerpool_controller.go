@@ -1255,7 +1255,7 @@ func (r *WorkerPoolReconciler) createWorker(ctx context.Context, pool *infrav1.K
 		OSUser:                 pool.Spec.Bootstrap.OSUser,
 		OSPasswordHash:         pool.Spec.Bootstrap.OSPasswordHash,
 		SSHAuthorizedKeys:      guest.SSHAuthorizedKeys,
-		SSHAllowedSources:      pool.Spec.Bootstrap.SSHAllowedSources,
+		SSHAllowedSources:      guest.SSHAllowedSources,
 		K8sVersion:             pool.Spec.Bootstrap.K8sVersion,
 		K8sMinorRepo:           pool.Spec.Bootstrap.K8sMinorRepo,
 		JoinEndpoint:           pool.Spec.Join.Endpoint,

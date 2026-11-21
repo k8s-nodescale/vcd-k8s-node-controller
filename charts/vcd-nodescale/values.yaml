@@ -58,6 +58,12 @@ bootstrap:
   # elsewhere (Ansible, a GitOps repository): the controller still reads it,
   # the chart just does not own it.
   create: true
+  # Same keys as spec.bootstrap; a pool that names a field overrides it here.
+  # Usually set by the Terraform/Ansible pair of the platform:
+  #   ntpServers: [ntp1.example.com]
+  #   sshAllowedSources: ["*@10.99.231.0/24"]   # os_config.allowed_ssh_ips
+  #   sysctls: {net.netfilter.nf_conntrack_max: "2621440"}
+  #   apt: {mirror: "https://mirror.example.com/ubuntu"}
   defaults: {}
   # caBundle is a PEM bundle (one or more certificates). Install it with
   #   --set-file bootstrap.caBundle=/path/to/ca-bundle.pem

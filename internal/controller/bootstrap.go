@@ -25,6 +25,15 @@ type installationBootstrap struct {
 	KernelModules []string                  `json:"kernelModules,omitempty"`
 	Containerd    *infrav1.ContainerdConfig `json:"containerd,omitempty"`
 	Apt           *infrav1.AptConfig        `json:"apt,omitempty"`
+
+	// SSHAllowedSources is the sshd AllowUsers list every worker of the
+	// installation admits unless its pool names its own. It is here for the
+	// same reason the NTP servers are: the list describes the operator's
+	// networks, not the pool, and every worker a platform creates must carry
+	// it or a node built by the controller is unreachable from where the
+	// Terraform baseline says SSH is allowed. The value is the Terraform
+	// os_config.allowed_ssh_ips list, unchanged.
+	SSHAllowedSources []string `json:"sshAllowedSources,omitempty"`
 }
 
 // guestBootstrap is the resolved guest policy: the pool's spec with the
@@ -36,6 +45,7 @@ type guestBootstrap struct {
 	// cluster identity, so unlike the other fields there is no
 	// installation-wide default for it.
 	SSHAuthorizedKeys      []string
+	SSHAllowedSources      []string
 	NTPServers             []string
 	CACerts                []string
 	Sysctls                []string
@@ -62,6 +72,7 @@ func (r *WorkerPoolReconciler) effectiveBootstrap(ctx context.Context, pool *inf
 	spec := pool.Spec.Bootstrap
 
 	ntp := append([]string(nil), spec.NTPServers...)
+	allowed := append([]string(nil), spec.SSHAllowedSources...)
 	sysctls := copyStringMap(spec.Sysctls)
 	modules := append([]string(nil), spec.KernelModules...)
 	containerd := copyContainerd(spec.Containerd)
@@ -77,6 +88,9 @@ func (r *WorkerPoolReconciler) effectiveBootstrap(ctx context.Context, pool *inf
 		}
 		if len(ntp) == 0 {
 			ntp = def.NTPServers
+		}
+		if len(allowed) == 0 {
+			allowed = def.SSHAllowedSources
 		}
 		if len(sysctls) == 0 {
 			sysctls = copyStringMap(def.Sysctls)
@@ -118,6 +132,7 @@ func (r *WorkerPoolReconciler) effectiveBootstrap(ctx context.Context, pool *inf
 
 	out := guestBootstrap{
 		SSHAuthorizedKeys: cloudinit.SSHKeyLines(spec.SSHAuthorizedKey, refKeys),
+		SSHAllowedSources: allowed,
 		NTPServers:        ntp,
 		CACerts:           certs,
 		Sysctls:           cloudinit.SysctlLines(sysctls),
