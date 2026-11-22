@@ -25,6 +25,8 @@
     --podline: rgba(79, 154, 212, .55);
     --shade: rgba(15, 30, 50, .035);
     --shade2: rgba(15, 30, 50, .075);
+    /* the empty disk bar: on a day theme it is the darker grey of the two */
+    --bar-none: rgba(15, 30, 50, .12);
   }
   :root[data-theme="dark"] {
     color-scheme: dark;
@@ -46,6 +48,8 @@
     --podline: rgba(121, 189, 234, .55);
     --shade: rgba(255, 255, 255, .045);
     --shade2: rgba(255, 255, 255, .09);
+    /* the empty disk bar: on a night theme it is the lighter grey of the two */
+    --bar-none: rgba(255, 255, 255, .22);
   }
   * { box-sizing: border-box; }
   body {
@@ -126,7 +130,7 @@
   /* A disk whose utilisation nobody reported: the same bar with the same track,
      no fill, and the outline saying "no data" - never a dash inside it and never
      a colour that reads as a level. */
-  .dbar.d-none { background: var(--chip); box-shadow: inset 0 0 0 1px var(--line); }
+  .dbar.d-none { background: var(--bar-none); box-shadow: inset 0 0 0 1px var(--muted); }
   .dbar b { position: relative; display: block; text-align: center; font-size: 10px;
             font-weight: 600; line-height: 15px; color: var(--fg);
             font-variant-numeric: tabular-nums; }
