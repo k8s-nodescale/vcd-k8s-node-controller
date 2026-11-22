@@ -123,9 +123,9 @@
   /* admitted but not yet measured: the standing charge of a starting worker */
   .dbar u.res { position: absolute; top: 0; bottom: 0; background: rgba(255, 255, 255, .22);
                 border-left: 1px solid rgba(255, 255, 255, .45); }
-  /* A disk whose utilisation nobody reported: sized, greyed, unmistakably not zero. */
-  .dbar.d-none { opacity: .35; }
-  .dbar.d-none b { color: var(--muted-foreground); }
+  /* A disk whose utilisation nobody reported: the same bar, empty and greyed -
+     a track at zero, never a dash and never a colour that reads as a level. */
+  .dbar.d-none { background: var(--border); opacity: .55; }
   .dbar b { position: relative; display: block; text-align: center; font-size: 10px;
             font-weight: 600; line-height: 15px; color: var(--fg);
             font-variant-numeric: tabular-nums; }
@@ -527,7 +527,7 @@
       if (!d.sizeGB) { return '<span class="dash">–</span>'; }
       return '<span class="dcell" title="' +
         esc("declared " + d.sizeGB + " GB; no utilisation - no node-exporter on this node") + '">' +
-        '<span class="dbar d-none"><i style="width:0"></i><b>–</b></span>' +
+        '<span class="dbar d-none"><i style="width:0"></i></span>' +
         '<span class="dsize">' + d.sizeGB + "G</span></span>";
     }
     var fill = d.level === "high" ? "high" : d.level === "warn" ? "warn" : "ok";
