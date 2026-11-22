@@ -123,6 +123,9 @@
   /* admitted but not yet measured: the standing charge of a starting worker */
   .dbar u.res { position: absolute; top: 0; bottom: 0; background: rgba(255, 255, 255, .22);
                 border-left: 1px solid rgba(255, 255, 255, .45); }
+  /* A disk whose utilisation nobody reported: sized, greyed, unmistakably not zero. */
+  .dbar.d-none { opacity: .35; }
+  .dbar.d-none b { color: var(--muted-foreground); }
   .dbar b { position: relative; display: block; text-align: center; font-size: 10px;
             font-weight: 600; line-height: 15px; color: var(--fg);
             font-variant-numeric: tabular-nums; }
@@ -516,7 +519,17 @@
   // filled to what is used, the percentage inside the bar, and the total
   // capacity after it - the size the colour alone never told.
   function diskCell(d) {
-    if (!d || d.percent == null) { return '<span class="dash">–</span>'; }
+    if (!d) { return '<span class="dash">–</span>'; }
+    // A size without utilisation: the controller knows every disk it declared
+    // (it resizes them), so the cell keeps the capacity and greys the bar. Only
+    // the fill needs node-exporter; its absence must not hide the disk.
+    if (d.percent == null) {
+      if (!d.sizeGB) { return '<span class="dash">–</span>'; }
+      return '<span class="dcell" title="' +
+        esc("declared " + d.sizeGB + " GB; no utilisation - no node-exporter on this node") + '">' +
+        '<span class="dbar d-none"><i style="width:0"></i><b>–</b></span>' +
+        '<span class="dsize">' + d.sizeGB + "G</span></span>";
+    }
     var fill = d.level === "high" ? "high" : d.level === "warn" ? "warn" : "ok";
     var pct = d.percent.toFixed(0) + "%";
     var title = d.usedGB + " of " + d.sizeGB + " GB";

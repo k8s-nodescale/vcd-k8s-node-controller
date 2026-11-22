@@ -491,9 +491,56 @@ func (c *Collector) poolView(ctx context.Context, p *infrav1.K8sWorkerPool, byNo
 		row.Limits.CPU = NewShare(row.Limits.Millicores, row.Allocatable.Millicores)
 		row.Limits.Memory = NewShare(row.Limits.MemoryMB, row.Allocatable.MemoryMB)
 		row.Real, row.RealSource, row.Disks = c.realUsage(ctx, kn, row.Allocatable, exporters, real)
+		row.Disks = declaredDisks(p, statusNode(p, row.NodeName), row.Disks)
 		view.Nodes = append(view.Nodes, row)
 	}
 	return view
+}
+
+// statusNode finds the pool's record for a Kubernetes node name.
+func statusNode(pool *infrav1.K8sWorkerPool, nodeName string) *infrav1.WorkerNodeStatus {
+	if nodeName == "" {
+		return nil
+	}
+	for i := range pool.Status.Nodes {
+		if pool.Status.Nodes[i].NodeName == nodeName || pool.Status.Nodes[i].Name == nodeName {
+			return &pool.Status.Nodes[i]
+		}
+	}
+	return nil
+}
+
+// declaredDisks fills in the size every worker disk is declared to have, for the
+// columns no exporter answered. Those numbers belong to the controller: they
+// come from the worker's own status.flavor, which the resize path updates, so a
+// size is always known even where no exporter runs. A nil Percent keeps saying
+// "no utilisation data" - it must never read as "zero used".
+func declaredDisks(pool *infrav1.K8sWorkerPool, n *infrav1.WorkerNodeStatus, disks []Disk) []Disk {
+	if n == nil || n.Flavor == nil || len(disks) == 0 {
+		return disks
+	}
+	mounts := make(map[int32]string, len(pool.Spec.Flavor.Disks))
+	for _, d := range pool.Spec.Flavor.Disks {
+		mounts[d.UnitNumber] = d.Mount
+	}
+	sizes := make(map[string]float64, 3)
+	if n.Flavor.OSDiskGB > 0 {
+		sizes["/"] = float64(n.Flavor.OSDiskGB)
+	}
+	for _, d := range n.Flavor.Disks {
+		if m := mounts[d.UnitNumber]; m != "" && d.SizeGB > 0 {
+			sizes[m] = float64(d.SizeGB)
+		}
+	}
+	for i := range disks {
+		if disks[i].SizeGB > 0 {
+			continue
+		}
+		if size, ok := sizes[disks[i].Mount]; ok {
+			disks[i].SizeGB = size
+		}
+	}
+	return disks
 }
 
 // shareOf is NewShare that returns a pointer, for the capacity view where a
