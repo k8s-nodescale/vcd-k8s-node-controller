@@ -2096,16 +2096,16 @@ is not inherited, because a flat key set is easier to create, rotate and review.
   encryption-at-rest only if the cluster enables it. There is no second layer
   here - treat the Secret as the credential itself. The UI account hashes are
   different: they are bcrypt (one-way), and the plaintext of those passwords
-  exists only where it was generated (the `initial-passwords` key until the
-  cluster owner chooses to drop it, or the control host's `.credentials` file).
+  exists only where it was generated - the `nodescale-ui-initial-passwords`
+  Secret until the cluster owner deletes it, or the control host's
+  `.credentials` file.
 
 ```bash
 # read the platform credential when you actually need it
 kubectl -n nodescale-system get secret vsphere-credentials \
   -o jsonpath='{.data.url}' | base64 -d; echo
 # and, if the cluster owner decides so, drop the generated UI passwords
-kubectl -n nodescale-system patch secret nodescale-ui-auth \
-  --type=json -p '[{"op":"remove","path":"/data/initial-passwords"}]'
+kubectl -n nodescale-system delete secret nodescale-ui-initial-passwords
 ```
 
 ### Looking at the page during development
@@ -2186,39 +2186,60 @@ viewers:
 - A missing or unparsable Secret closes the page: everything except
   `/nodescale-ui/healthz` answers `503` instead of opening.
 
-The chart creates the Secret on install when it does not exist yet
-(`ui.auth.createSecret`), with the accounts `admin` (admins) and `viewer`
-(viewers) and 24-character generated passwords. The plaintext is written once,
-next to the hashes, under the key `initial-passwords`; `helm install` prints the
-same command in its notes:
+The chart creates **no** Secrets. Two must exist before `helm install`, and they
+are a pair, because the passwords belong to the hashes:
 
+| Secret | content | read by | deletion |
+| --- | --- | --- | --- |
+| `nodescale-ui-auth` (`ui.auth.secretName`) | `users.yaml`, bcrypt hashes | the page | never - signing in needs it |
+| `nodescale-ui-initial-passwords` (`ui.auth.initialPasswordsSecretName`) | `passwords`, the plaintext | the owner, once | by the owner, when convenient |
+
+Both are written in the same step, and only while `nodescale-ui-auth` does not
+exist yet: if the accounts Secret is already there, the plaintext is unknown (or
+was already deleted), and writing a new one would produce a Secret whose
+passwords do not match the hashes.
+
+The Terraform + Ansible pair does it for you: the role generates the passwords on
+the control host (`lookup('password')`, kept in
+`<playbook_dir>/.credentials/<host>/nodescale-ui-admin` and `…-viewer`, mode
+`0600`) and creates both Secrets. Where Ansible does not install the chart, or
+where an external secret store owns them, create the two by hand:
+
+```bash
+# users.yaml: the two groups, each account with its bcrypt hash
+# (htpasswd -nB <user> prints "<user>:$2y$...", take the part after the colon)
+cat > users.yaml <<EOF
+admins:
+  - username: admin
+    passwordHash: "$(htpasswd -nB admin | cut -d: -f2)"
+viewers:
+  - username: viewer
+    passwordHash: "$(htpasswd -nB viewer | cut -d: -f2)"
+EOF
+
+kubectl -n nodescale-system create secret generic nodescale-ui-auth \
+  --from-file=users.yaml=users.yaml
+
+kubectl -n nodescale-system create secret generic nodescale-ui-initial-passwords \
+  --from-literal=passwords="admin: <admin-password>
+viewer: <viewer-password>"
 ```
-kubectl -n nodescale-system get secret nodescale-ui-auth \
-  -o jsonpath='{.data.initial-passwords}' | base64 -d
+
+Reading the passwords, and removing them:
+
+```bash
+kubectl -n nodescale-system get secret nodescale-ui-initial-passwords \
+  -o jsonpath='{.data.passwords}' | base64 -d
+
+# nothing reads this Secret and no upgrade recreates it - deleting it is final
+kubectl -n nodescale-system delete secret nodescale-ui-initial-passwords
 ```
 
-`users.yaml` holds only bcrypt hashes, so a password that was never read from
-that key cannot be recovered, only reset (see above).
-
-**Removing `initial-passwords` is the cluster owner's decision, not part of the
-upgrade procedure.** Nothing reads the key at runtime - only `users.yaml` signs
-people in - and no upgrade brings it back: the Secret is written on install only
-(the template is guarded by a `lookup`, and the Secret carries
-`helm.sh/resource-policy: keep`). So the choice is made once, by whoever owns the
-cluster, and it neither blocks nor changes a release. Where the plaintext should
-stop existing, drop the key:
-
-```
-kubectl -n nodescale-system patch secret nodescale-ui-auth \
-  --type=json -p '[{"op":"remove","path":"/data/initial-passwords"}]'
-```
-
-`helm upgrade` never rotates the accounts and `helm uninstall` keeps the Secret
-(`helm.sh/resource-policy: keep`). Where Ansible installs the chart it generates
-the passwords itself, keeps them on the control host and creates the Secret
-once, in which case the values set `ui.auth.createSecret: false`. They are then
-in `<playbook_dir>/.credentials/<inventory_hostname>/nodescale-ui-admin` and
-`nodescale-ui-viewer` (mode `0600`), not in the cluster at all.
+Neither Secret is part of a release: `helm upgrade` never touches them and
+`helm uninstall` leaves them, so a reinstall keeps the accounts. Rotation is one
+command - put a new bcrypt hash into `users.yaml` of `nodescale-ui-auth`, and the
+page picks it up within `ui.auth.refreshInterval`, ending every session (the
+cookie key is derived from that file).
 
 Signing in happens on a form at `/nodescale-ui/login`, not in the browser's
 Basic dialog: the page sets a signed cookie (`HttpOnly`, `SameSite=Strict`,

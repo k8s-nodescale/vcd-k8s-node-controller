@@ -49,19 +49,20 @@ worker count or worker LB pool membership; use the CRD instead.
 The management UI is served at {{ .Values.ui.pathPrefix }}/ on the ingress
 controller (plain HTTP on its HTTP node port, HTTPS on its HTTPS node port with
 the controller's default certificate).
-{{- if and .Values.ui.auth.enabled .Values.ui.auth.createSecret }}
+{{- if .Values.ui.auth.enabled }}
 
-The chart generated the two accounts. Read the passwords once, then delete the
-key so they stop existing:
+The page signs people in with the accounts in
+{{ .Values.ui.auth.secretName }} (key {{ .Values.ui.auth.key }}, bcrypt hashes).
+The chart creates no Secrets: that one and {{ .Values.ui.auth.initialPasswordsSecretName }}
+must exist before the install (see the README). The generated passwords are in
+{{ .Values.ui.auth.initialPasswordsSecretName }}, key "passwords":
 
-  kubectl -n {{ $ns }} get secret {{ .Values.ui.auth.secretName }} \
-    -o jsonpath='{.data.initial-passwords}' | base64 -d
+  kubectl -n {{ $ns }} get secret {{ .Values.ui.auth.initialPasswordsSecretName }} \
+    -o jsonpath='{.data.passwords}' | base64 -d
 
-  kubectl -n {{ $ns }} patch secret {{ .Values.ui.auth.secretName }} \
-    --type=json -p '[{"op":"remove","path":"/data/initial-passwords"}]'
-
-Rotate a password with "htpasswd -nB <user>" and put the hash into the
-users.yaml key of that Secret; the page picks it up within
-{{ .Values.ui.auth.refreshInterval }} without a restart.
+That Secret is the owner's to delete once read - the server never reads it and
+no upgrade recreates it. Rotate a password with "htpasswd -nB <user>" and put the
+hash into {{ .Values.ui.auth.key }} of {{ .Values.ui.auth.secretName }}; the page
+picks it up within {{ .Values.ui.auth.refreshInterval }} without a restart.
 {{- end }}
 {{- end }}

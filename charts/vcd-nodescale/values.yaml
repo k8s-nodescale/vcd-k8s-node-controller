@@ -222,14 +222,18 @@ ui:
     # How long a sign-in through the login form lasts. The cookie is signed with
     # a key derived from users.yaml, so changing any account ends every session.
     sessionTTL: 12h
-    # createSecret writes the Secret on install when it does not exist yet: two
-    # bcrypt hashes in users.yaml and the generated passwords in
-    # initial-passwords for the operator to read once. An upgrade never
-    # rotates them, and an existing Secret is left alone. Turn this off where
-    # Ansible or an external secret store owns the Secret.
-    createSecret: true
-    adminUsername: admin
-    viewerUsername: viewer
+    # The chart creates no Secrets. Both must exist before "helm install":
+    #
+    #   <secretName>                       users.yaml - bcrypt hashes, read by
+    #                                      the server, never deleted
+    #   <initialPasswordsSecretName>       passwords - the plaintext, read once
+    #                                      by the owner, deletable at will
+    #
+    # They are a pair: the passwords belong to the hashes, so they are written
+    # together and only while <secretName> does not exist yet. The Terraform +
+    # Ansible pair creates both (roles/k8s_addons_node_controller); a manual
+    # install creates them with the commands in the README.
+    initialPasswordsSecretName: nodescale-ui-initial-passwords
 
   service:
     type: ClusterIP
