@@ -61,6 +61,19 @@ package_upgrade: false
 # customization-phases.md §4.2 - work that can fail slowly or needs a retry
 # belongs in a systemd unit, not here.
 bootcmd:
+  # The Terraform baseline owns /etc/netplan/01-netplan.yaml from cloud-init and
+  # deletes the image's 50-cloud-init.yaml there; vCD's own 99-netcfg-vmware.yaml
+  # is left as the customization engine wrote it. Same file and same removal
+  # here. The initscript's net stage cannot do it on its own: it runs before the
+  # engine renames what it finds, so on a controller-made worker the image's
+  # cloud-init file survived next to the other two and three configs claimed
+  # ens192.
+  - |
+    mkdir -p /etc/netplan
+    echo "network: {version: 2, renderer: networkd, ethernets: { {{ .NICName }}: {dhcp4: false, dhcp6: false, addresses: [{{ .NodeIP }}/{{ .CIDRPrefix }}], routes: [{to: default, via: {{ .GatewayIP }}}], nameservers: {addresses: {{ .DNSServersJSON }}}}}}" > /etc/netplan/01-netplan.yaml
+    chmod 600 /etc/netplan/01-netplan.yaml
+    rm -f /etc/netplan/50-cloud-init.yaml
+    netplan apply || true
 {{- if .OSPasswordHash }}
   # Early and unconditional: a worker whose disk stage fails must still be
   # reachable with the password the pool says it has. The users module skips an
@@ -86,22 +99,6 @@ bootcmd:
     systemctl enable --now --no-block k8s-node-prereqs.service || true
 
 write_files:
-  # Fallback network config for the case where the vCD customization phase did
-  # not run; the initscript writes 01-netplan.yaml and removes this file.
-  - path: /etc/netplan/50-cloud-init.yaml
-    permissions: '0600'
-    content: |
-      network:
-        version: 2
-        ethernets:
-          {{ .NICName }}:
-            dhcp4: false
-            addresses: [{{ .NodeIP }}/{{ .CIDRPrefix }}]
-            routes:
-              - to: default
-                via: {{ .GatewayIP }}
-            nameservers:
-              addresses: {{ .DNSServersJSON }}
 {{- if .DNSServersLine }}
   # The Terraform baseline writes the resolvers twice: netplan for the
   # interface and a resolved drop-in. Netplan alone is enough until a second
@@ -148,7 +145,9 @@ write_files:
   # The Terraform baseline writes every node of the cluster into /etc/hosts, so
   # a worker can resolve its peers before DNS knows them. The controller knows
   # the pool's own workers (and reads the cluster's Nodes), and appends rather
-  # than replacing the file cloud-init writes for the guest's own hostname.
+  # than replacing the file. The guest's own line is not ours to append: the
+  # hostname modules rewrite it after this step, so it is normalised in runcmd
+  # below instead. write_files runs before them in cloud_init_modules.
   {{- if .HostsLines }}
   - path: /etc/hosts
     append: true
@@ -647,6 +646,29 @@ write_files:
       WantedBy=multi-user.target
 
 runcmd:
+  # /etc/hosts is not fully ours: the image's own line and the one the vCD
+  # customization engine adds both name this guest, and the engine builds its
+  # FQDN from the computer name plus a domain it reads off the template name -
+  # "Ubuntu-24.04-ENG-Server" has a dot, so the domain became "04-ENG-Server"
+  # and a controller-made worker carried
+  # "192.168.100.9 KION-WEB-DEV-wrk-03.04-ENG-Server KION-WEB-DEV-wrk-03".
+  # The Terraform baseline ends up with the node's name alone on the 127.0.1.1
+  # line and no per-address FQDN entry at all (its Ansible hosts template
+  # replaces the file), so both are collapsed here to "<ip> <node name>" and
+  # "127.0.1.1 <node name>", duplicates dropped. runs after cloud-init's
+  # hostname modules, which rewrite the localhost line themselves.
+  - |
+    awk -v ip="{{ .NodeIP }}" -v n="{{ .NodeName }}" '
+      $1 == ip { if (!ipdone) { print ip " " n; ipdone=1 } ; next }
+      /^127\.0\.1\.1[ \t]/ { if (!lhdone) { print "127.0.1.1 " n; lhdone=1 } ; next }
+      { print }
+      END {
+        if (!ipdone) print ip " " n
+        if (!lhdone) print "127.0.1.1 " n
+      }
+    ' /etc/hosts > /etc/hosts.nodescale
+    cat /etc/hosts.nodescale > /etc/hosts
+    rm -f /etc/hosts.nodescale
 {{- if .CACertFiles }}
   # Trust the pool's CA bundle before anything reaches the network: apt, the
   # Kubernetes repository and the container registry all use it.

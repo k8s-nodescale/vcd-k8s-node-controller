@@ -355,10 +355,33 @@ func TestUserDataMatchesTheTerraformBaseline(t *testing.T) {
 		t.Error("periodic apt is not disabled")
 	}
 
-	// /etc/hosts has to be appended, not replaced: cloud-init owns the guest's
-	// own line, the pool contributes its peers.
+	// /etc/hosts has to be appended, not replaced: the pool contributes its
+	// peers to whatever the image already has. The guest's own line is written
+	// by cloud-init's hostname modules after write_files, so the template has to
+	// normalise it afterwards: on vCD the engine reports a FQDN whose domain is
+	// the part of the template name after its first dot.
 	if !strings.Contains(ud, "path: /etc/hosts") || !strings.Contains(ud, "append: true") {
 		t.Fatal("/etc/hosts is not written by the template")
+	}
+	for _, want := range []string{
+		`-v n="` + testParams().NodeName + `"`,
+		`-v ip="` + testParams().NodeIP + `"`,
+		`' /etc/hosts > /etc/hosts.nodescale`,
+	} {
+		if !strings.Contains(ud, want) {
+			t.Errorf("the guest's own hosts line is not normalised to %q", want)
+		}
+	}
+
+	// Netplan: one file name for this interface, the image's cloud-init file
+	// removed, in bootcmd where the Terraform baseline does it. A write_files
+	// fallback cannot work: it lands after the vCD engine and its files.
+	if strings.Contains(ud, "path: /etc/netplan/50-cloud-init.yaml") {
+		t.Error("50-cloud-init.yaml is still written by write_files")
+	}
+	if !strings.Contains(ud, "rm -f /etc/netplan/50-cloud-init.yaml") ||
+		!strings.Contains(ud, "> /etc/netplan/01-netplan.yaml") {
+		t.Error("bootcmd does not own /etc/netplan/01-netplan.yaml")
 	}
 	for _, p := range testParams().HostsLines {
 		if !strings.Contains(ud, p) {

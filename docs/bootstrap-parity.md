@@ -40,11 +40,11 @@ for a worker on this path.
 
 | # | Option | Where the baseline sets it | Controller | Note |
 | --- | --- | --- | --- | --- |
-| 15 | Static address, prefix, gateway (netplan) | TF metadata + Ansible netplan | **yes** | `ipPlan.cidr` + `bootstrap.nicName` |
+| 15 | Static address, prefix, gateway (netplan) | TF metadata + Ansible netplan | **yes** | `ipPlan.cidr` + `bootstrap.nicName`; `01-netplan.yaml` is written in `bootcmd` and the image's `50-cloud-init.yaml` removed there, as the baseline does. A `write_files` fallback cannot work: it lands after the vCD engine's `99-netcfg-vmware.yaml` and leaves two or three configs for one NIC. |
 | 16 | netplan DNS servers | Ansible `search netplan file ... change dns server` | **yes** | `bootstrap.dns` |
 | 17 | systemd-resolved drop-in (`DNS=`, `Domains=~.`) | Ansible `configure systemd-resolved DNS drop-in` | **yes** | `/etc/systemd/resolved.conf.d/nodescale.conf` + `systemctl restart systemd-resolved` |
-| 18 | `netplan apply` after the DNS change | Ansible | **yes** | cloud-init applies the only netplan file it wrote; nothing to re-apply |
-| 19 | `/etc/hosts` peer records | TF `write_files` (`append: true`) | **yes** | `HostsLines` from the pool's workers and the cluster's Nodes; append, not replace |
+| 18 | `netplan apply` after the DNS change | Ansible | **yes** | `bootcmd` applies `01-netplan.yaml` once, after removing the image's `50-cloud-init.yaml`; the initscript applies it too when the customization phase writes it |
+| 19 | `/etc/hosts` peer records | TF `write_files` (`append: true`) | **yes** | `HostsLines` from the pool's workers and the cluster's Nodes; append, not replace. The guest's own `127.0.1.1` line is cloud-init's: its hostname modules run after `write_files` and take the FQDN the vCD engine reports, which appends the part of the template name after its first dot (`Ubuntu-24.04-ENG-Server` -> `.04-ENG-Server`), so `runcmd` rewrites that line to `127.0.1.1 <node>` and collapses every line for the node's own address to `<ip> <node>`, dropping the engine's FQDN alias - the shape the baseline ends up with. |
 | 20 | `/add_hosts_records.sh` computed peers | TF `runcmd` | **yes** | same data, resolved in the controller instead of a shell loop |
 | 21 | NTP servers (chrony) | TF `ntp.servers` | **yes** | `bootstrap.ntpServers[]` in a marked block of `chrony.conf` |
 | 22 | `systemctl restart chrony` | cloud-init `ntp` module | **yes** | after the block is written; empty list keeps the image's sources |
