@@ -481,7 +481,7 @@
   var state = { pools: [], current: null, stamp: "", stale: false, me: null, draft: null,
                 flavorDraft: null, flavorEdit: false, pendingDelete: null, diskDraft: null,
                 pendingDisks: null, fitOpen: false, perCore: null, perCoreAt: 0,
-                pendingReplicas: null, planner: null, plannerAt: 0,
+                pendingReplicas: null, planner: null, plannerAt: 0, actionsDisabled: false,
                 flags: { taints: false, volumes: false, sts: false, dense: false, ds: false } };
   var pick = document.getElementById("poolPick");
 
@@ -1584,6 +1584,7 @@
   function applyBusy(p, admin) {
     var busy = !!(p && p.busy);
     var disabled = !admin || busy;
+    state.actionsDisabled = disabled;
     ["setReplicas", "minus", "plus", "applyDisks"].forEach(function (id) {
       var el = document.getElementById(id);
       if (!el) { return; }
@@ -1593,6 +1594,9 @@
         el.disabled = disabled;
       }
     });
+    // A blocked draft stays greyed whatever the busy state says.
+    var setRep = document.getElementById("setReplicas");
+    if (setRep) { setRep.disabled = disabled || draftBlocked(p, state.draft); }
     document.getElementById("replicasInput").disabled = disabled;
 
     // The flavour sheet is locked the way the disk sheet is: reading the page is
@@ -1806,6 +1810,15 @@
     return out;
   }
 
+  // draftBlocked is a draft the pool refuses outright: policy, not capacity.
+  // Nothing would be queued and the click would only raise a toast, so the
+  // button is greyed out and the reason stays under the field.
+  function draftBlocked(p, v) {
+    if (!p || v == null) { return false; }
+    if (v < p.minReplicas) { return true; }
+    return v === 0 && !p.allowLastWorker;
+  }
+
   function renderDraftHint() {
     var input = document.getElementById("replicasInput");
     var hint = document.getElementById("replicasHint");
@@ -1844,6 +1857,10 @@
     }
     hint.textContent = text;
     hint.style.color = warn ? "var(--warn)" : "";
+    // A number the pool will refuse cannot be sent, so the button says so by
+    // being dead rather than by a toast after the click.
+    var btn = document.getElementById("setReplicas");
+    if (btn) { btn.disabled = state.actionsDisabled || draftBlocked(p, v); }
   }
 
   document.getElementById("plus").addEventListener("click", function () {
