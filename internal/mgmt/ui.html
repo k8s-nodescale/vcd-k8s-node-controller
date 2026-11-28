@@ -1792,7 +1792,11 @@
   function replicasRoom(p) {
     var out = { fit: null, bound: null, window: p ? p.ipWindowSize || 0 : 0 };
     if (!p || !p.capacity) { return out; }
-    var dims = fitDims(p, p.capacity, p.capacity.cpuPerCore || 1);
+    // The same switch the capacity pane draws with: with the planner off the
+    // page shows no fit at all, so the hint must not promise room the
+    // controller is not reading either.
+    var plannerOn = state.planner != null ? state.planner : p.preflight !== false;
+    var dims = fitDims(p, p.capacity, p.capacity.cpuPerCore || 1, plannerOn);
     if (dims.length) {
       var best = dims[0];
       for (var i = 1; i < dims.length; i++) { if (dims[i].n < best.n) { best = dims[i]; } }
