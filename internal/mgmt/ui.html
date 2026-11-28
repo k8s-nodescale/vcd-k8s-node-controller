@@ -1820,7 +1820,17 @@
       input.style.borderColor = "";
     }
     var v = state.draft;
-    if (p && v != null && v > p.observedReplicas) {
+    // The policy gates come first: a number the pool will refuse is not a
+    // capacity question, and saying "0 fit" about it would point at the wrong
+    // thing. The controller still protects the floor server-side, but only by
+    // refusing each removal, which leaves spec.replicas above what it reaches.
+    if (p && v != null && v < p.minReplicas) {
+      text = v + " is below the pool floor (minReplicas " + p.minReplicas + ")";
+      warn = true;
+    } else if (p && v === 0 && !p.allowLastWorker) {
+      text = "scale-in to 0 needs scaleDown.allowLastWorker: true";
+      warn = true;
+    } else if (p && v != null && v > p.observedReplicas) {
       var room = replicasRoom(p);
       var extra = v - p.observedReplicas;
       if (room.window && v > room.window) {
